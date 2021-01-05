@@ -40,7 +40,7 @@
 #include "CodeSigningTypes.h"
 #include <CommonCrypto/CommonHMAC.h>
 #include <CommonCrypto/CommonDigest.h>
-#include <CommonCrypto/CommonDigestSPI.h>
+#include "CommonDigestSPI.h"
 
 #define NO_ULEB
 #include "Architectures.hpp"
@@ -124,14 +124,14 @@ private:
     uint32_t exportsTrieOffset = 0;
     uint32_t exportsTrieSize = 0;
     std::set<int> reexportDeps;
-    
+
 public:
-    
+
     void optimize_loadcommands(dyld3::MachOAnalyzer* mh)
     {
         // update header flags
         mh->flags &= 0x7FFFFFFF; // remove in-cache bit
-        
+
         // update load commands
         __block uint64_t cumulativeFileSize = 0;
         __block int depIndex = 0;

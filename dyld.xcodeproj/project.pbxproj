@@ -2711,6 +2711,7 @@
 					"DEBUG=1",
 					"$(inherited)",
 					"BUILDING_CACHE_BUILDER=1",
+					"SUPPORT_ARCH_arm64e=1",
 				);
 				GCC_SYMBOLS_PRIVATE_EXTERN = NO;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
@@ -2722,7 +2723,7 @@
 				INSTALL_PATH = "$(INSTALL_LOCATION)/usr/local/bin";
 				MACOSX_DEPLOYMENT_TARGET = 10.11;
 				MTL_ENABLE_DEBUG_INFO = YES;
-				ONLY_ACTIVE_ARCH = YES;
+				ONLY_ACTIVE_ARCH = NO;
 				OTHER_CFLAGS = (
 					"-DBOM_SUPPORT=1",
 					"-DBUILDING_EMBEDDED_SHARED_CACHE_BUILDER=1",
@@ -2825,7 +2826,7 @@
 				OTHER_CFLAGS = "-DCHROOT_PATH=\\\"$(DERIVED_FILES_DIR)/TestRoot\\\"";
 				PRODUCT_BUNDLE_IDENTIFIER = "com.apple.dyld.local-test-runner";
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				SDKROOT = macosx.internal;
+				SDKROOT = macosx;
 				STRIP_INSTALLED_PRODUCT = YES;
 				USER_HEADER_SEARCH_PATHS = "./dyld3 ./dyld3/shared-cache $SRCROOT/testing/include";
 			};
@@ -3615,6 +3616,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
+				ARCHS = "$(ARCHS_STANDARD)";
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
@@ -3638,12 +3640,14 @@
 					"DEBUG=1",
 					"BUILDING_DYLDINFO=1",
 					"$(inherited)",
+					"SUPPORT_ARCH_arm64e=1",
 				);
 				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				MACOSX_DEPLOYMENT_TARGET = 10.14;
 				MTL_ENABLE_DEBUG_INFO = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
 				STRIP_STYLE = debugging;
 				SUPPORTED_PLATFORMS = "macosx iphoneos watchos appletvos bridgeos";
 			};
@@ -3653,6 +3657,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
+				ARCHS = "$(ARCHS_STANDARD)";
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
@@ -3676,6 +3681,7 @@
 				MACOSX_DEPLOYMENT_TARGET = 10.14;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
 				STRIP_STYLE = debugging;
 				SUPPORTED_PLATFORMS = "macosx iphoneos watchos appletvos bridgeos";
 			};
@@ -4019,7 +4025,7 @@
 				MACOSX_DEPLOYMENT_TARGET = 10.14;
 				OTHER_CFLAGS = "-DBUILDING_SHARED_CACHE_UTIL=1";
 				PRODUCT_NAME = dyld_shared_cache_util;
-				SDKROOT = macosx.internal;
+				SDKROOT = macosx;
 				SUPPORTED_PLATFORMS = "macosx iphoneos watchos appletvos bridgeos";
 			};
 			name = Debug;
@@ -4036,7 +4042,7 @@
 				MACOSX_DEPLOYMENT_TARGET = 10.14;
 				OTHER_CFLAGS = "-DBUILDING_SHARED_CACHE_UTIL=1";
 				PRODUCT_NAME = dyld_shared_cache_util;
-				SDKROOT = macosx.internal;
+				SDKROOT = macosx;
 				SKIP_INSTALL = NO;
 				SUPPORTED_PLATFORMS = "macosx iphoneos watchos appletvos bridgeos";
 			};

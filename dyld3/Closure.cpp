@@ -30,13 +30,13 @@
 #include <mach-o/dyld_priv.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
-#include <System/machine/cpu_capabilities.h>
-#include <_simple.h>
+//#include <System/machine/cpu_capabilities.h>
+// #include <_simple.h>
 
-extern "C" {
-  #include <corecrypto/ccdigest.h>
-  #include <corecrypto/ccsha2.h>
-}
+//extern "C" {
+//  #include <corecrypto/ccdigest.h>
+//  #include <corecrypto/ccsha2.h>
+//}
 
 #include "Closure.h"
 #include "MachOFile.h"
@@ -793,7 +793,7 @@ uint64_t Image::chainedStartsOffset() const
     assert(size == sizeof(uint64_t));
     return *startsOffset;
 }
-    
+
 void Image::objcFixups(ResolvedSymbolTarget& objcProtocolClassTarget,
                        uint64_t& objcImageInfoVMOffset,
                        Array<ProtocolISAFixup>& protocolISAFixups,
@@ -1273,7 +1273,7 @@ bool LaunchClosure::classAndProtocolHashTables(Array<Image::ObjCClassImage>& ima
     uint32_t offsetToClassTable = 0;
     uint32_t offsetToProtocolTable = 0;
     uint32_t numImages = 0;
-    
+
     // Get the header
     memcpy(&offsetToClassTable,     buffer + 0, sizeof(uint32_t));
     memcpy(&offsetToProtocolTable,  buffer + 4, sizeof(uint32_t));
@@ -1289,7 +1289,7 @@ bool LaunchClosure::classAndProtocolHashTables(Array<Image::ObjCClassImage>& ima
     // Write out out the protocol hash table if there is one
     if ( offsetToProtocolTable != 0 )
         protocolHashTable = (const ObjCClassOpt*)(buffer + offsetToProtocolTable);
-    
+
     return true;
 }
 
@@ -1306,7 +1306,7 @@ void LaunchClosure::duplicateClassesHashTable(const ObjCClassDuplicatesOpt*& dup
 static bool getContainerLibraryCachesDir(const char* envp[], char libCacheDir[])
 {
     // $HOME is root of writable data container
-    const char* homeDir = _simple_getenv(envp, "HOME");
+    const char* homeDir = "HOME";
     if ( homeDir == nullptr )
         return false;
 
@@ -1366,7 +1366,7 @@ bool LaunchClosure::buildClosureCachePath(const char* mainExecutablePath, const 
 
 
 ////////////////////////////  ObjCStringTable ////////////////////////////////////////
-    
+
 uint32_t ObjCStringTable::hash(const char *key, size_t keylen) const
 {
     uint64_t val = objc_opt::lookup8((uint8_t*)key, keylen, salt);

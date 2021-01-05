@@ -34,8 +34,8 @@
 #include <sys/stat.h>
 #include <mach/mach.h>
 #if !TARGET_OS_SIMULATOR && !TARGET_OS_DRIVERKIT
-  #include <sandbox.h>
-  #include <sandbox/private.h>
+//   #include <sandbox.h>
+//   #include <sandbox/private.h>
 #endif
 #include <TargetConditionals.h>
 #include "MachOFile.h"
@@ -79,8 +79,9 @@ static bool sandboxBlocked(const char* path, const char* kind)
     // sandbox calls not yet supported in dyld_sim
     return false;
 #else
-    sandbox_filter_type filter = (sandbox_filter_type)(SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT);
-    return ( sandbox_check(getpid(), kind, filter, path) > 0 );
+    // sandbox_filter_type filter = (sandbox_filter_type)(SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT);
+    // return ( sandbox_check(getpid(), kind, filter, path) > 0 );
+    return false;
 #endif
 }
 
