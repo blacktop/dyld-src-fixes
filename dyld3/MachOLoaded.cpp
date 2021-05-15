@@ -1007,7 +1007,8 @@ uint64_t MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::signPointer(uint64_t un
     }
     assert(0 && "invalid signing key");
 #else
-    assert(0 && "arm64e signing only arm64e");
+//    assert(0 && "arm64e signing only arm64e");
+    return (uintptr_t)unsignedAddr;
 #endif
 }
 

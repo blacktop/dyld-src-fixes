@@ -270,7 +270,7 @@ static void printSlideInfoForDataRegion(const DyldSharedCache* dyldCache, uint64
         for (int i=0; i < slideInfo->page_starts_count; ++i) {
             uint16_t delta = slideInfo->page_starts[i];
             if ( delta == DYLD_CACHE_SLIDE_V3_PAGE_ATTR_NO_REBASE ) {
-                printf("page[% 5d]: no rebasing\n", i);
+//                printf("page[% 5d]: no rebasing\n", i);
                 continue;
             }
 
@@ -296,7 +296,7 @@ static void printSlideInfoForDataRegion(const DyldSharedCache* dyldCache, uint64
                 }
                 else {
                     uint64_t targetValue = ptr.arm64e.unpackTarget();
-                    printf("    [% 5d + 0x%04llX]: 0x%016llX\n", i, (uint64_t)((const uint8_t*)loc - pageStart), targetValue);
+//                    printf("    [% 5d + 0x%04llX]: 0x%016llX\n", i, (uint64_t)((const uint8_t*)loc - pageStart), targetValue);
                 }
             } while (delta != 0);
         }

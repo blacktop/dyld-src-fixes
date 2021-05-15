@@ -34,7 +34,7 @@
 
 #include <CommonCrypto/CommonHMAC.h>
 #include <CommonCrypto/CommonDigest.h>
-#include <CommonCrypto/CommonDigestSPI.h>
+#include "CommonDigestSPI.h"
 
 AppCacheBuilder::AppCacheBuilder(const DyldSharedCache::CreateOptions& options,
                                  const Options& appCacheOptions,

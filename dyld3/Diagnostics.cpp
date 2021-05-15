@@ -146,19 +146,19 @@ const char* Diagnostics::errorMessage() const
 #else
 void Diagnostics::warning(const char* format, ...)
 {
-    _SIMPLE_STRING tmp = _simple_salloc();
-    va_list    list;
-    va_start(list, format);
-    _simple_vsprintf(tmp, format, list);
-    va_end(list);
-#if BUILDING_CACHE_BUILDER
-    dispatch_sync(sWarningQueue, ^{
-        _warnings.insert(_simple_string(tmp));
-    });
-#else
-    _warnings.insert(_simple_string(tmp));
-#endif
-    _simple_sfree(tmp);
+//    _SIMPLE_STRING tmp = _simple_salloc();
+//    va_list    list;
+//    va_start(list, format);
+//    _simple_vsprintf(tmp, format, list);
+//    va_end(list);
+//#if BUILDING_CACHE_BUILDER
+//    dispatch_sync(sWarningQueue, ^{
+//        _warnings.insert(_simple_string(tmp));
+//    });
+//#else
+//    _warnings.insert(_simple_string(tmp));
+//#endif
+//    _simple_sfree(tmp);
 }
 
 void Diagnostics::verbose(const char* format, ...)
@@ -195,9 +195,9 @@ void Diagnostics::copy(const Diagnostics& other)
 
 std::string Diagnostics::errorMessage() const
 {
-    if ( _buffer != nullptr )
-        return _simple_string(_buffer);
-    else
+//    if ( _buffer != nullptr )
+//        return _simple_string(_buffer);
+//    else
         return "";
 }
 
