@@ -296,7 +296,9 @@ static void printSlideInfoForDataRegion(const DyldSharedCache* dyldCache, uint64
                 }
                 else {
                     uint64_t targetValue = ptr.arm64e.unpackTarget();
-//                    printf("    [% 5d + 0x%04llX]: 0x%016llX\n", i, (uint64_t)((const uint8_t*)loc - pageStart), targetValue);
+//                    if ( !verboseSlideInfo )
+                    if (slideInfo->page_starts_count == 19944)
+                        printf("    [% 5d + 0x%04llX]: 0x%016llX\n", i, (uint64_t)((const uint8_t*)loc - pageStart), targetValue);
                 }
             } while (delta != 0);
         }

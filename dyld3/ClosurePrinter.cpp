@@ -434,21 +434,21 @@ static Node buildImageNode(const Image* image, const Array<const ImageArray*>& i
     }
 
 
-#if 0
-    // add things to init before this image
-    __block Node initBeforeNode;
-    image->forEachInitBefore(groupList, ^(Image beforeImage) {
-        Node beforeNode;
-        beforeNode.value = beforeimage->path();
-        imageNode.map["initializer-order"].array.push_back(beforeNode);
-    });
-
-     // add override info if relevant
-    group.forEachImageRefOverride(groupList, ^(Image standardDylib, Image overrideDylib, bool& stop) {
-        if ( overrideDylib.binaryData() == image->binaryData() ) {
-            imageNode.map["override-of-cached-dylib"].value = standardDylib.path();
-        }
-    });
+#if 1
+//    // add things to init before this image
+//    __block Node initBeforeNode;
+//    image->forEachInitBefore(groupList, ^(Image beforeImage) {
+//        Node beforeNode;
+//        beforeNode.value = beforeimage->path();
+//        imageNode.map["initializer-order"].array.push_back(beforeNode);
+//    });
+//
+//     // add override info if relevant
+//    group.forEachImageRefOverride(groupList, ^(Image standardDylib, Image overrideDylib, bool& stop) {
+//        if ( overrideDylib.binaryData() == image->binaryData() ) {
+//            imageNode.map["override-of-cached-dylib"].value = standardDylib.path();
+//        }
+//    });
     // add dtrace info
     image->forEachDOF(nullptr, ^(const void* section) {
         Node initNode;

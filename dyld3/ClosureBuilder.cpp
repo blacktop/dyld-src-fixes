@@ -3080,7 +3080,7 @@ void ClosureBuilder::parseObjCClassDuplicates(Map<const char*, bool, HashCString
 // used at launch by dyld when kernel has already mapped main executable
 const LaunchClosure* ClosureBuilder::makeLaunchClosure(const LoadedFileInfo& fileInfo, bool allowInsertFailures)
 {
-    dyld3::ScopedTimer timer(DBG_DYLD_TIMING_BUILD_CLOSURE, 0, 0, 0);
+//    dyld3::ScopedTimer timer(DBG_DYLD_TIMING_BUILD_CLOSURE, 0, 0, 0);
     const mach_header* mainMH = (const mach_header*)fileInfo.fileContent;
     // set up stack based storage for all arrays
     BuilderLoadedImage  loadImagesStorage[512];
@@ -3368,7 +3368,7 @@ const LaunchClosure* ClosureBuilder::makeLaunchClosure(const LoadedFileInfo& fil
     const LaunchClosure* result = closureWriter.finalize();
     imageArrayWriter.deallocate();
 
-    timer.setData4(dyld3::DyldTimingBuildClosure::LaunchClosure_Built);
+//    timer.setData4(dyld3::DyldTimingBuildClosure::LaunchClosure_Built);
 
     return result;
 }
@@ -3377,7 +3377,7 @@ const LaunchClosure* ClosureBuilder::makeLaunchClosure(const LoadedFileInfo& fil
 const DlopenClosure* ClosureBuilder::makeDlopenClosure(const char* path, const LaunchClosure* mainClosure, const Array<LoadedImage>& alreadyLoadedList,
                                                        closure::ImageNum callerImageNum, bool noLoad, bool forceBindLazies, bool canUseSharedCacheClosure, closure::ImageNum* topImageNum)
 {
-    dyld3::ScopedTimer timer(DBG_DYLD_TIMING_BUILD_CLOSURE, 0, 0, 0);
+//    dyld3::ScopedTimer timer(DBG_DYLD_TIMING_BUILD_CLOSURE, 0, 0, 0);
     // set up stack based storage for all arrays
     BuilderLoadedImage  loadImagesStorage[256];
     Image::LinkedImage  dependenciesStorage[128];
@@ -3471,7 +3471,7 @@ const DlopenClosure* ClosureBuilder::makeDlopenClosure(const char* path, const L
 
     // exit early in RTLD_NOLOAD mode
     if ( noLoad ) {
-        timer.setData4(dyld3::DyldTimingBuildClosure::DlopenClosure_NoLoad);
+//        timer.setData4(dyld3::DyldTimingBuildClosure::DlopenClosure_NoLoad);
         // if no new images added to _loadedImages, then requested path was already loaded
         if ( (uint32_t)_loadedImages.count() == _alreadyInitedIndex )
             *topImageNum = foundTopImage->imageNum;
@@ -3484,9 +3484,9 @@ const DlopenClosure* ClosureBuilder::makeDlopenClosure(const char* path, const L
     if ( (_dyldCache != nullptr) && (_dyldCache->header.cacheType == kDyldSharedCacheTypeProduction) ) {
         if ( foundTopImage->imageNum < closure::kFirstLaunchClosureImageNum ) {
             if (foundTopImage->imageNum < closure::kLastDyldCacheImageNum)
-                timer.setData4(dyld3::DyldTimingBuildClosure::DlopenClosure_UsedSharedCacheDylib);
-            else
-                timer.setData4(dyld3::DyldTimingBuildClosure::DlopenClosure_UsedSharedCacheOther);
+//                timer.setData4(dyld3::DyldTimingBuildClosure::DlopenClosure_UsedSharedCacheDylib);
+//            else
+//                timer.setData4(dyld3::DyldTimingBuildClosure::DlopenClosure_UsedSharedCacheOther);
             *topImageNum = foundTopImage->imageNum;
             return nullptr;
         }
@@ -3549,9 +3549,9 @@ const DlopenClosure* ClosureBuilder::makeDlopenClosure(const char* path, const L
         }
     } else {
         if (foundTopImage->imageNum < closure::kLastDyldCacheImageNum)
-            timer.setData4(dyld3::DyldTimingBuildClosure::DlopenClosure_UsedSharedCacheDylib);
-        else
-            timer.setData4(dyld3::DyldTimingBuildClosure::DlopenClosure_UsedSharedCacheOther);
+//            timer.setData4(dyld3::DyldTimingBuildClosure::DlopenClosure_UsedSharedCacheDylib);
+//        else
+//            timer.setData4(dyld3::DyldTimingBuildClosure::DlopenClosure_UsedSharedCacheOther);
         return nullptr;
     }
 
@@ -3613,7 +3613,7 @@ const DlopenClosure* ClosureBuilder::makeDlopenClosure(const char* path, const L
     // make final DlopenClosure object
     const DlopenClosure* result = closureWriter.finalize();
     imageArrayWriter.deallocate();
-    timer.setData4(dyld3::DyldTimingBuildClosure::DlopenClosure_Built);
+//    timer.setData4(dyld3::DyldTimingBuildClosure::DlopenClosure_Built);
     return result;
 }
 

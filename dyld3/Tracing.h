@@ -32,8 +32,8 @@
 #include <sys/mount.h>
 #include <uuid/uuid.h>
 #include <mach-o/loader.h>
-#include <System/sys/kdebug.h>
-#include <System/sys/reason.h>
+//#include <System/sys/kdebug.h>
+//#include <System/sys/reason.h>
 
 
 #define DBG_DYLD_INTERNAL_SUBCLASS              (7)
@@ -90,13 +90,13 @@ struct VIS_HIDDEN kt_arg {
 private:
     void prepare(uint32_t code) {
         if (_str) {
-            _value = kdebug_trace_string(code, 0, _str);
-            if (_value == (uint64_t)-1) _value = 0;
+//            _value = kdebug_trace_string(code, 0, _str);
+//            if (_value == (uint64_t)-1) _value = 0;
         }
     }
     void destroy(uint32_t code) {
         if (_str && _value) {
-            kdebug_trace_string(code, _value, nullptr);
+//            kdebug_trace_string(code, _value, nullptr);
         }
     }
     friend class ScopedTimer;
