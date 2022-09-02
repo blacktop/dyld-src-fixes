@@ -138,6 +138,7 @@ private:
         Console,
         XCTest
     };
+    void emitBegin();
     void runLeaks();
     void dumpLogs();
     void getLogsString(char** buffer);
@@ -225,7 +226,7 @@ catch_mach_exception_raise_state_identity(mach_port_t exception_port,
 }
 
 _process::_process() :  executablePath(nullptr), args(nullptr), env(nullptr), stdoutHandler(nullptr), stderrHandler(nullptr),
-                        crashHandler(nullptr), exitHandler(nullptr), pid(0), arch(currentArch), suspended(false), async(false) {}
+                        crashHandler(nullptr), exitHandler(nullptr), arch(currentArch), suspended(false) {}
 _process::~_process() {
     if (stdoutHandler) { Block_release(stdoutHandler);}
     if (stderrHandler) { Block_release(stderrHandler);}
@@ -241,7 +242,6 @@ void _process::set_stderr_handler(_dyld_test_reader_t SEH) { stderrHandler = Blo
 void _process::set_exit_handler(_dyld_test_exit_handler_t EH) { exitHandler = Block_copy(EH); }
 void _process::set_crash_handler(_dyld_test_crash_handler_t CH) { crashHandler = Block_copy(CH); }
 void _process::set_launch_suspended(bool S) { suspended = S; }
-void _process::set_launch_async(bool S) { async = S; }
 void _process::set_launch_arch(cpu_type_t A) { arch = A; }
 
 pid_t _process::launch() {
@@ -378,9 +378,6 @@ pid_t _process::launch() {
     if (!suspended) {
         kill(pid, SIGCONT);
     }
-    if (!async) {
-        dispatch_block_wait(oneShotSemaphoreBlock, DISPATCH_TIME_FOREVER);
-    }
     Block_release(oneShotSemaphoreBlock);
     dispatch_release(queue);
     return pid;
@@ -498,12 +495,15 @@ TestState::TestState() : testName(__progname), logImmediate(false), logOnSuccess
             }
         }
     });
+}
+
+void TestState::emitBegin() {
     if (output == BATS) {
         printf("[BEGIN]");
         if (checkForLeaks) {
             printf(" MallocStackLogging=1 MallocDebugReport=none");
         }
-        forEachEnvVar(environ, [this](const char* env, const char* val) {
+        forEachEnvVar(environ, [](const char* env, const char* val) {
             if ((strncmp(env, "DYLD_", 5) == 0) || (strncmp(env, "TEST_", 5) == 0)) {
                 printf(" %s=%s", env, val);
             }
@@ -546,21 +546,23 @@ TestState* TestState::getState() {
                 if(!state->compare_exchange_strong(expected, newState)) {
                     newState->~TestState();
                     free(temp);
+                } else {
+                    newState->emitBegin();
                 }
             }
             sState.store(*state);
+            break; // don't print [BEGIN] if a second main executeable is dlopen()ed
         }
     }
     assert(sState != nullptr);
     return sState;
 }
-
 __attribute__((noreturn))
 void TestState::runLeaks(void) {
     auto testState = TestState::getState();
-    pid_t pid = getpid();
+    pid_t currentPid = getpid();
     char pidString[32];
-    sprintf(&pidString[0], "%d", pid);
+    sprintf(&pidString[0], "%d", currentPid);
     if (getuid() != 0) {
         printf("Insufficient priviledges, skipping Leak check: %s\n", testState->testName);
         exit(0);
@@ -614,7 +616,7 @@ void TestState::_PASSV(const char* file, unsigned line, const char* format, va_l
     if (checkForLeaks) {
         runLeaks();
     } else {
-        _IOlock.withLock([this,&format,&args,&file,&line](){
+        _IOlock.withLock([this,&format,&args](){
             if (output == Console) {
                 printf("[\033[0;32mPASS\033[0m] %s: ", testName);
                 vprintf(format, args);

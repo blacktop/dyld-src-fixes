@@ -1,4 +1,6 @@
 
+// BOOT_ARGS: dyld_flags=2
+
 // BUILD(macos):  $CC foo.c -dynamiclib -DRESULT=9  -current_version 9  -install_name $RUN_DIR/Foo.framework/Foo -o $BUILD_DIR/alt9/Foo.framework/Foo
 // BUILD(macos):  $CC foo.c -dynamiclib -DRESULT=10 -current_version 10 -install_name $RUN_DIR/Foo.framework/Foo -o $BUILD_DIR/Foo.framework/Foo
 // BUILD(macos):  $CC foo.c -dynamiclib -DRESULT=11 -current_version 11 -install_name $RUN_DIR/Foo.framework/Foo -o $BUILD_DIR/alt11/Foo.framework/Versions/A/Foo
@@ -10,8 +12,9 @@
 // BUILD(macos):  $CC main.c            -o $BUILD_DIR/env-DYLD_VERSIONED_FRAMEWORK_PATH.exe $BUILD_DIR/Foo.framework/Foo
 // BUILD(macos):  $CC main.c            -o $BUILD_DIR/env-DYLD_VERSIONED_FRAMEWORK_PATH-missing.exe -Wl,-dyld_env,DYLD_VERSIONED_FRAMEWORK_PATH=@loader_path/alt12 $BUILD_DIR/Foo2.framework/Foo2
 
-// BUILD(macos):  $SYMLINK Versions/A/Foo  $BUILD_DIR/alt11/Foo.framework/Foo $DEPENDS_ON $BUILD_DIR/alt11/Foo.framework/Versions/A/Foo
+// BUILD(macos):  $SYMLINK Versions/A/Foo  $BUILD_DIR/alt11/Foo.framework/Foo $DEPENDS_ON_ARG $BUILD_DIR/alt11/Foo.framework/Versions/A/Foo
 // BUILD(macos):  $DYLD_ENV_VARS_ENABLE $BUILD_DIR/env-DYLD_VERSIONED_FRAMEWORK_PATH.exe
+// BUILD(macos):  $DYLD_ENV_VARS_ENABLE $BUILD_DIR/env-DYLD_VERSIONED_FRAMEWORK_PATH-missing.exe
 
 // BUILD(ios,tvos,watchos,bridgeos):
 
@@ -20,8 +23,9 @@
 // RUN: DYLD_VERSIONED_FRAMEWORK_PATH=$RUN_DIR/alt9 ./env-DYLD_VERSIONED_FRAMEWORK_PATH.exe 10
 // RUN: DYLD_VERSIONED_FRAMEWORK_PATH=$RUN_DIR/alt9:$RUN_DIR/alt11 ./env-DYLD_VERSIONED_FRAMEWORK_PATH.exe 11
 // RUN: DYLD_VERSIONED_FRAMEWORK_PATH=$RUN_DIR/alt11:$RUN_DIR/alt12 ./env-DYLD_VERSIONED_FRAMEWORK_PATH.exe 12
-// FIXME: Forcibly disable testing with closures since macOS does not use them and they are currently broken
-// RUN: DYLD_USE_CLOSURES=0 ./env-DYLD_VERSIONED_FRAMEWORK_PATH-missing.exe 12
+// RUN: ./env-DYLD_VERSIONED_FRAMEWORK_PATH-missing.exe 12
+// RUN: DYLD_AMFI_FAKE=0x81 ./env-DYLD_VERSIONED_FRAMEWORK_PATH-missing.exe 12
+// RUN: DYLD_AMFI_FAKE=0x01 ./env-DYLD_VERSIONED_FRAMEWORK_PATH-missing.exe 10
 
 #include <stdio.h>  // fprintf(), NULL
 #include <stdlib.h> // exit(), EXIT_SUCCESS
