@@ -26,7 +26,9 @@
 
 #include <assert.h>
 #include <stdbool.h>
+#if __has_include(<unistd.h>)
 #include <unistd.h>
+#endif
 #include <Availability.h>
 #include <TargetConditionals.h>
 #include <mach-o/dyld.h>
@@ -54,7 +56,15 @@ extern void _dyld_dlopen_atfork_child(void);
 typedef void (*_dyld_objc_notify_mapped)(unsigned count, const char* const paths[], const struct mach_header* const mh[]);
 typedef void (*_dyld_objc_notify_init)(const char* path, const struct mach_header* mh);
 typedef void (*_dyld_objc_notify_unmapped)(const char* path, const struct mach_header* mh);
-
+typedef void (*_dyld_objc_notify_patch_class)(const struct mach_header* originalMH, void* originalClass,
+                                              const struct mach_header* replacementMH, const void* replacementClass);
+struct _dyld_objc_notify_mapped_info {
+    const struct mach_header*   mh;
+    const char*                 path;
+    uint32_t                    dyldOptimized :  1,
+                                flags         : 31;
+};
+typedef void (*_dyld_objc_notify_mapped2)(unsigned count, const struct _dyld_objc_notify_mapped_info infos[]);
 
 //
 // Note: only for use by objc runtime
@@ -69,6 +79,37 @@ typedef void (*_dyld_objc_notify_unmapped)(const char* path, const struct mach_h
 void _dyld_objc_notify_register(_dyld_objc_notify_mapped    mapped,
                                 _dyld_objc_notify_init      init,
                                 _dyld_objc_notify_unmapped  unmapped);
+
+
+struct _dyld_objc_callbacks
+{
+    uintptr_t version;
+};
+
+struct _dyld_objc_callbacks_v1
+{
+    uintptr_t                       version; // == 1
+    _dyld_objc_notify_mapped        mapped;
+    _dyld_objc_notify_init          init;
+    _dyld_objc_notify_unmapped      unmapped;
+    _dyld_objc_notify_patch_class   patches;
+};
+
+struct _dyld_objc_callbacks_v2
+{
+    uintptr_t                       version; // == 2
+    _dyld_objc_notify_mapped2       mapped;
+    _dyld_objc_notify_init          init;
+    _dyld_objc_notify_unmapped      unmapped;
+    _dyld_objc_notify_patch_class   patches;
+};
+
+
+// Exists in Mac OS X 13.0 and later
+// Exists in iOS 16.0 and later
+// Exists in watchOS 9.0 and later
+// Exists in tvOS 16.0 and later.
+void _dyld_objc_register_callbacks(const struct _dyld_objc_callbacks*);
 
 
 //
@@ -123,6 +164,12 @@ extern const struct mach_header* dyld_image_header_containing_address(const void
 // Exists in Mac OS X 10.16 and later
 extern const struct mach_header* _dyld_get_prog_image_header(void);
 
+//
+// Return the mach header of the binary returned by dlopen
+//
+// Exists in Mac OS X 13.0 and later
+extern const struct mach_header* _dyld_get_dlopen_image_header(void* handle);
+
 typedef uint32_t dyld_platform_t;
 
 typedef struct {
@@ -131,7 +178,7 @@ typedef struct {
 } dyld_build_version_t;
 
 // Returns the active platform of the process
-extern dyld_platform_t dyld_get_active_platform(void) __API_AVAILABLE(macos(10.14), ios(12.0), watchos(5.0), tvos(12.0)/*, bridgeos(3.0)*/);
+extern dyld_platform_t dyld_get_active_platform(void) __API_AVAILABLE(macos(10.14), ios(12.0), watchos(5.0), tvos(12.0));
 
 // Base platforms are platforms that have version numbers (macOS, iOS, watchos, tvOS, bridgeOS)
 // All other platforms are mapped to a base platform for version checks
@@ -157,27 +204,27 @@ extern dyld_platform_t dyld_get_active_platform(void) __API_AVAILABLE(macos(10.1
 //      Old behaviour all other platforms, as well as older iOSes and watchOSes
 //  }
 
-extern dyld_platform_t dyld_get_base_platform(dyld_platform_t platform) __API_AVAILABLE(macos(10.14), ios(12.0), watchos(5.0), tvos(12.0)/*, bridgeos(3.0)*/);
+extern dyld_platform_t dyld_get_base_platform(dyld_platform_t platform) __API_AVAILABLE(macos(10.14), ios(12.0), watchos(5.0), tvos(12.0));
 
 // SPI to ask if a platform is a simulation platform
-extern bool dyld_is_simulator_platform(dyld_platform_t platform) __API_AVAILABLE(macos(10.14), ios(12.0), watchos(5.0), tvos(12.0)/*, bridgeos(3.0)*/);
+extern bool dyld_is_simulator_platform(dyld_platform_t platform) __API_AVAILABLE(macos(10.14), ios(12.0), watchos(5.0), tvos(12.0));
 
 // Takes a version and returns if the image was built againt that SDK or newer
 // In the case of multi_plaform mach-o's it tests against the active platform
-extern bool dyld_sdk_at_least(const struct mach_header* mh, dyld_build_version_t version) __API_AVAILABLE(macos(10.14), ios(12.0), watchos(5.0), tvos(12.0)/*, bridgeos(3.0)*/);
+extern bool dyld_sdk_at_least(const struct mach_header* mh, dyld_build_version_t version) __API_AVAILABLE(macos(10.14), ios(12.0), watchos(5.0), tvos(12.0));
 
 // Takes a version and returns if the image was built with that minos version or newer
 // In the case of multi_plaform mach-o's it tests against the active platform
-extern bool dyld_minos_at_least(const struct mach_header* mh, dyld_build_version_t version) __API_AVAILABLE(macos(10.14), ios(12.0), watchos(5.0), tvos(12.0)/*, bridgeos(3.0)*/);
+extern bool dyld_minos_at_least(const struct mach_header* mh, dyld_build_version_t version) __API_AVAILABLE(macos(10.14), ios(12.0), watchos(5.0), tvos(12.0));
 
 // Convenience versions of the previous two functions that run against the the main executable
-extern bool dyld_program_sdk_at_least(dyld_build_version_t version) __API_AVAILABLE(macos(10.14), ios(12.0), watchos(5.0), tvos(12.0)/*, bridgeos(3.0)*/);
-extern bool dyld_program_minos_at_least(dyld_build_version_t version) __API_AVAILABLE(macos(10.14), ios(12.0), watchos(5.0), tvos(12.0)/*, bridgeos(3.0)*/);
+extern bool dyld_program_sdk_at_least(dyld_build_version_t version) __API_AVAILABLE(macos(10.14), ios(12.0), watchos(5.0), tvos(12.0));
+extern bool dyld_program_minos_at_least(dyld_build_version_t version) __API_AVAILABLE(macos(10.14), ios(12.0), watchos(5.0), tvos(12.0));
 
 // Function that walks through the load commands and calls the internal block for every version found
 // Intended as a fallback for very complex (and rare) version checks, or for tools that need to
 // print our everything for diagnostic reasons
-extern void dyld_get_image_versions(const struct mach_header* mh, void (^callback)(dyld_platform_t platform, uint32_t sdk_version, uint32_t min_version)) __API_AVAILABLE(macos(10.14), ios(12.0), watchos(5.0), tvos(12.0)/*, bridgeos(3.0)*/);
+extern void dyld_get_image_versions(const struct mach_header* mh, void (^callback)(dyld_platform_t platform, uint32_t sdk_version, uint32_t min_version)) __API_AVAILABLE(macos(10.14), ios(12.0), watchos(5.0), tvos(12.0));
 
 // Convienence constants for dyld version SPIs.
 
@@ -228,19 +275,19 @@ extern uint32_t dyld_get_program_sdk_watch_os_version(void) __API_AVAILABLE(watc
 extern uint32_t dyld_get_program_min_watch_os_version(void) __API_AVAILABLE(watchos(3.0));
 #endif
 
-//#if TARGET_OS_BRIDGE
-//// bridgeOS only.
-//// This finds the bridgeOS SDK version that the main executable was built against.
-//// Exists in bridgeOSOS 2.0 and later
-//extern uint32_t dyld_get_program_sdk_bridge_os_version(void) __API_AVAILABLE(bridgeos(2.0));
-//
-//// bridgeOS only.
-//// This finds the Watch min OS version that the main executable was built to run on.
-//// Note: dyld_get_program_min_os_version() returns the iOS equivalent (e.g. 9.0)
-////       whereas this returns the raw bridgeOS version (e.g. 2.0).
-//// Exists in bridgeOS 2.0 and later
-//extern uint32_t dyld_get_program_min_bridge_os_version(void) __API_AVAILABLE(bridgeos(2.0));
-//#endif
+#if TARGET_OS_BRIDGE
+// bridgeOS only.
+// This finds the bridgeOS SDK version that the main executable was built against.
+// Exists in bridgeOSOS 2.0 and later
+extern uint32_t dyld_get_program_sdk_bridge_os_version(void) __API_AVAILABLE(bridgeos(2.0));
+
+// bridgeOS only.
+// This finds the Watch min OS version that the main executable was built to run on.
+// Note: dyld_get_program_min_os_version() returns the iOS equivalent (e.g. 9.0)
+//       whereas this returns the raw bridgeOS version (e.g. 2.0).
+// Exists in bridgeOS 2.0 and later
+extern uint32_t dyld_get_program_min_bridge_os_version(void) __API_AVAILABLE(bridgeos(2.0));
+#endif
 
 //
 // This finds the min OS version a binary was built to run on.
@@ -263,7 +310,9 @@ extern uint32_t dyld_get_program_min_os_version(void);
 
 
 //
-// Returns if any OS dylib has overridden its copy in the shared cache
+// Returns true if any OS dylib has overridden its copy in the shared cache
+// Returns false for iOS unzippered twins in the shared cache overriding
+// their macOS counterpart in catalyst mode.
 //
 // Exists in iPhoneOS 3.1 and later 
 // Exists in Mac OS X 10.10 and later
@@ -618,7 +667,7 @@ struct _dyld_protocol_conformance_result {
 //
 // Exists in Mac OS X 12.0 and later
 // Exists in iOS 15.0 and later
-struct _dyld_protocol_conformance_result
+extern struct _dyld_protocol_conformance_result
 _dyld_find_protocol_conformance(const void *protocolDescriptor,
                                 const void *metadataType,
                                 const void *typeDescriptor);
@@ -628,7 +677,7 @@ _dyld_find_protocol_conformance(const void *protocolDescriptor,
 //
 // Exists in Mac OS X 12.0 and later
 // Exists in iOS 15.0 and later
-struct _dyld_protocol_conformance_result
+extern struct _dyld_protocol_conformance_result
 _dyld_find_foreign_type_protocol_conformance(const void *protocol,
                                              const char *foreignTypeIdentityStart,
                                              size_t foreignTypeIdentityLength);
@@ -645,6 +694,37 @@ extern uint32_t _dyld_swift_optimizations_version(void) __API_AVAILABLE(macos(12
 // Swift uses this define to guard for the above symbol being available at build time
 #define DYLD_FIND_PROTOCOL_CONFORMANCE_DEFINED 1
 
+// Called only by Swift to check if dyld has pre-optimized protocol conformances in the closure
+// for the given on-disk mach_header containing a __swift5_proto section
+//
+// Exists in Mac OS X 13.0 and later
+// Exists in iOS 16.0 and later
+extern bool _dyld_has_preoptimized_swift_protocol_conformances(const struct mach_header* mh);
+
+// Called only by Swift to see if dyld has pre-optimized protocol conformances for the given
+// protocolDescriptor/metadataType and typeDescriptor in the closure on disk.
+//
+// Exists in Mac OS X 13.0 and later
+// Exists in iOS 16.0 and later
+extern struct _dyld_protocol_conformance_result
+_dyld_find_protocol_conformance_on_disk(const void *protocolDescriptor,
+                                        const void *metadataType,
+                                        const void *typeDescriptor,
+                                        uint32_t flags);
+
+// Called only by Swift to see if dyld has pre-optimized protocol conformances for the given
+// foreign type descriptor name and protocol in the closure on disk.
+//
+// Exists in Mac OS X 13.0 and later
+// Exists in iOS 16.0 and later
+extern struct _dyld_protocol_conformance_result
+_dyld_find_foreign_type_protocol_conformance_on_disk(const void *protocol,
+                                                     const char *foreignTypeIdentityStart,
+                                                     size_t foreignTypeIdentityLength,
+                                                     uint32_t flags);
+
+// Swift uses this define to guard for the above symbols being available at build time
+#define DYLD_FIND_PROTOCOL_ON_DISK_CONFORMANCE_DEFINED 1
 
 // called by exit() before it calls cxa_finalize() so that thread_local
 // objects are destroyed before global objects.
@@ -666,6 +746,9 @@ extern bool _dyld_is_objc_constant(DyldObjCConstantKind kind, const void* addr);
 // temp exports to keep tapi happy, until ASan stops using dyldVersionNumber
 extern double      dyldVersionNumber;
 extern const char* dyldVersionString;
+
+// True if dyld told objc to patch classes
+extern uint8_t dyld_process_has_objc_patches;
 
 #if __cplusplus
 }

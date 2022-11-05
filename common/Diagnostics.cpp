@@ -51,19 +51,19 @@
 
 #include "Diagnostics.h"
 
-#if BUILDING_CACHE_BUILDER
+#if BUILDING_CACHE_BUILDER || BUILDING_UNIT_TESTS || BUILDING_CACHE_BUILDER_UNIT_TESTS
   #include <dispatch/dispatch.h>
   dispatch_queue_t sWarningQueue = dispatch_queue_create("com.apple.dyld.cache-builder.warnings", NULL);
 #endif
 
 Diagnostics::Diagnostics(bool verbose)
-#if BUILDING_CACHE_BUILDER
+#if BUILDING_CACHE_BUILDER || BUILDING_UNIT_TESTS || BUILDING_CACHE_BUILDER_UNIT_TESTS
     : _prefix(""), _verbose(verbose)
 #endif
 {
 }
 
-#if BUILDING_CACHE_BUILDER
+#if BUILDING_CACHE_BUILDER || BUILDING_UNIT_TESTS || BUILDING_CACHE_BUILDER_UNIT_TESTS
 Diagnostics::Diagnostics(const std::string& prefix, bool verbose)
     : _prefix(prefix),_verbose(verbose)
 {
@@ -79,44 +79,36 @@ void Diagnostics::error(const char* format, ...)
 {
     va_list    list;
     va_start(list, format);
-#if __x86_64__
     error(format, list);
-#else
-    errorVA(format, list);
-#endif
     va_end(list);
 }
 
-#if __x86_64__
 void Diagnostics::error(const char* format, va_list list)
-#else
-void Diagnostics::errorVA(const char* format, va_list list)
-#endif
 {
-//    if ( _buffer == nullptr )
-//        _buffer = _simple_salloc();
-//    _simple_vsprintf(_buffer, format, list);
-//
-//#if BUILDING_CACHE_BUILDER
-//    if ( !_verbose )
-//        return;
-//
-//    if (_prefix.empty()) {
-//        fprintf(stderr, "%s\n", _simple_string(_buffer));
-//    } else {
-//        fprintf(stderr, "[%s] %s\n", _prefix.c_str(), _simple_string(_buffer));
-//    }
-//#endif
+    // if ( _buffer == nullptr )
+    //     _buffer = _simple_salloc();
+    // _simple_vsprintf(_buffer, format, list);
+
+#if BUILDING_CACHE_BUILDER || BUILDING_UNIT_TESTS || BUILDING_CACHE_BUILDER_UNIT_TESTS
+    if ( !_verbose )
+        return;
+
+    if (_prefix.empty()) {
+        fprintf(stderr, "%s\n", _simple_string(_buffer));
+    } else {
+        fprintf(stderr, "[%s] %s\n", _prefix.c_str(), _simple_string(_buffer));
+    }
+#endif
 }
 
  void Diagnostics::appendError(const char* format, ...)
  {
-//    if ( _buffer != nullptr )
-//        _simple_sresize(_buffer);
-//    va_list list;
-//    va_start(list, format);
-//    error(format, list);
-//    va_end(list);
+    // if ( _buffer != nullptr )
+    //     _simple_sresize(_buffer);
+    va_list list;
+    va_start(list, format);
+    error(format, list);
+    va_end(list);
  }
 
 bool Diagnostics::hasError() const
@@ -131,9 +123,9 @@ bool Diagnostics::noError() const
 
 void Diagnostics::clearError()
 {
-//    if ( _buffer )
-//        _simple_sfree(_buffer);
-//    _buffer = nullptr;
+    // if ( _buffer )
+    //     _simple_sfree(_buffer);
+    _buffer = nullptr;
 }
 
 void Diagnostics::assertNoError() const
@@ -144,38 +136,12 @@ void Diagnostics::assertNoError() const
 
 bool Diagnostics::errorMessageContains(const char* subString) const
 {
-    if ( _buffer == nullptr )
+    // if ( _buffer == nullptr )
         return false;
-//    return (strstr(_simple_string(_buffer), subString) != nullptr);
-    return false;
+    // return (strstr(_simple_string(_buffer), subString) != nullptr);
 }
 
-void Diagnostics::quotePath(const char* path, char newPath[PATH_MAX])
-{
-    if ( !path ) {
-        newPath[0] = '\0';
-        return;
-    }
-    size_t len = strlen(path);
-    if ( len >= PATH_MAX )
-        len = PATH_MAX-1;
-    for (size_t i = 0; i < len; i++) {
-        newPath[i] = path[i];
-        if ( newPath[i] == '\'' )
-            newPath[i] = ' ';
-    }
-    newPath[len] = '\0';
-}
-
-
-#if !BUILDING_CACHE_BUILDER
-const char* Diagnostics::errorMessage() const
-{
-//    return _buffer ? _simple_string(_buffer) : "";
-    return "";
-}
-
-#else
+#if BUILDING_CACHE_BUILDER || BUILDING_UNIT_TESTS || BUILDING_CACHE_BUILDER_UNIT_TESTS
 void Diagnostics::warning(const char* format, ...)
 {
     _SIMPLE_STRING tmp = _simple_salloc();
@@ -183,13 +149,9 @@ void Diagnostics::warning(const char* format, ...)
     va_start(list, format);
     _simple_vsprintf(tmp, format, list);
     va_end(list);
-#if BUILDING_CACHE_BUILDER
     dispatch_sync(sWarningQueue, ^{
         _warnings.insert(_simple_string(tmp));
     });
-#else
-    _warnings.insert(_simple_string(tmp));
-#endif
     _simple_sfree(tmp);
 }
 
@@ -240,29 +202,31 @@ const char* Diagnostics::errorMessageCStr() const
 
 const std::set<std::string> Diagnostics::warnings() const
 {
-#if BUILDING_CACHE_BUILDER
     __block std::set<std::string> retval;
     dispatch_sync(sWarningQueue, ^{
         retval = _warnings;
     });
     return retval;
-#else
-    return _warnings;
-#endif
 }
 
 void Diagnostics::clearWarnings()
 {
-#if BUILDING_CACHE_BUILDER
     dispatch_sync(sWarningQueue, ^{
         _warnings.clear();
     });
-#else
-    _warnings.clear();
-#endif
 }
 
-#if BUILDING_CACHE_BUILDER
+#else
+
+const char* Diagnostics::errorMessage() const
+{
+    // return _buffer ? _simple_string(_buffer) : "";
+    return "";
+}
+
+#endif
+
+#if BUILDING_CACHE_BUILDER || BUILDING_UNIT_TESTS || BUILDING_CACHE_BUILDER_UNIT_TESTS
 void TimeRecorder::pushTimedSection() {
     openTimings.push_back(mach_absolute_time());
 }
@@ -286,6 +250,8 @@ void TimeRecorder::recordTime(const char* format, ...) {
         });
     }
 
+    free(output_string);
+
     openTimings.push_back(mach_absolute_time());
 }
 
@@ -308,7 +274,6 @@ void TimeRecorder::logTimings() {
 
     timings.clear();
 }
-#endif
 
 #endif
 
