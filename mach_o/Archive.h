@@ -35,7 +35,7 @@
 // ld
 #include <TargetConditionals.h>
 #if !TARGET_OS_EXCLAVEKIT
-#include "File.h"
+//#include "File.h"
 #endif //!TARGET_OS_EXCLAVEKIT
 
 namespace mach_o {

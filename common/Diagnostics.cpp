@@ -31,8 +31,8 @@
 #if TARGET_OS_EXCLAVEKIT
   extern "C" void abort_report_np(const char* format, ...) __attribute__((noreturn,format(printf, 1, 2)));
 #else
-  #include <_simple.h>
-  #include <libc_private.h>
+//  #include <_simple.h>
+//  #include <libc_private.h>
 #endif
 #if BUILDING_CACHE_BUILDER || BUILDING_UNIT_TESTS || BUILDING_CACHE_BUILDER_UNIT_TESTS
   #include <mach/mach_time.h> // mach_absolute_time()
@@ -78,42 +78,42 @@ void Diagnostics::error(const char* format, ...)
 
 void Diagnostics::error(const char* format, va_list list)
 {
-#if TARGET_OS_EXCLAVEKIT
-    vsnprintf(_strBuf, sizeof(_strBuf), format, list);
-#else
-    if ( _buffer == nullptr )
-        _buffer = _simple_salloc();
-    _simple_vsprintf(_buffer, format, list);
-#endif
-
-#if BUILDING_CACHE_BUILDER || BUILDING_UNIT_TESTS || BUILDING_CACHE_BUILDER_UNIT_TESTS
-    if ( !_verbose )
-        return;
-
-    if (_prefix.empty()) {
-        fprintf(stderr, "%s\n", _simple_string(_buffer));
-    } else {
-        fprintf(stderr, "[%s] %s\n", _prefix.c_str(), _simple_string(_buffer));
-    }
-#endif
+//#if TARGET_OS_EXCLAVEKIT
+//    vsnprintf(_strBuf, sizeof(_strBuf), format, list);
+//#else
+//    if ( _buffer == nullptr )
+//        _buffer = _simple_salloc();
+//    _simple_vsprintf(_buffer, format, list);
+//#endif
+//
+//#if BUILDING_CACHE_BUILDER || BUILDING_UNIT_TESTS || BUILDING_CACHE_BUILDER_UNIT_TESTS
+//    if ( !_verbose )
+//        return;
+//
+//    if (_prefix.empty()) {
+//        fprintf(stderr, "%s\n", _simple_string(_buffer));
+//    } else {
+//        fprintf(stderr, "[%s] %s\n", _prefix.c_str(), _simple_string(_buffer));
+//    }
+//#endif
 }
 
  void Diagnostics::appendError(const char* format, ...)
  {
-#if TARGET_OS_EXCLAVEKIT
-    size_t len = strlen(_strBuf);
-    va_list list;
-    va_start(list, format);
-    vsnprintf(&_strBuf[len], sizeof(_strBuf)-len, format, list);
-    va_end(list);
-#else
-   if ( _buffer != nullptr )
-        _simple_sresize(_buffer);
-    va_list list;
-    va_start(list, format);
-    error(format, list);
-    va_end(list);
-#endif
+//#if TARGET_OS_EXCLAVEKIT
+//    size_t len = strlen(_strBuf);
+//    va_list list;
+//    va_start(list, format);
+//    vsnprintf(&_strBuf[len], sizeof(_strBuf)-len, format, list);
+//    va_end(list);
+//#else
+//   if ( _buffer != nullptr )
+//        _simple_sresize(_buffer);
+//    va_list list;
+//    va_start(list, format);
+//    error(format, list);
+//    va_end(list);
+//#endif
  }
 
 bool Diagnostics::hasError() const
@@ -136,19 +136,19 @@ bool Diagnostics::noError() const
 
 void Diagnostics::clearError()
 {
-#if TARGET_OS_EXCLAVEKIT
-    *_strBuf = '\0';
-#else
-    if ( _buffer )
-        _simple_sfree(_buffer);
-    _buffer = nullptr;
-#endif
+//#if TARGET_OS_EXCLAVEKIT
+//    *_strBuf = '\0';
+//#else
+//    if ( _buffer )
+//        _simple_sfree(_buffer);
+//    _buffer = nullptr;
+//#endif
 }
 
 void Diagnostics::assertNoError() const
 {
-    if ( hasError() )
-        abort_report_np("%s", errorMessageCStr());
+//    if ( hasError() )
+//        abort_report_np("%s", errorMessageCStr());
 }
 
 bool Diagnostics::errorMessageContains(const char* subString) const
@@ -161,15 +161,15 @@ bool Diagnostics::errorMessageContains(const char* subString) const
 #if BUILDING_CACHE_BUILDER || BUILDING_UNIT_TESTS || BUILDING_CACHE_BUILDER_UNIT_TESTS
 void Diagnostics::warning(const char* format, ...)
 {
-    _SIMPLE_STRING tmp = _simple_salloc();
-    va_list    list;
-    va_start(list, format);
-    _simple_vsprintf(tmp, format, list);
-    va_end(list);
-    dispatch_sync(sWarningQueue, ^{
-        _warnings.insert(_simple_string(tmp));
-    });
-    _simple_sfree(tmp);
+//    _SIMPLE_STRING tmp = _simple_salloc();
+//    va_list    list;
+//    va_start(list, format);
+//    _simple_vsprintf(tmp, format, list);
+//    va_end(list);
+//    dispatch_sync(sWarningQueue, ^{
+//        _warnings.insert(_simple_string(tmp));
+//    });
+//    _simple_sfree(tmp);
 }
 
 void Diagnostics::verbose(const char* format, ...)
@@ -211,9 +211,9 @@ std::string Diagnostics::errorMessage() const
 
 const char* Diagnostics::errorMessageCStr() const
 {
-    if ( _buffer != nullptr )
-        return _simple_string(_buffer);
-    else
+//    if ( _buffer != nullptr )
+//        return _simple_string(_buffer);
+//    else
         return "";
 }
 
@@ -242,7 +242,8 @@ const char* Diagnostics::errorMessage() const
 #if TARGET_OS_EXCLAVEKIT
     return _strBuf;
 #else
-    return _simple_string(_buffer);
+//    return _simple_string(_buffer);
+    return "error";
 #endif
 }
 

@@ -23,9 +23,9 @@
 
 #include <TargetConditionals.h>
 #if !TARGET_OS_EXCLAVEKIT
-  #include <_simple.h>
+//  #include <_simple.h>
   #include <stdint.h>
-  #include <dyld/VersionMap.h>
+//  #include <dyld/VersionMap.h>
   #include <mach/mach_time.h> // mach_absolute_time()
   #include <mach-o/dyld_priv.h>
   #include <sys/syscall.h>
@@ -472,12 +472,14 @@ ProcessConfig::Process::Process(const KernelArgs* kernArgs, SyscallDelegate& sys
 #if !TARGET_OS_EXCLAVEKIT
 const char* ProcessConfig::Process::appleParam(const char* key) const
 {
-    return _simple_getenv((const char**)apple, key);
+//    return _simple_getenv((const char**)apple, key);
+    return "";
 }
 
 const char* ProcessConfig::Process::environ(const char* key) const
 {
-    return _simple_getenv((const char**)envp, key);
+//    return _simple_getenv((const char**)envp, key);
+    return "";
 }
 
 std::pair<uint64_t, uint64_t> ProcessConfig::Process::fileIDFromFileHexStrings(const char* encodedFileInfo)
@@ -600,19 +602,19 @@ uint32_t ProcessConfig::Process::findVersionSetEquivalent(dyld3::Platform versio
     uint32_t candidateVersion = 0;
     uint32_t candidateVersionEquivalent = 0;
     uint32_t newVersionSetVersion = 0;
-    for (const auto& i : dyld3::sVersionMap) {
-        switch (MachOFile::basePlatform(versionPlatform)) {
-            case dyld3::Platform::macOS:    newVersionSetVersion = i.macos; break;
-            case dyld3::Platform::iOS:      newVersionSetVersion = i.ios; break;
-            case dyld3::Platform::watchOS:  newVersionSetVersion = i.watchos; break;
-            case dyld3::Platform::tvOS:     newVersionSetVersion = i.tvos; break;
-            case dyld3::Platform::bridgeOS: newVersionSetVersion = i.bridgeos; break;
-            default: newVersionSetVersion = 0xffffffff; // If we do not know about the platform it is newer than everything
-        }
-        if (newVersionSetVersion > version) { break; }
-        candidateVersion = newVersionSetVersion;
-        candidateVersionEquivalent = i.set;
-    }
+//    for (const auto& i : dyld3::sVersionMap) {
+//        switch (MachOFile::basePlatform(versionPlatform)) {
+//            case dyld3::Platform::macOS:    newVersionSetVersion = i.macos; break;
+//            case dyld3::Platform::iOS:      newVersionSetVersion = i.ios; break;
+//            case dyld3::Platform::watchOS:  newVersionSetVersion = i.watchos; break;
+//            case dyld3::Platform::tvOS:     newVersionSetVersion = i.tvos; break;
+//            case dyld3::Platform::bridgeOS: newVersionSetVersion = i.bridgeos; break;
+//            default: newVersionSetVersion = 0xffffffff; // If we do not know about the platform it is newer than everything
+//        }
+//        if (newVersionSetVersion > version) { break; }
+//        candidateVersion = newVersionSetVersion;
+//        candidateVersionEquivalent = i.set;
+//    }
 
     if (newVersionSetVersion == 0xffffffff && candidateVersion == 0) {
         candidateVersionEquivalent = newVersionSetVersion;
@@ -665,18 +667,18 @@ Platform ProcessConfig::Process::getMainPlatform()
                     result = dyld3::Platform::iOS;
                 }
 
-                for (const dyld3::VersionSetEntry& entry : dyld3::sVersionMap) {
-                    if ( entry.macos == this->mainExecutableSDKVersion ) {
-                        this->mainExecutableSDKVersion = entry.ios;
-                        break;
-                    }
-                }
-                for (const dyld3::VersionSetEntry& entry : dyld3::sVersionMap) {
-                    if ( entry.macos == this->mainExecutableMinOSVersion ) {
-                        this->mainExecutableMinOSVersion = entry.ios;
-                        break;
-                    }
-                }
+//                for (const dyld3::VersionSetEntry& entry : dyld3::sVersionMap) {
+//                    if ( entry.macos == this->mainExecutableSDKVersion ) {
+//                        this->mainExecutableSDKVersion = entry.ios;
+//                        break;
+//                    }
+//                }
+//                for (const dyld3::VersionSetEntry& entry : dyld3::sVersionMap) {
+//                    if ( entry.macos == this->mainExecutableMinOSVersion ) {
+//                        this->mainExecutableMinOSVersion = entry.ios;
+//                        break;
+//                    }
+//                }
             }
         }
     }
@@ -1569,7 +1571,7 @@ ProcessConfig::PathOverrides::PathOverrides(const Process& process, const Securi
         if ( strlen(crashMsg) > 15 ) {
             // if there is a crash, have DYLD_ env vars show up in crash log as secondary string
             // main string is missing symbol/dylib message
-            CRSetCrashLogMessage2(allocator.strdup(crashMsg));
+//            CRSetCrashLogMessage2(allocator.strdup(crashMsg));
         }
     }
     else if ( log.searching ) {
@@ -2548,10 +2550,10 @@ void console(const char* format, ...)
         ::close(logFD);
   #endif // BUILDING_DYLD
     } else {
-        ::_simple_dprintf(2, "dyld[%d]: ", getpid());
+//        ::_simple_dprintf(2, "dyld[%d]: ", getpid());
         va_list list;
         va_start(list, format);
-        ::_simple_vdprintf(2, format, list);
+//        ::_simple_vdprintf(2, format, list);
         va_end(list);
     }
 #endif // TARGET_OS_EXCLAVEKIT

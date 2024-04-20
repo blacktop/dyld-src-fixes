@@ -33,7 +33,7 @@
   #include <unistd.h>
 #endif
 
-#include "Array.h"
+// #include "Array.h"
 #include "Header.h"
 #include "Architecture.h"
 #include "Misc.h"
@@ -625,10 +625,10 @@ Error Header::validSemanticsDependents(const Policy& policy) const
                 const char* libSystemDir = "/System/DriverKit/usr/lib/system/";
                 if ( strncmp(installName, libSystemDir, strlen(libSystemDir)) != 0 )
                     isLibSystem = true;
-            } else if ( this->platformAndVersions().platform.isExclaveKit() ) {
-                const char* libSystemDir = "/System/ExclaveKit/usr/lib/system/";
-                if ( strncmp(installName, libSystemDir, strlen(libSystemDir)) != 0 )
-                    isLibSystem = true;
+//            } else if ( this->platformAndVersions().platform.isExclaveKit() ) {
+//                const char* libSystemDir = "/System/ExclaveKit/usr/lib/system/";
+//                if ( strncmp(installName, libSystemDir, strlen(libSystemDir)) != 0 )
+//                    isLibSystem = true;
             } else {
                 const char* libSystemDir = "/usr/lib/system/";
                 if ( strncmp(installName, libSystemDir, strlen(libSystemDir)) != 0 )
@@ -750,101 +750,101 @@ bool Interval::overlaps(const Interval& other) const
 
 Error Header::validSemanticsSegments(const Policy& policy, uint64_t fileSize) const
 {
-    // check each segment load command in isolation
-    struct SegRange
-    {
-        Interval    vm;
-        Interval    file;
-        const char* name;
-    };
-    STACK_ALLOC_OVERFLOW_SAFE_ARRAY(SegRange, ranges, 12);
-    __block Error     lcError;
-    __block bool      hasTEXT              = false;
-    __block bool      hasLINKEDIT          = false;
-    __block uint64_t segmentIndexText     = 0;
-    __block uint64_t segmentIndexLinkedit = 0;
-    forEachLoadCommandSafe(^(const load_command* cmd, bool& stop) {
-        if ( cmd->cmd == LC_SEGMENT_64 ) {
-            const segment_command_64* seg64 = (segment_command_64*)cmd;
-            if ( strcmp(seg64->segname, "__TEXT") == 0 ) {
-                hasTEXT          = true;
-                segmentIndexText = ranges.count();
-            }
-            else if ( strcmp(seg64->segname, "__LINKEDIT") == 0 ) {
-                hasLINKEDIT          = true;
-                segmentIndexLinkedit = ranges.count();
-            }
-            lcError = validSegment<segment_command_64, section_64>(policy, fileSize, seg64);
-            ranges.push_back({ { seg64->vmaddr, seg64->vmaddr + seg64->vmsize }, { seg64->fileoff, seg64->fileoff + seg64->filesize }, seg64->segname });
-        }
-        else if ( cmd->cmd == LC_SEGMENT ) {
-            const segment_command* seg32 = (segment_command*)cmd;
-            if ( strcmp(seg32->segname, "__TEXT") == 0 ) {
-                hasTEXT          = true;
-                segmentIndexText = ranges.count();
-            }
-            else if ( strcmp(seg32->segname, "__LINKEDIT") == 0 ) {
-                hasLINKEDIT          = true;
-                segmentIndexLinkedit = ranges.count();
-            }
-            lcError = validSegment<segment_command, section>(policy, fileSize, seg32);
-            ranges.push_back({ { seg32->vmaddr, seg32->vmaddr + seg32->vmsize }, { seg32->fileoff, seg32->fileoff + seg32->filesize }, seg32->segname });
-        }
-        if ( lcError )
-            stop = true;
-    });
-    if ( lcError )
-        return std::move(lcError);
-
-    // dynamic binaries have further restrictions
-    if ( isDyldManaged() ) {
-        if ( hasTEXT ) {
-            if ( ranges[segmentIndexText].file.start != 0 )
-                return Error("__TEXT segment fileoffset is not zero");
-            const uint32_t headerAndLCSize = machHeaderSize() + mh.sizeofcmds;
-            if ( ranges[segmentIndexText].file.end < headerAndLCSize )
-                return Error("load commands do not fit in __TEXT segment");
-        }
-        else {
-            return Error("missing __TEXT segment");
-        }
-        // FIXME: LINKEDIT checks need to move to Analyzer
-        //if ( !hasLINKEDIT )
-        //    return Error("missing __LINKEDIT segment");
-    }
-
-    // check for overlapping segments, by looking at every possible pair of segments
-    for ( const SegRange& r1 : ranges ) {
-        for ( const SegRange& r2 : ranges ) {
-            if ( &r1 == &r2 )
-                continue;
-            if ( r1.vm.overlaps(r2.vm) )
-                return Error("vm range of segment '%s' overlaps segment '%s'", r1.name, r2.name);
-            if ( r1.file.overlaps(r2.file) )
-                return Error("file range of segment '%s' overlaps segment '%s'", r1.name, r2.name);
-        }
-    }
-
-    // check segment load command order matches file content order which matches vm order
-    // skip dyld cache because segments are moved around too much
-    if ( policy.enforceSegmentOrderMatchesLoadCmds() && !inDyldCache() ) {
-        const SegRange* last = nullptr;
-        for ( const SegRange& r : ranges ) {
-            if ( last != nullptr ) {
-                if ( (r.file.start < last->file.start) && (r.file.start != r.file.end) )
-                    return Error("segment '%s' file offset out of order", r.name);
-                if ( r.vm.start < last->vm.start ) {
-                    if ( isFileSet() && (strcmp(r.name, "__PRELINK_INFO") == 0) ) {
-                        // __PRELINK_INFO may have no vmaddr set
-                    }
-                    else {
-                        return Error("segment '%s' vm address out of order", r.name);
-                    }
-                }
-            }
-            last = &r;
-        }
-    }
+//    // check each segment load command in isolation
+//    struct SegRange
+//    {
+//        Interval    vm;
+//        Interval    file;
+//        const char* name;
+//    };
+//    STACK_ALLOC_OVERFLOW_SAFE_ARRAY(SegRange, ranges, 12);
+//    __block Error     lcError;
+//    __block bool      hasTEXT              = false;
+//    __block bool      hasLINKEDIT          = false;
+//    __block uint64_t segmentIndexText     = 0;
+//    __block uint64_t segmentIndexLinkedit = 0;
+//    forEachLoadCommandSafe(^(const load_command* cmd, bool& stop) {
+//        if ( cmd->cmd == LC_SEGMENT_64 ) {
+//            const segment_command_64* seg64 = (segment_command_64*)cmd;
+//            if ( strcmp(seg64->segname, "__TEXT") == 0 ) {
+//                hasTEXT          = true;
+//                segmentIndexText = ranges.count();
+//            }
+//            else if ( strcmp(seg64->segname, "__LINKEDIT") == 0 ) {
+//                hasLINKEDIT          = true;
+//                segmentIndexLinkedit = ranges.count();
+//            }
+//            lcError = validSegment<segment_command_64, section_64>(policy, fileSize, seg64);
+//            ranges.push_back({ { seg64->vmaddr, seg64->vmaddr + seg64->vmsize }, { seg64->fileoff, seg64->fileoff + seg64->filesize }, seg64->segname });
+//        }
+//        else if ( cmd->cmd == LC_SEGMENT ) {
+//            const segment_command* seg32 = (segment_command*)cmd;
+//            if ( strcmp(seg32->segname, "__TEXT") == 0 ) {
+//                hasTEXT          = true;
+//                segmentIndexText = ranges.count();
+//            }
+//            else if ( strcmp(seg32->segname, "__LINKEDIT") == 0 ) {
+//                hasLINKEDIT          = true;
+//                segmentIndexLinkedit = ranges.count();
+//            }
+//            lcError = validSegment<segment_command, section>(policy, fileSize, seg32);
+//            ranges.push_back({ { seg32->vmaddr, seg32->vmaddr + seg32->vmsize }, { seg32->fileoff, seg32->fileoff + seg32->filesize }, seg32->segname });
+//        }
+//        if ( lcError )
+//            stop = true;
+//    });
+//    if ( lcError )
+//        return std::move(lcError);
+//
+//    // dynamic binaries have further restrictions
+//    if ( isDyldManaged() ) {
+//        if ( hasTEXT ) {
+//            if ( ranges[segmentIndexText].file.start != 0 )
+//                return Error("__TEXT segment fileoffset is not zero");
+//            const uint32_t headerAndLCSize = machHeaderSize() + mh.sizeofcmds;
+//            if ( ranges[segmentIndexText].file.end < headerAndLCSize )
+//                return Error("load commands do not fit in __TEXT segment");
+//        }
+//        else {
+//            return Error("missing __TEXT segment");
+//        }
+//        // FIXME: LINKEDIT checks need to move to Analyzer
+//        //if ( !hasLINKEDIT )
+//        //    return Error("missing __LINKEDIT segment");
+//    }
+//
+//    // check for overlapping segments, by looking at every possible pair of segments
+//    for ( const SegRange& r1 : ranges ) {
+//        for ( const SegRange& r2 : ranges ) {
+//            if ( &r1 == &r2 )
+//                continue;
+//            if ( r1.vm.overlaps(r2.vm) )
+//                return Error("vm range of segment '%s' overlaps segment '%s'", r1.name, r2.name);
+//            if ( r1.file.overlaps(r2.file) )
+//                return Error("file range of segment '%s' overlaps segment '%s'", r1.name, r2.name);
+//        }
+//    }
+//
+//    // check segment load command order matches file content order which matches vm order
+//    // skip dyld cache because segments are moved around too much
+//    if ( policy.enforceSegmentOrderMatchesLoadCmds() && !inDyldCache() ) {
+//        const SegRange* last = nullptr;
+//        for ( const SegRange& r : ranges ) {
+//            if ( last != nullptr ) {
+//                if ( (r.file.start < last->file.start) && (r.file.start != r.file.end) )
+//                    return Error("segment '%s' file offset out of order", r.name);
+//                if ( r.vm.start < last->vm.start ) {
+//                    if ( isFileSet() && (strcmp(r.name, "__PRELINK_INFO") == 0) ) {
+//                        // __PRELINK_INFO may have no vmaddr set
+//                    }
+//                    else {
+//                        return Error("segment '%s' vm address out of order", r.name);
+//                    }
+//                }
+//            }
+//            last = &r;
+//        }
+//    }
 
     return Error::none();
 }

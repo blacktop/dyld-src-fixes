@@ -34,7 +34,7 @@
 #include <cstddef>
 #include <utility>
 #if !TARGET_OS_EXCLAVEKIT
-#include <_simple.h>
+//#include <_simple.h>
 #include <mach/vm_statistics.h>
 #include <os/lock.h>
 #include <pthread.h>

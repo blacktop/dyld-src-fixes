@@ -46,12 +46,12 @@
   #include <pthread.h>
   #include <unistd.h>
   #include <malloc/malloc.h>
-  #include <os/lock_private.h>
+//  #include <os/lock_private.h>
   #include <mach/mach.h>
   #include <mach/vm_types.h>
   typedef pthread_key_t                dyld_thread_key_t;
-  typedef os_unfair_recursive_lock     dyld_recursive_mutex;
-  typedef os_unfair_recursive_lock_t   dyld_recursive_mutex_t;
+//  typedef os_unfair_recursive_lock     dyld_recursive_mutex;
+//  typedef os_unfair_recursive_lock_t   dyld_recursive_mutex_t;
   typedef os_unfair_lock               dyld_mutex;
   typedef os_unfair_lock_t             dyld_mutex_t;
 #endif // !TARGET_OS_EXCLAVEKIT
@@ -90,8 +90,8 @@ struct VIS_HIDDEN  [[clang::ptrauth_vtable_pointer(process_independent, address_
     virtual bool            isLaunchdOwned() const;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunguarded-availability-new"
-    virtual void            os_unfair_recursive_lock_lock_with_options(dyld_recursive_mutex_t lock, os_unfair_lock_options_t options) const;
-    virtual void            os_unfair_recursive_lock_unlock(dyld_recursive_mutex_t lock) const;
+//    virtual void            os_unfair_recursive_lock_lock_with_options(dyld_recursive_mutex_t lock, os_unfair_lock_options_t options) const;
+//    virtual void            os_unfair_recursive_lock_unlock(dyld_recursive_mutex_t lock) const;
 #pragma clang diagnostic pop
     virtual void            exit(int result) const  __attribute__((noreturn));
     virtual const char*     getenv(const char* key) const;
@@ -101,7 +101,7 @@ struct VIS_HIDDEN  [[clang::ptrauth_vtable_pointer(process_independent, address_
     // Added in version 2
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunguarded-availability-new"
-    virtual void            os_unfair_recursive_lock_unlock_forked_child(dyld_recursive_mutex_t lock) const;
+//    virtual void            os_unfair_recursive_lock_unlock_forked_child(dyld_recursive_mutex_t lock) const;
 #pragma clang diagnostic pop
 
     // Added in version 3
@@ -114,7 +114,7 @@ struct VIS_HIDDEN  [[clang::ptrauth_vtable_pointer(process_independent, address_
     virtual void            run_async(void* (*func)(void*), void* context) const;
 
     // Added in version 6
-    virtual void            os_unfair_lock_lock_with_options(dyld_mutex_t lock, os_unfair_lock_options_t options) const;
+//    virtual void            os_unfair_lock_lock_with_options(dyld_mutex_t lock, os_unfair_lock_options_t options) const;
     virtual void            os_unfair_lock_unlock(dyld_mutex_t lock) const;
 };
 

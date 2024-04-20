@@ -1188,6 +1188,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		1C68CFD52BD41DAE00B6585E /* CommonDigestSPI.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = CommonDigestSPI.h; sourceTree = "<group>"; };
 		2D059CA528E47F82003DACFD /* Archive.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = Archive.h; sourceTree = "<group>"; };
 		2D059CA628E4807D003DACFD /* Archive.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = Archive.cpp; sourceTree = "<group>"; };
 		2D26356C28F452D700CCF6E6 /* Test_CString.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = Test_CString.mm; sourceTree = "<group>"; };
@@ -2334,6 +2335,7 @@
 				2DE6C0A628D08A3D0018D8FD /* TracedValue.h */,
 				DE86439427F7BD9E008F714A /* Utils.h */,
 				DE86439327F7BD9E008F714A /* Utils.cpp */,
+				1C68CFD52BD41DAE00B6585E /* CommonDigestSPI.h */,
 			);
 			path = common;
 			sourceTree = "<group>";
@@ -6089,6 +6091,8 @@
 					"DEBUG=1",
 					"BUILDING_NM=1",
 					"$(inherited)",
+					"TARGET_OS_EXCLAVEKIT=0",
+					"BUILDING_CACHE_BUILDER=1",
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 			};
@@ -6098,7 +6102,10 @@
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = F98B35A324ED748E00DE738B /* base.xcconfig */;
 			buildSettings = {
-				GCC_PREPROCESSOR_DEFINITIONS = "BUILDING_NM=1";
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"BUILDING_NM=1",
+					"TARGET_OS_EXCLAVEKIT=0",
+				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 			};
 			name = Release;
@@ -6599,7 +6606,7 @@
 					"-faligned-allocation",
 				);
 				PRODUCT_NAME = dyld_shared_cache_util;
-				SDKROOT = macosx.internal;
+				SDKROOT = macosx;
 				SUPPORTED_PLATFORMS = "macosx iphoneos xros watchos appletvos bridgeos";
 				VERSIONING_SYSTEM = "apple-generic";
 			};
@@ -6617,7 +6624,7 @@
 					"-faligned-allocation",
 				);
 				PRODUCT_NAME = dyld_shared_cache_util;
-				SDKROOT = macosx.internal;
+				SDKROOT = macosx;
 				SUPPORTED_PLATFORMS = "macosx iphoneos xros watchos appletvos bridgeos";
 				VERSIONING_SYSTEM = "apple-generic";
 			};
@@ -6903,7 +6910,7 @@
 				);
 				IS_ZIPPERED = "";
 				ONLY_ACTIVE_ARCH = YES;
-				SDKROOT = macosx.internal;
+				SDKROOT = macosx;
 				SYSTEM_HEADER_SEARCH_PATHS = "";
 				USER_HEADER_SEARCH_PATHS = (
 					./dyld,
@@ -6954,7 +6961,7 @@
 					./ld,
 				);
 				IS_ZIPPERED = "";
-				SDKROOT = macosx.internal;
+				SDKROOT = macosx;
 				SYSTEM_HEADER_SEARCH_PATHS = "";
 				USER_HEADER_SEARCH_PATHS = (
 					./dyld,

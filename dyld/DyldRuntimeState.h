@@ -30,8 +30,8 @@
 #include <mach-o/dyld_priv.h>
 #include <TargetConditionals.h>
 #if !TARGET_OS_EXCLAVEKIT
-  #include <os/atomic_private.h>
-  #include <os/lock_private.h>
+//  #include <os/atomic_private.h>
+//  #include <os/lock_private.h>
 #endif
 #include "Defines.h"
 #include "MachOLoaded.h"

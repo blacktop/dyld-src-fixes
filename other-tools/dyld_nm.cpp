@@ -39,6 +39,7 @@
 #include "Error.h"
 #include "NListSymbolTable.h"
 #include "Misc.h"
+#include "Header.h"
 
 
 using mach_o::Universal;
@@ -365,16 +366,16 @@ int main(int argc, const char* argv[])
 
             // build table of info about each imported dylib
             __block std::vector<std::string> imports;
-            header->forEachDependentDylib(^(const char* loadPath, bool, bool, bool, mach_o::Version32, mach_o::Version32, bool& stop) {
-                std::string leafName = loadPath;
-                if ( const char* lastSlash = strrchr(loadPath, '/') )
-                    leafName = lastSlash+1;
-                size_t leafNameLen = leafName.size();
-                if ( (leafNameLen > 6) && (leafName.substr(leafNameLen-6) == ".dylib") )
-                    imports.push_back(leafName.substr(0,leafNameLen-6));
-                else
-                    imports.push_back(leafName);
-            });
+            header->forEachDependentDylib(^(const char* loadPath, mach_o::DependentDylibAttributes kind, mach_o::Version32, mach_o::Version32, bool& stop) {
+               std::string leafName = loadPath;
+               if ( const char* lastSlash = strrchr(loadPath, '/') )
+                   leafName = lastSlash+1;
+               size_t leafNameLen = leafName.size();
+               if ( (leafNameLen > 6) && (leafName.substr(leafNameLen-6) == ".dylib") )
+                   imports.push_back(leafName.substr(0,leafNameLen-6));
+               else
+                   imports.push_back(leafName);
+           });
 
             // print each symbol
             for (const Entry& sym : symbols) {

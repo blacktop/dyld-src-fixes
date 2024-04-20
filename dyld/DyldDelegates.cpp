@@ -35,7 +35,7 @@
     #include <sys/uio.h>
     #include <sys/un.h>
     #if __arm64__ || __arm__
-        #include <System/sys/mman.h>
+//        #include <System/sys/mman.h>
     #else
         #include <sys/mman.h>
     #endif
@@ -47,19 +47,19 @@
     #include <sys/param.h>
     #include <sys/mount.h>
     #include <dirent.h>
-    #include <System/sys/csr.h>
-    #include <System/sys/reason.h>
+//    #include <System/sys/csr.h>
+//    #include <System/sys/reason.h>
     #include <kern/kcdata.h>
     //FIXME: Hack to avoid <sys/commpage.h> being included by <System/machine/cpu_capabilities.h>
-    #include <System/sys/commpage.h>
-    #include <System/machine/cpu_capabilities.h>
-    #include <System/sys/content_protection.h>
-    #include <sandbox/private.h>
+//    #include <System/sys/commpage.h>
+//    #include <System/machine/cpu_capabilities.h>
+//    #include <System/sys/content_protection.h>
+//    #include <sandbox/private.h>
     #include <sys/syscall.h>
     #include <sys/attr.h>
     #include <sys/vnode.h>
     #if !TARGET_OS_DRIVERKIT
-        #include <vproc_priv.h>
+//        #include <vproc_priv.h>
     #endif
     // no libc header for send() syscall interface
     extern "C" ssize_t __sendto(int, const void*, size_t, int, const struct sockaddr*, socklen_t);

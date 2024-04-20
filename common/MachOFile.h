@@ -110,17 +110,29 @@ inline bool greaterThanAddOrOverflow(uint64_t addLHS, uint64_t addRHS, T b) {
 
 // Note, this should match PLATFORM_* values in <mach-o/loader.h>
 enum class Platform {
-    unknown             = 0,
-    macOS               = 1,    // PLATFORM_MACOS
-    iOS                 = 2,    // PLATFORM_IOS
-    tvOS                = 3,    // PLATFORM_TVOS
-    watchOS             = 4,    // PLATFORM_WATCHOS
-    bridgeOS            = 5,    // PLATFORM_BRIDGEOS
-    iOSMac              = 6,    // PLATFORM_MACCATALYST
-    iOS_simulator       = 7,    // PLATFORM_IOSSIMULATOR
-    tvOS_simulator      = 8,    // PLATFORM_TVOSSIMULATOR
-    watchOS_simulator   = 9,    // PLATFORM_WATCHOSSIMULATOR
-    driverKit           = 10,   // PLATFORM_DRIVERKIT
+  unknown = 0,
+  macOS = 1,                       // PLATFORM_MACOS
+  iOS = 2,                         // PLATFORM_IOS
+  tvOS = 3,                        // PLATFORM_TVOS
+  watchOS = 4,                     // PLATFORM_WATCHOS
+  bridgeOS = 5,                    // PLATFORM_BRIDGEOS
+  iOSMac = 6,                      // PLATFORM_MACCATALYST
+  iOS_simulator = 7,               // PLATFORM_IOSSIMULATOR
+  tvOS_simulator = 8,              // PLATFORM_TVOSSIMULATOR
+  watchOS_simulator = 9,           // PLATFORM_WATCHOSSIMULATOR
+  driverKit = 10,                  // PLATFORM_DRIVERKIT
+  visionOS  = 11,           // PLATFORM_VISIONOS
+  visionOsSimulator  = 12,  // PLATFORM_VISIONOSSIMULATOR
+  Firmware  = 13,           // PLATFORM_FIRMWARE
+  SepOS  = 14,              // PLATFORM_SEPOS
+  macOSExclaveCore  = 15,   // PLATFORM_MACOS_EXCLAVECORE
+  macOSExclaveKit  = 16,    // PLATFORM_MACOS_EXCLAVEKIT
+  iOSExclaveCore  = 17,     // PLATFORM_IOS_EXCLAVECORE
+  iOSExclaveKit  = 18,      // PLATFORM_IOS_EXCLAVEKIT
+  tvOsExclaveCore  = 19,    // PLATFORM_TVOS_EXCLAVECORE
+  tvOsExclaveKit  = 20,     // PLATFORM_TVOS_EXCLAVEKIT
+  watchOsExclaveCore  = 21, // PLATFORM_WATCHOS_EXCLAVECORE
+  watchOsExclaveKit  = 22,  // PLATFORM_WATCHOS_EXCLAVEKIT
 };
 
 // A prioritized list of architectures

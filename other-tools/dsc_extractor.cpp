@@ -44,7 +44,7 @@
 #include "CodeSigningTypes.h"
 #include <CommonCrypto/CommonHMAC.h>
 #include <CommonCrypto/CommonDigest.h>
-#include <CommonCrypto/CommonDigestSPI.h>
+#include "CommonDigestSPI.h"
 
 #define NO_ULEB
 #include "Architectures.hpp"
@@ -369,7 +369,7 @@ static CacheFiles mapCacheFiles(const char* path)
         crashReporterMessage += output_string;
         free(output_string);
 
-        CRSetCrashLogMessage(crashReporterMessage.c_str());
+//        CRSetCrashLogMessage(crashReporterMessage.c_str());
     };
 
     crashReporterCallback("dyld: Starting dsc_extractor\n");
@@ -430,7 +430,7 @@ static CacheFiles mapCacheFiles(const char* path)
     std::optional<MappedCache> localSymbolsMappedCache = mapCacheFile(localSymbolsCachePath.c_str(), 0, nullptr, true,
                                                                       localSymbolsUUID, crashReporterCallback);
 
-    CRSetCrashLogMessage("");
+//    CRSetCrashLogMessage("");
 
     CacheFiles cacheFiles;
     cacheFiles.caches = std::move(caches);

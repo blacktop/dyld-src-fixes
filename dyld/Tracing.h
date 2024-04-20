@@ -52,7 +52,7 @@
   #define DBG_DYLD_AOT_UUID_MAP_A         (15)
   #define DBG_DYLD_AOT_UUID_MAP_B         (16)
 #else
-  #include <sys/kdebug_private.h>
+//  #include <sys/kdebug_private.h>
 #endif
 
 #include "Defines.h"
@@ -113,7 +113,7 @@ private:
     void prepare(uint32_t code) {
 #if !TARGET_OS_EXCLAVEKIT
         if (_str) {
-            _value = kdebug_trace_string(code, 0, _str);
+//            _value = kdebug_trace_string(code, 0, _str);
             if (_value == (uint64_t)-1) _value = 0;
         }
 #endif
@@ -121,7 +121,7 @@ private:
     void destroy(uint32_t code) {
 #if !TARGET_OS_EXCLAVEKIT
         if (_str && _value) {
-            kdebug_trace_string(code, _value, nullptr);
+//            kdebug_trace_string(code, _value, nullptr);
         }
 #endif
     }

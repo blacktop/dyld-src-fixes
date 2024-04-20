@@ -76,7 +76,7 @@ void Lock::lock() {
     assert(_runtimeState != nullptr);
     _runtimeState->libSystemHelpers->os_unfair_lock_lock_with_options(_lock, OS_UNFAIR_LOCK_NONE);
 #else /* BUILDING_DYLD */
-    os_unfair_lock_lock_with_options(_lock, OS_UNFAIR_LOCK_NONE);
+//    os_unfair_lock_lock_with_options(_lock, OS_UNFAIR_LOCK_NONE);
 #endif /* BUILDING_DYLD */
 }
 void Lock::unlock() {
@@ -511,7 +511,7 @@ void MemoryManager::vm_deallocate_bytes(void* p, uint64_t size) {
         bytesToHex((const uint8_t*)&kr, sizeof(kern_return_t), intStrBuffer);
         strlcat(&buffer[0], intStrBuffer, 1024);
         strlcat(&buffer[0], ")", 1024);
-        CRSetCrashLogMessage2(buffer);
+//        CRSetCrashLogMessage2(buffer);
         assert(0 && "vm_allocate failed");
         return {nullptr, 0};
     }

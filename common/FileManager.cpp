@@ -33,7 +33,7 @@
 #include <sys/param.h>
 #include <sys/ucred.h>
 #include <sys/mount.h>
-#include <System/sys/fsgetpath.h>
+//#include <System/sys/fsgetpath.h>
 
 #include "FileManager.h"
 
@@ -210,8 +210,7 @@ ssize_t FileManager::fsgetpath(char result[], size_t resultBufferSize, uint64_t 
 #if BUILDING_DYLD
     return _syscall->fsgetpath(result, resultBufferSize, fsID, objID);
 #else
-    fsid_t      fsid  = *reinterpret_cast<fsid_t*>(&fsID);
-    return ::fsgetpath(result, resultBufferSize, &fsid, objID);
+    return _syscall->fsgetpath(result, resultBufferSize, fsID, objID);
 #endif
 }
 
@@ -297,7 +296,8 @@ int FileRecord::open(int flags) {
         fsid = _fileManager->fsidForUUID(_volume);
     }
     if (fsid && _objectID) {
-        _fd = openbyid_np((fsid_t*)&fsid, (fsobj_id_t*)_objectID, flags);
+//        _fd = openbyid_np((fsid_t*)&fsid, (fsobj_id_t*)_objectID, flags);
+        _fd = -1;
     }
     if (_fd == -1) {
         _fd = ::open(getPath(), flags);

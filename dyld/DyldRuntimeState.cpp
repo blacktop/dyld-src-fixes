@@ -32,13 +32,13 @@
   #include <sys/stat.h>
   #include <sys/types.h>
   #include <sys/mman.h>
-  #include <System/sys/reason.h>
+//  #include <System/sys/reason.h>
   #include <kern/kcdata.h>
   #include <libkern/OSAtomic.h>
-  #include <_simple.h>
+//  #include <_simple.h>
   // atexit header is missing C++ guards
   extern "C" {
-    #include <System/atexit.h>
+//    #include <System/atexit.h>
   }
 #endif
 #include <mach-o/dyld_priv.h>
@@ -754,9 +754,9 @@ void RuntimeState::vlog(const char* format, va_list list)
 #endif // !TARGET_OS_SIMULATOR
     if ( _logDescriptor != -1 ) {
         // NOTE: it would be nicer to somehow merge these into one write call to reduce multithread interleaving
-        ::_simple_dprintf(_logDescriptor, "dyld[%d]: ", config.process.pid);
+//        ::_simple_dprintf(_logDescriptor, "dyld[%d]: ", config.process.pid);
         // write to file, stderr, or console
-        ::_simple_vdprintf(_logDescriptor, format, list);
+//        ::_simple_vdprintf(_logDescriptor, format, list);
     }
 
 #if BUILDING_DYLD && !TARGET_OS_SIMULATOR
