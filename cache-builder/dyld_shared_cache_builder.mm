@@ -269,8 +269,12 @@ static Platform stringToPlatform(Diagnostics& diags, const std::string& str) {
         return tvOS_simulator;
     if (str == "watchOS_simulator")
         return watchOS_simulator;
-    if ( (str == "driverKit") )
+    if (str == "driverKit")
         return driverKit;
+    if (str == "macOSExclaveKit")
+        return macOSExclaveKit;
+    if (str == "iOSExclaveKit")
+        return iOSExclaveKit;
     if ( std::isdigit(str.front()) ) {
         // Also allow platforms to be specified as an integer
         return (Platform)atoi(str.c_str());
@@ -896,7 +900,9 @@ static void buildCacheFromJSONManifest(Diagnostics& diags, const SharedCacheBuil
             (void)mkpath_np((options.dstRoot + MACOSX_MRM_DYLD_SHARED_CACHE_DIR).c_str(), 0755);
         } else if (buildOptions.platform == driverKit ) {
             (void)mkpath_np((options.dstRoot + DRIVERKIT_DYLD_SHARED_CACHE_DIR).c_str(), 0755);
-        } else {
+        } else if ( dyld3::MachOFile::isExclaveKitPlatform((dyld3::Platform)buildOptions.platform) ) {
+            (void)mkpath_np((options.dstRoot + EXCLAVEKIT_DYLD_SHARED_CACHE_DIR).c_str(), 0755);
+        }else {
             (void)mkpath_np((options.dstRoot + IPHONE_DYLD_SHARED_CACHE_DIR).c_str(), 0755);
         }
     }
@@ -915,6 +921,7 @@ static void buildCacheFromJSONManifest(Diagnostics& diags, const SharedCacheBuil
                     dylibsInNewCaches.insert(fileResults[i]);
             }
             if ( buildOptions.platform == Platform::macOS ) {
+                //FIXME: We should be using MH_SIM_SUPPORT now that all the relevent binaries include it in their headers
                 // macOS has to leave the simulator support binaries on disk
                 // It won't put them in the result of getFilesToRemove() so we need to manually add them
                 simulatorSupportDylibs.insert("/usr/lib/system/libsystem_kernel.dylib");
@@ -1302,7 +1309,7 @@ int main(int argc, const char* argv[])
             if (requiresConcurrencyLimit) { dispatch_semaphore_wait(concurrencyLimit, DISPATCH_TIME_FOREVER); }
 
             const std::string& jsonPath = jsonPaths[index];
-            Diagnostics diags;
+            Diagnostics diags(options.debug);
             buildCacheFromJSONManifest(diags, options, jsonPath);
 
             if (diags.hasError()) {
@@ -1322,7 +1329,7 @@ int main(int argc, const char* argv[])
         if ( failedToBuildCacheRef )
             return EXIT_FAILURE;
     } else {
-        Diagnostics diags;
+        Diagnostics diags(options.debug);
         buildCacheFromJSONManifest(diags, options, jsonManifestPath);
 
         if (diags.hasError()) {

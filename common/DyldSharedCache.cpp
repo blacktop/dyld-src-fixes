@@ -22,6 +22,9 @@
  * @APPLE_LICENSE_HEADER_END@
  */
 
+#include <TargetConditionals.h>
+
+#if !TARGET_OS_EXCLAVEKIT
 
 #include <dirent.h>
 #include <sys/errno.h>
@@ -279,6 +282,40 @@ void DyldSharedCache::forEachRegion(void (^handler)(const void* content, uint64_
     }
 }
 
+const char* DyldSharedCache::mappingName(uint32_t maxProt, uint64_t flags)
+{
+    const char* mappingName = "";
+    if ( maxProt & VM_PROT_EXECUTE ) {
+        if ( flags & DYLD_CACHE_MAPPING_TEXT_STUBS ) {
+            mappingName = "__TEXT_STUBS";
+        } else {
+            mappingName = "__TEXT";
+        }
+    } else if ( maxProt & VM_PROT_WRITE ) {
+        if ( flags & DYLD_CACHE_MAPPING_AUTH_DATA ) {
+            if ( flags & DYLD_CACHE_MAPPING_DIRTY_DATA )
+                mappingName = "__AUTH_DIRTY";
+            else if ( flags & DYLD_CACHE_MAPPING_CONST_DATA )
+                mappingName = "__AUTH_CONST";
+            else
+                mappingName = "__AUTH";
+        } else {
+            if ( flags & DYLD_CACHE_MAPPING_DIRTY_DATA )
+                mappingName = "__DATA_DIRTY";
+            else if ( flags & DYLD_CACHE_MAPPING_CONST_DATA )
+                mappingName = "__DATA_CONST";
+            else
+                mappingName = "__DATA";
+        }
+    }
+    else if ( maxProt & VM_PROT_READ ) {
+        mappingName = "__LINKEDIT";
+    } else {
+        mappingName = "*unknown*";
+    }
+    return mappingName;
+}
+
 void DyldSharedCache::forEachRange(void (^handler)(const char* mappingName,
                                                    uint64_t unslidVMAddr, uint64_t vmSize,
                                                    uint32_t cacheFileIndex, uint64_t fileOffset,
@@ -290,35 +327,7 @@ void DyldSharedCache::forEachRange(void (^handler)(const char* mappingName,
     forEachCache(^(const DyldSharedCache *cache, bool& stopCache) {
         cache->forEachRegion(^(const void *content, uint64_t unslidVMAddr, uint64_t size,
                         uint32_t initProt, uint32_t maxProt, uint64_t flags, bool& stopRegion) {
-            const char* mappingName = "";
-            if ( maxProt & VM_PROT_EXECUTE ) {
-                if ( flags & DYLD_CACHE_MAPPING_TEXT_STUBS ) {
-                    mappingName = "__TEXT_STUBS";
-                } else {
-                    mappingName = "__TEXT";
-                }
-            } else if ( maxProt & VM_PROT_WRITE ) {
-                if ( flags & DYLD_CACHE_MAPPING_AUTH_DATA ) {
-                    if ( flags & DYLD_CACHE_MAPPING_DIRTY_DATA )
-                        mappingName = "__AUTH_DIRTY";
-                    else if ( flags & DYLD_CACHE_MAPPING_CONST_DATA )
-                        mappingName = "__AUTH_CONST";
-                    else
-                        mappingName = "__AUTH";
-                } else {
-                    if ( flags & DYLD_CACHE_MAPPING_DIRTY_DATA )
-                        mappingName = "__DATA_DIRTY";
-                    else if ( flags & DYLD_CACHE_MAPPING_CONST_DATA )
-                        mappingName = "__DATA_CONST";
-                    else
-                        mappingName = "__DATA";
-                }
-            }
-            else if ( maxProt & VM_PROT_READ ) {
-                mappingName = "__LINKEDIT";
-            } else {
-                mappingName = "*unknown*";
-            }
+            const char* mappingName = DyldSharedCache::mappingName(maxProt, flags);
             uint64_t fileOffset = (uint8_t*)content - (uint8_t*)cache;
             bool stop = false;
             handler(mappingName, unslidVMAddr, size, cacheFileIndex, fileOffset, initProt, maxProt, stop);
@@ -352,7 +361,7 @@ void DyldSharedCache::forEachCache(void (^handler)(const DyldSharedCache *cache,
         return;
 
     for (uint32_t i = 0; i != header.subCacheArrayCount; ++i) {
-        const DyldSharedCache* cache = (const DyldSharedCache*)((uint8_t*)this + this->getSubCacheVmOffset(i));
+        const DyldSharedCache* cache = (const DyldSharedCache*)((uintptr_t)this + this->getSubCacheVmOffset(i));
         handler(cache, stop);
         if ( stop )
             return;
@@ -386,25 +395,25 @@ int32_t DyldSharedCache::getSubCacheIndex(const void* addr) const
 
 void DyldSharedCache::getSubCacheUuid(uint8_t index, uint8_t uuid[]) const {
     if (header.mappingOffset <= __offsetof(dyld_cache_header, cacheSubType) ) {
-        const dyld_subcache_entry_v1* subCacheEntries = (dyld_subcache_entry_v1*)((uint8_t*)this + header.subCacheArrayOffset);
+        const dyld_subcache_entry_v1* subCacheEntries = (dyld_subcache_entry_v1*)((uintptr_t)this + header.subCacheArrayOffset);
         memcpy(uuid, subCacheEntries[index].uuid, 16);
     } else {
-        const dyld_subcache_entry* subCacheEntries = (dyld_subcache_entry*)((uint8_t*)this + header.subCacheArrayOffset);
+        const dyld_subcache_entry* subCacheEntries = (dyld_subcache_entry*)((uintptr_t)this + header.subCacheArrayOffset);
         memcpy(uuid, subCacheEntries[index].uuid, 16);
     }
 }
 
 uint64_t DyldSharedCache::getSubCacheVmOffset(uint8_t index) const {
     if (header.mappingOffset <= __offsetof(dyld_cache_header, cacheSubType) ) {
-        const dyld_subcache_entry_v1* subCacheEntries = (dyld_subcache_entry_v1*)((uint8_t*)this + header.subCacheArrayOffset);
+        const dyld_subcache_entry_v1* subCacheEntries = (dyld_subcache_entry_v1*)((uintptr_t)this + header.subCacheArrayOffset);
         return subCacheEntries[index].cacheVMOffset;
     } else {
-        const dyld_subcache_entry* subCacheEntries = (dyld_subcache_entry*)((uint8_t*)this + header.subCacheArrayOffset);
+        const dyld_subcache_entry* subCacheEntries = (dyld_subcache_entry*)((uintptr_t)this + header.subCacheArrayOffset);
         return subCacheEntries[index].cacheVMOffset;
     }
 }
 
-bool DyldSharedCache::inCache(const void* addr, size_t length, bool& readOnly) const
+bool DyldSharedCache::inCache(const void* addr, size_t length, bool& immutable) const
 {
     // quick out if before start of cache
     if ( addr < this )
@@ -414,22 +423,19 @@ bool DyldSharedCache::inCache(const void* addr, size_t length, bool& readOnly) c
     uintptr_t slide = (uintptr_t)this - (uintptr_t)(mappings[0].address);
     uintptr_t unslidStart = (uintptr_t)addr - slide;
 
-    // quick out if after end of cache
-    const dyld_cache_mapping_info* lastMapping = &mappings[header.mappingCount - 1];
-    if ( unslidStart > (lastMapping->address + lastMapping->size) )
-        return false;
-
-    // walk cache regions
-    const dyld_cache_mapping_info* mappingsEnd = &mappings[header.mappingCount];
-    uintptr_t unslidEnd = unslidStart + length;
-    for (const dyld_cache_mapping_info* m=mappings; m < mappingsEnd; ++m) {
-        if ( (unslidStart >= m->address) && (unslidEnd < (m->address+m->size)) ) {
-            readOnly = ((m->initProt & VM_PROT_WRITE) == 0);
-            return true;
+    // walk cache ranges
+    __block bool found = false;
+    auto inRange = ^(const char* mappingName, uint64_t unslidVMAddr, uint64_t vmSize, uint32_t cacheFileIndex,
+                     uint64_t fileOffset, uint32_t initProt, uint32_t maxProt, bool& stopRange) {
+        if ( (unslidVMAddr <= unslidStart) && ((unslidStart+length) < (unslidVMAddr+vmSize)) ) {
+            found     = true;
+            immutable = ((maxProt & VM_PROT_WRITE) == 0);
+            stopRange = true;
         }
-    }
+    };
+    this->forEachRange(inRange, nullptr);
 
-    return false;
+    return found;
 }
 
 bool DyldSharedCache::isAlias(const char* path) const {
@@ -542,7 +548,7 @@ const void* DyldSharedCache::getLocalNlistEntries() const
     // check for cache without local symbols info
     if (!this->hasLocalSymbolsInfo())
         return nullptr;
-    const auto localInfo = (dyld_cache_local_symbols_info*)((uint8_t*)this + header.localSymbolsOffset);
+    const auto localInfo = (dyld_cache_local_symbols_info*)((uintptr_t)this + header.localSymbolsOffset);
     return getLocalNlistEntries(localInfo);
 }
 
@@ -551,7 +557,7 @@ const uint32_t DyldSharedCache::getLocalNlistCount() const
     // check for cache without local symbols info
      if (!this->hasLocalSymbolsInfo())
         return 0;
-    const auto localInfo = (dyld_cache_local_symbols_info*)((uint8_t*)this + header.localSymbolsOffset);
+    const auto localInfo = (dyld_cache_local_symbols_info*)((uintptr_t)this + header.localSymbolsOffset);
     return localInfo->nlistCount;
 }
 
@@ -565,7 +571,7 @@ const char* DyldSharedCache::getLocalStrings() const
     // check for cache without local symbols info
      if (!this->hasLocalSymbolsInfo())
         return nullptr;
-    const auto localInfo = (dyld_cache_local_symbols_info*)((uint8_t*)this + header.localSymbolsOffset);
+    const auto localInfo = (dyld_cache_local_symbols_info*)((uintptr_t)this + header.localSymbolsOffset);
     return getLocalStrings(localInfo);
 }
 
@@ -574,7 +580,7 @@ const uint32_t DyldSharedCache::getLocalStringsSize() const
     // check for cache without local symbols info
      if (!this->hasLocalSymbolsInfo())
         return 0;
-    const auto localInfo = (dyld_cache_local_symbols_info*)((uint8_t*)this + header.localSymbolsOffset);
+    const auto localInfo = (dyld_cache_local_symbols_info*)((uintptr_t)this + header.localSymbolsOffset);
     return localInfo->stringsSize;
 }
 
@@ -584,7 +590,7 @@ const dyld3::MachOFile* DyldSharedCache::getImageFromPath(const char* dylibPath)
     const dyld_cache_mapping_info* mappings = (dyld_cache_mapping_info*)((char*)this + header.mappingOffset);
     uint32_t dyldCacheImageIndex;
     if ( hasImagePath(dylibPath, dyldCacheImageIndex) )
-        return (dyld3::MachOFile*)((uint8_t*)this + dylibs[dyldCacheImageIndex].address - mappings[0].address);
+        return (dyld3::MachOFile*)((uintptr_t)this + dylibs[dyldCacheImageIndex].address - mappings[0].address);
     return nullptr;
 }
 
@@ -593,7 +599,7 @@ void DyldSharedCache::forEachLocalSymbolEntry(void (^handler)(uint64_t dylibOffs
     // check for cache without local symbols info
     if (!this->hasLocalSymbolsInfo())
         return;
-    const auto localInfo = (dyld_cache_local_symbols_info*)((uint8_t*)this + header.localSymbolsOffset);
+    const auto localInfo = (dyld_cache_local_symbols_info*)((uintptr_t)this + header.localSymbolsOffset);
 
     if ( header.mappingOffset >= __offsetof(dyld_cache_header, symbolFileUUID) ) {
         // On new caches, the dylibOffset is 64-bits, and is a VM offset
@@ -618,10 +624,10 @@ void DyldSharedCache::forEachLocalSymbolEntry(void (^handler)(uint64_t dylibOffs
 const mach_header* DyldSharedCache::getIndexedImageEntry(uint32_t index, uint64_t& mTime, uint64_t& inode) const
 {
     const dyld_cache_image_info*   dylibs   = images();
-    const dyld_cache_mapping_info* mappings = (dyld_cache_mapping_info*)((char*)this + header.mappingOffset);
+    const dyld_cache_mapping_info* mappings = (dyld_cache_mapping_info*)((uintptr_t)this + header.mappingOffset);
     mTime = dylibs[index].modTime;
     inode = dylibs[index].inode;
-    return (mach_header*)((uint8_t*)this + dylibs[index].address - mappings[0].address);
+    return (mach_header*)((uintptr_t)this + dylibs[index].address - mappings[0].address);
 }
 
 const mach_header* DyldSharedCache::getIndexedImageEntry(uint32_t index) const
@@ -1135,7 +1141,8 @@ void DyldSharedCache::forEachPatchableExport(uint32_t imageIndex, void (^handler
 #if BUILDING_SHARED_CACHE_UTIL
 void DyldSharedCache::forEachPatchableUseOfExport(uint32_t imageIndex, uint32_t dylibVMOffsetOfImpl,
                                                   void (^handler)(uint32_t userImageIndex, uint32_t userVMOffset,
-                                                                  MachOLoaded::PointerMetaData pmd, uint64_t addend)) const {
+                                                                  MachOLoaded::PointerMetaData pmd, uint64_t addend,
+                                                                  bool isWeakImport)) const {
     if ( header.patchInfoAddr == 0 )
         return;
 
@@ -1241,7 +1248,7 @@ void DyldSharedCache::forEachPatchableUseOfExport(uint32_t imageIndex, uint32_t 
                 pmd.key               = patchLocation.key;
                 pmd.usesAddrDiversity = patchLocation.usesAddressDiversity;
 
-                handler(userImageIndex, userVMOffset, pmd, patchLocation.getAddend());
+                handler(userImageIndex, userVMOffset, pmd, patchLocation.getAddend(), false);
             }
         }
         return;
@@ -1271,7 +1278,8 @@ bool DyldSharedCache::shouldPatchClientOfImage(uint32_t imageIndex, uint32_t use
 }
 
 void DyldSharedCache::forEachPatchableUseOfExportInImage(uint32_t imageIndex, uint32_t dylibVMOffsetOfImpl, uint32_t userImageIndex,
-                                                         void (^handler)(uint32_t userVMOffset, MachOLoaded::PointerMetaData pmd, uint64_t addend)) const {
+                                                         void (^handler)(uint32_t userVMOffset, MachOLoaded::PointerMetaData pmd, uint64_t addend,
+                                                                         bool isWeakImport)) const {
     if ( header.patchInfoAddr == 0 )
         return;
 
@@ -1379,7 +1387,7 @@ void DyldSharedCache::forEachPatchableUseOfExportInImage(uint32_t imageIndex, ui
                     pmd.key               = patchLocation.key;
                     pmd.usesAddrDiversity = patchLocation.usesAddressDiversity;
 
-                    handler(userVMOffset, pmd, patchLocation.getAddend());
+                    handler(userVMOffset, pmd, patchLocation.getAddend(), false);
                 }
             }
         }
@@ -1394,7 +1402,8 @@ void DyldSharedCache::forEachPatchableUseOfExportInImage(uint32_t imageIndex, ui
 
 void DyldSharedCache::forEachPatchableUseOfExport(uint32_t imageIndex, uint32_t dylibVMOffsetOfImpl,
                                                   void (^handler)(uint64_t cacheVMOffset,
-                                                                  MachOLoaded::PointerMetaData pmd, uint64_t addend)) const {
+                                                                  MachOLoaded::PointerMetaData pmd, uint64_t addend,
+                                                                  bool isWeakImport)) const {
     if ( header.patchInfoAddr == 0 )
         return;
 
@@ -1442,7 +1451,7 @@ void DyldSharedCache::forEachPatchableUseOfExport(uint32_t imageIndex, uint32_t 
                 pmd.key               = patchLocation.key;
                 pmd.usesAddrDiversity = patchLocation.usesAddressDiversity;
 
-                handler(patchLocation.cacheOffset, pmd, patchLocation.getAddend());
+                handler(patchLocation.cacheOffset, pmd, patchLocation.getAddend(), false);
             }
         }
         return;
@@ -1464,7 +1473,8 @@ void DyldSharedCache::forEachPatchableUseOfExport(uint32_t imageIndex, uint32_t 
 void DyldSharedCache::forEachPatchableGOTUseOfExport(uint32_t imageIndex, uint32_t dylibVMOffsetOfImpl,
                                                      void (^handler)(uint64_t cacheVMOffset,
                                                                      MachOFile::PointerMetaData pmd,
-                                                                     uint64_t addend)) const {
+                                                                     uint64_t addend,
+                                                                     bool isWeakImport)) const {
     if ( header.patchInfoAddr == 0 )
         return;
 
@@ -2200,3 +2210,5 @@ void DyldSharedCache::computeTransitiveDependents(std::unordered_map<std::string
     });
 }
 #endif
+
+#endif // !TARGET_OS_EXCLAVEKIT

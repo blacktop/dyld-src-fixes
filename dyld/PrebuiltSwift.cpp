@@ -22,10 +22,16 @@
  */
 
 
+#include <TargetConditionals.h>
+
+#if !TARGET_OS_EXCLAVEKIT
+
 #include "objc-shared-cache.h"
 #include "OptimizerObjC.h"
 #include "PrebuiltSwift.h"
 #include "SwiftVisitor.h"
+
+#if SUPPORT_PREBUILTLOADERS || BUILDING_UNIT_TESTS || BUILDING_CACHE_BUILDER_UNIT_TESTS
 
 using metadata_visitor::ResolvedValue;
 using metadata_visitor::SwiftPointer;
@@ -122,7 +128,7 @@ static void getFixupTargets(RuntimeState& state, Diagnostics& diag, const JustIn
                         vmAddrToFixupTargetMap[fixupVMAddr.rawValue()] = targetAndAddend;
                     }
                     else {
-                        diag.error("out of range bind ordinal %d (max %lu)", bindOrdinal, bindTargets.count());
+                        diag.error("out of range bind ordinal %d (max %llu)", bindOrdinal, bindTargets.count());
                         stopChain = true;
                     }
                 } else if ( fixupLocation->isRebase(pointerFormat, loadAddress, targetRuntimeOffset) ) {
@@ -159,7 +165,7 @@ static void getFixupTargets(RuntimeState& state, Diagnostics& diag, const JustIn
                     vmAddrToFixupTargetMap[fixupVMAddr.rawValue()] = targetAndAddend;
                 }
                 else {
-                    diag.error("out of range bind ordinal %d (max %lu)", targetIndex, bindTargets.count());
+                    diag.error("out of range bind ordinal %d (max %llu)", targetIndex, bindTargets.count());
                     fixupsStop = true;
                 }
             }, ^(uint64_t runtimeOffset, uint32_t segmentIndex,
@@ -170,7 +176,7 @@ static void getFixupTargets(RuntimeState& state, Diagnostics& diag, const JustIn
                     vmAddrToFixupTargetMap[fixupVMAddr.rawValue()] = targetAndAddend;
                 }
                 else {
-                    diag.error("out of range bind ordinal %d (max %lu)", overrideBindTargetIndex, overrideBindTargets.count());
+                    diag.error("out of range bind ordinal %d (max %llu)", overrideBindTargetIndex, overrideBindTargets.count());
                     fixupsStop = true;
                 }
             });
@@ -212,7 +218,7 @@ static void getFixupTargets(RuntimeState& state, Diagnostics& diag, const JustIn
                     vmAddrToFixupTargetMap[fixupVMAddr.rawValue()] = targetAndAddend;
                 }
                 else {
-                    diag.error("out of range bind ordinal %d (max %lu)", targetIndex, bindTargets.count());
+                    diag.error("out of range bind ordinal %d (max %llu)", targetIndex, bindTargets.count());
                     fixupsStop = true;
                 }
             });
@@ -254,7 +260,9 @@ static SwiftVisitor makeSwiftVisitor(Diagnostics& diag, RuntimeState& state,
 #if POINTERS_ARE_UNSLID
     const dyld3::MachOAnalyzer* dylibMA = ldr->analyzer(state);
 
-    SwiftVisitor swiftVisitor(state.config.dyldCache.addr, dylibMA);
+    const DyldSharedCache* dyldCache = (const DyldSharedCache*)state.config.dyldCache.addr;
+    uint64_t sharedCacheRelativeSelectorBaseVMAddress = dyldCache->sharedCacheRelativeSelectorBaseVMAddress();
+    SwiftVisitor swiftVisitor(dyldCache, dylibMA, VMAddress(sharedCacheRelativeSelectorBaseVMAddress));
     return swiftVisitor;
 #elif SUPPORT_VM_LAYOUT
     const dyld3::MachOAnalyzer* dylibMA = ldr->analyzer(state);
@@ -393,7 +401,9 @@ bool PrebuiltSwift::findProtocolConformances(Diagnostics& diag, PrebuiltObjC& pr
 #if BUILDING_CACHE_BUILDER || BUILDING_CLOSURE_UTIL || BUILDING_CACHE_BUILDER_UNIT_TESTS
             auto it = vmAddrToFixupTargetMap.find(ptr.targetValue.vmAddress().rawValue());
             if ( it != vmAddrToFixupTargetMap.end() ) {
-                const PrebuiltLoader::BindTargetRef& bindTarget = it->second.first;
+                PrebuiltLoader::BindTargetRef bindTarget(diag, it->second.first);
+                if ( diag.hasError() )
+                    return false;
                 if ( bindTarget.isAbsolute() && (bindTarget.offset() == 0) )
                     return true;
             }
@@ -670,3 +680,7 @@ void PrebuiltSwift::make(Diagnostics& diag, PrebuiltObjC& prebuiltObjC, RuntimeS
 
 
 } // namespace dyld4
+
+#endif // SUPPORT_PREBUILTLOADERS || BUILDING_UNIT_TESTS || BUILDING_CACHE_BUILDER_UNIT_TESTS
+
+#endif // !TARGET_OS_EXCLAVEKIT

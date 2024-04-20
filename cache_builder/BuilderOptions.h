@@ -53,7 +53,8 @@ struct BuilderOptions
                    bool dylibsRemovedFromDisk, bool isLocallyBuiltCache,
                    CacheKind kind, bool forceDevelopmentSubCacheSuffix);
 
-    bool isSimultor() const;
+    bool isSimulator() const;
+    bool isExclaveKit() const;
 
     // Core fields
     const dyld3::GradedArchs&                   archs;
@@ -66,8 +67,9 @@ struct BuilderOptions
 
     // Logging/printing
     std::string                                 logPrefix;
-    bool                                        timePasses  = false;
-    bool                                        stats       = false;
+    bool                                        timePasses   = false;
+    bool                                        stats        = false;
+    bool                                        debug        = false;
 
     // Other
     std::unordered_map<std::string, unsigned>   dylibOrdering;
@@ -82,6 +84,7 @@ struct InputFile
     uint64_t                inode   = 0;
     uint64_t                mtime   = 0;
     std::string             path;
+    bool                    forceNotCacheEligible = false;
 
     bool hasError() const;
     const error::Error& getError() const;

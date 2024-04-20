@@ -29,10 +29,12 @@
 #include <stdio.h>
 #include <assert.h>
 #include <stddef.h>
-#include <mach/mach.h>
 #include <TargetConditionals.h>
-
 #include "Defines.h"
+#if !TARGET_OS_EXCLAVEKIT
+#include <mach/mach.h>
+#endif
+#include "Allocator.h"
 
 namespace dyld3 {
 
@@ -48,17 +50,17 @@ class VIS_HIDDEN Array
 {
 public:
                     Array()                                 : _elements(nullptr), _allocCount(0), _usedCount(0) {}
-                    Array(T* storage, uintptr_t allocCount, uintptr_t usedCount=0) : _elements(storage), _allocCount(allocCount), _usedCount(usedCount) {}
-    void            setInitialStorage(T* storage, uintptr_t allocCount) { assert(_usedCount == 0); _elements=storage; _allocCount=allocCount; }
+                    Array(T* storage, uint64_t allocCount, uint64_t usedCount=0) : _elements(storage), _allocCount(allocCount), _usedCount(usedCount) {}
+    void            setInitialStorage(T* storage, uint64_t allocCount) { assert(_usedCount == 0); _elements=storage; _allocCount=allocCount; }
 
-    T&              operator[](size_t idx)       { assert(idx < _usedCount); return _elements[idx]; }
-    const T&        operator[](size_t idx) const { assert(idx < _usedCount); return _elements[idx]; }
+    T&              operator[](uint64_t idx)       { assert(idx < _usedCount); return _elements[idx]; }
+    const T&        operator[](uint64_t idx) const { assert(idx < _usedCount); return _elements[idx]; }
     T&              back()                       { assert(_usedCount > 0); return _elements[_usedCount-1]; }
-    uintptr_t       count() const                { return _usedCount; }
-    uintptr_t       maxCount() const             { return _allocCount; }
-    uintptr_t       freeCount() const            { return _allocCount - _usedCount; }
+    uint64_t        count() const                { return _usedCount; }
+    uint64_t        maxCount() const             { return _allocCount; }
+    uint64_t        freeCount() const            { return _allocCount - _usedCount; }
     bool            empty() const                { return (_usedCount == 0); }
-    uintptr_t       index(const T& element)      { return &element - _elements; }
+    uint64_t        index(const T& element)      { return &element - _elements; }
     void            push_back(const T& t)        { assert(_usedCount < _allocCount); _elements[_usedCount++] = t; }
     void            default_constuct_back()      { assert(_usedCount < _allocCount); new (&_elements[_usedCount++])T(); }
     void            pop_back()                   { assert(_usedCount > 0); _usedCount--; }
@@ -66,17 +68,17 @@ public:
     T*              end()                        { return &_elements[_usedCount]; }
     const T*        begin() const                { return &_elements[0]; }
     const T*        end() const                  { return &_elements[_usedCount]; }
-    const Array<T>  subArray(uintptr_t start, uintptr_t size) const { assert(start+size <= _usedCount);
+    const Array<T>  subArray(uint64_t start, uint64_t size) const { assert(start+size <= _usedCount);
                                                                       return Array<T>(&_elements[start], size, size); }
     bool            contains(const T& targ) const { for (const T& a : *this) { if ( a == targ ) return true; } return false; }
-    void            remove(size_t idx)            { assert(idx < _usedCount); ::memmove(&_elements[idx], &_elements[idx+1], sizeof(T)*(_usedCount-idx-1)); }
-    void            resize(size_t count)          { assert(count <= _allocCount); _usedCount = count; }
+    void            remove(uint64_t idx)            { assert(idx < _usedCount); ::memmove(&_elements[idx], &_elements[idx+1], sizeof(T)*(_usedCount-idx-1)); }
+    void            resize(uint64_t count)          { assert(count <= _allocCount); _usedCount = count; }
     void            clear()                       { _usedCount = 0; }
-    
+
 protected:
     T*          _elements;
-    uintptr_t   _allocCount;
-    uintptr_t   _usedCount;
+    uint64_t   _allocCount;
+    uint64_t   _usedCount;
 };
 
 
@@ -102,12 +104,12 @@ private:
 // When the variable goes out of scope, any vm_allocate()ed storage is released.
 // if MAXCOUNT is specified, then only one one vm_allocate() to that size is done.
 //
-template <typename T, uintptr_t MAXCOUNT=0xFFFFFFFF>
+template <typename T, uint64_t MAXCOUNT=0xFFFFFFFF>
 class VIS_HIDDEN OverflowSafeArray : public Array<T>
 {
 public:
                     OverflowSafeArray() : Array<T>(nullptr, 0) {}
-                    OverflowSafeArray(T* stackStorage, uintptr_t stackAllocCount) : Array<T>(stackStorage, stackAllocCount) {}
+                    OverflowSafeArray(T* stackStorage, uint64_t stackAllocCount) : Array<T>(stackStorage, stackAllocCount) {}
                     ~OverflowSafeArray();
 
                     OverflowSafeArray(const OverflowSafeArray&) = delete;
@@ -121,8 +123,8 @@ public:
     void            emplace_back(Args&&... args) { verifySpace(1); new (&this->_elements[this->_usedCount++])T(args...); }
     void            default_constuct_back()      { verifySpace(1); new (&this->_elements[this->_usedCount++])T(); }
     void            clear();
-    void            reserve(uintptr_t n) { if (this->_allocCount < n) growTo(n); }
-    void            resize(uintptr_t n) {
+    void            reserve(uint64_t n) { if (this->_allocCount < n) growTo(n); }
+    void            resize(uint64_t n) {
         if (n == this->_usedCount)
             return;
         if (n < this->_usedCount) {
@@ -134,46 +136,52 @@ public:
     }
 
 protected:
-    void            growTo(uintptr_t n);
-    void            verifySpace(uintptr_t n)     { if (this->_usedCount+n > this->_allocCount) growTo(this->_usedCount + n); }
+    void            growTo(uint64_t n);
+    void            verifySpace(uint64_t n)     { if (this->_usedCount+n > this->_allocCount) growTo(this->_usedCount + n); }
 
 private:
-    vm_address_t    _overflowBuffer         = 0;
-    vm_size_t       _overflowBufferSize     = 0;
+    void *          _overflowBuffer         = 0;
+    uint64_t        _overflowBufferSize     = 0;
 };
 
 
-template <typename T, uintptr_t MAXCOUNT>
-inline void OverflowSafeArray<T,MAXCOUNT>::growTo(uintptr_t n)
+template <typename T, uint64_t MAXCOUNT>
+inline void OverflowSafeArray<T,MAXCOUNT>::growTo(uint64_t n)
 {
-    vm_address_t    oldBuffer      = _overflowBuffer;
-    vm_size_t       oldBufferSize  = _overflowBufferSize;
+    void *          oldBuffer      = _overflowBuffer;
+    uint64_t        oldBufferSize  = _overflowBufferSize;
     if ( MAXCOUNT != 0xFFFFFFFF ) {
         assert(oldBufferSize == 0); // only re-alloc once
         // MAXCOUNT is specified, so immediately jump to that size
-        _overflowBufferSize = round_page(std::max(MAXCOUNT, n) * sizeof(T));
+        //_overflowBufferSize = round_page(std::max(MAXCOUNT, n) * sizeof(T));
     }
     else {
        // MAXCOUNT is not specified, keep doubling size
        _overflowBufferSize = round_page(std::max(this->_allocCount * 2, n) * sizeof(T));
     }
-    kern_return_t kr = ::vm_allocate(mach_task_self(), &_overflowBuffer, _overflowBufferSize, VM_FLAGS_ANYWHERE | VM_MAKE_TAG(VM_MEMORY_DYLD));
-    if (kr != KERN_SUCCESS) {
-#if BUILDING_LIBDYLD
+#if !TARGET_OS_EXCLAVEKIT
+    int kr = ::vm_allocate(mach_task_self(), (vm_address_t*)&_overflowBuffer, (vm_size_t)_overflowBufferSize, VM_FLAGS_ANYWHERE | VM_MAKE_TAG(VM_MEMORY_DYLD));
+#else
+    _overflowBuffer = lsl::MemoryManager::allocate_pages(_overflowBufferSize);
+    int kr = 0;
+#endif
+    if (kr != 0) {
+#if BUILDING_LIBDYLD && !TARGET_OS_EXCLAVEKIT
         //FIXME We should figure out a way to do this in dyld
         char crashString[256];
         snprintf(crashString, sizeof(crashString), "OverflowSafeArray failed to allocate %llu bytes, vm_allocate returned: %d\n",
-                (uint64_t)_overflowBufferSize, kr);
+                 (uint64_t)_overflowBufferSize, kr);
         CRSetCrashLogMessage(crashString);
 #endif
         assert(0);
     }
+
     if constexpr (std::is_trivially_copyable<T>::value) {
-        ::memcpy((void*)_overflowBuffer, (void*)this->_elements, this->_usedCount*sizeof(T));
+        ::memcpy((void*)_overflowBuffer, (void*)this->_elements, (size_t)(this->_usedCount*sizeof(T)));
     } else if constexpr (std::is_move_constructible<T>::value) {
         //static_assert(std::is_trivially_copyable<T>::value, "Type isn't POD, but our destructor doesn't destroy elements");
         T* newBuffer = (T*)_overflowBuffer;
-        for (uintptr_t i = 0; i != this->_usedCount; ++i)
+        for (uint64_t i = 0; i != this->_usedCount; ++i)
             new (&newBuffer[i]) T(std::move(this->_elements[i]));
     } else {
         static_assert(std::is_trivially_copyable<T>::value || std::is_move_constructible<T>::value,
@@ -183,30 +191,38 @@ inline void OverflowSafeArray<T,MAXCOUNT>::growTo(uintptr_t n)
     this->_allocCount = _overflowBufferSize / sizeof(T);
 
     if ( oldBuffer != 0 )
-        ::vm_deallocate(mach_task_self(), oldBuffer, oldBufferSize);
+#if !TARGET_OS_EXCLAVEKIT
+        ::vm_deallocate(mach_task_self(), (vm_address_t)oldBuffer, (vm_size_t)oldBufferSize);
+#else
+        lsl::MemoryManager::deallocate_pages(oldBuffer, oldBufferSize);
+#endif
 }
 
-template <typename T, uintptr_t MAXCOUNT>
+template <typename T, uint64_t MAXCOUNT>
 inline void OverflowSafeArray<T,MAXCOUNT>::clear()
 {
     if constexpr (!std::is_trivially_destructible<T>::value) {
-        for (uintptr_t i = 0; i != this->_usedCount; ++i)
+        for (uint64_t i = 0; i != this->_usedCount; ++i)
             this->_elements[i].~T();
     }
     this->_usedCount = 0;
 }
 
-template <typename T, uintptr_t MAXCOUNT>
+template <typename T, uint64_t MAXCOUNT>
 inline OverflowSafeArray<T,MAXCOUNT>::~OverflowSafeArray()
 {
     // Call clear in case there are element destructors to call
     clear();
 
     if ( _overflowBuffer != 0 )
-        ::vm_deallocate(mach_task_self(), _overflowBuffer, _overflowBufferSize);
+#if !TARGET_OS_EXCLAVEKIT
+        ::vm_deallocate(mach_task_self(), (vm_address_t)_overflowBuffer, (vm_size_t)_overflowBufferSize);
+#else
+    lsl::MemoryManager::deallocate_pages(_overflowBuffer, _overflowBufferSize);
+#endif
 }
 
-template <typename T, uintptr_t MAXCOUNT>
+template <typename T, uint64_t MAXCOUNT>
 inline OverflowSafeArray<T,MAXCOUNT>& OverflowSafeArray<T,MAXCOUNT>::operator=(OverflowSafeArray<T,MAXCOUNT>&& other)
 {
     if (this == &other)
@@ -214,13 +230,17 @@ inline OverflowSafeArray<T,MAXCOUNT>& OverflowSafeArray<T,MAXCOUNT>::operator=(O
 
     // Free our buffer if we have one
     if ( _overflowBuffer != 0 )
-        ::vm_deallocate(mach_task_self(), _overflowBuffer, _overflowBufferSize);
+#if !TARGET_OS_EXCLAVEKIT
+        vm_deallocate(mach_task_self(), (vm_address_t)_overflowBuffer, (vm_size_t)_overflowBufferSize);
+#else
+    lsl::MemoryManager::deallocate_pages(_overflowBuffer, _overflowBufferSize);
+#endif
 
     new (this) OverflowSafeArray<T,MAXCOUNT>(std::move(other));
     return *this;
 }
 
-template <typename T, uintptr_t MAXCOUNT>
+template <typename T, uint64_t MAXCOUNT>
 inline OverflowSafeArray<T,MAXCOUNT>::OverflowSafeArray(OverflowSafeArray<T,MAXCOUNT>&& other)
 {
 
@@ -257,13 +277,13 @@ template <typename T, int QUANT=4, int INIT=1>
 class VIS_HIDDEN GrowableArray
 {
 public:
-    T&              operator[](size_t idx)       { assert(idx < _usedCount); return _elements[idx]; }
-    const T&        operator[](size_t idx) const { assert(idx < _usedCount); return _elements[idx]; }
+    T&              operator[](uint64_t idx)       { assert(idx < _usedCount); return _elements[idx]; }
+    const T&        operator[](uint64_t idx) const { assert(idx < _usedCount); return _elements[idx]; }
     T&              back()                       { assert(_usedCount > 0); return _elements[_usedCount-1]; }
-    uintptr_t       count() const                { return _usedCount; }
-    uintptr_t       maxCount() const             { return _allocCount; }
+    uint64_t        count() const                { return _usedCount; }
+    uint64_t        maxCount() const             { return _allocCount; }
     bool            empty() const                { return (_usedCount == 0); }
-    uintptr_t       index(const T& element)      { return &element - _elements; }
+    uint64_t        index(const T& element)      { return &element - _elements; }
     void            push_back(const T& t)        { verifySpace(1); _elements[_usedCount++] = t; }
     template< class... Args >
     void            emplace_back( Args&&... args ) { verifySpace(1);
@@ -274,20 +294,20 @@ public:
     T*              end()                        { return &_elements[_usedCount]; }
     const T*        begin() const                { return &_elements[0]; }
     const T*        end() const                  { return &_elements[_usedCount]; }
-    const Array<T>  subArray(uintptr_t start, uintptr_t size) const { assert(start+size <= _usedCount);
+    const Array<T>  subArray(uint64_t start, uint64_t size) const { assert(start+size <= _usedCount);
                                                                       return Array<T>(&_elements[start], size, size); }
     const Array<T>& array() const                 { return *((Array<T>*)this); }
     bool            contains(const T& targ) const { for (const T& a : *this) { if ( a == targ ) return true; } return false; }
     void            erase(T& targ);
-    void            verifySpace(uintptr_t n)     { if (this->_usedCount+n > this->_allocCount) growTo(this->_usedCount + n); }
+    void            verifySpace(uint64_t n)     { if (this->_usedCount+n > this->_allocCount) growTo(this->_usedCount + n); }
     void            clear();
 protected:
-    void            growTo(uintptr_t n);
+    void            growTo(uint64_t n);
 
 private:
     T*              _elements               = _initialAlloc;
-    uintptr_t       _allocCount             = INIT;
-    uintptr_t       _usedCount              = 0;
+    uint64_t        _allocCount             = INIT;
+    uint64_t        _usedCount              = 0;
     T               _initialAlloc[INIT]     = { };
 };
 
@@ -305,9 +325,9 @@ void GrowableArray<T,QUANT,INIT>::clear() {
 }
 
 template <typename T, int QUANT, int INIT>
-inline void GrowableArray<T,QUANT,INIT>::growTo(uintptr_t n)
+inline void GrowableArray<T,QUANT,INIT>::growTo(uint64_t n)
 {
-    uintptr_t newCount = (n + QUANT - 1) & (-QUANT);
+    uint64_t newCount = (n + QUANT - 1) & (-QUANT);
     T* newArray = (T*)::malloc(sizeof(T)*newCount);
     T* oldArray = this->_elements;
     if ( this->_usedCount != 0 )
@@ -343,14 +363,14 @@ inline void GrowableArray<T,QUANT,INIT>::erase(T& targ)
 //  STACK_ALLOC_ARRAY(foo, myarray, 10);
 //  myarray is of type Array<foo>
 #define STACK_ALLOC_ARRAY(_type, _name, _count)  \
-    uintptr_t __##_name##_array_alloc[1 + ((sizeof(_type)*(_count))/sizeof(uintptr_t))]; \
+    uint64_t __##_name##_array_alloc[1 + ((sizeof(_type)*(_count))/sizeof(uint64_t))]; \
     __block dyld3::Array<_type> _name((_type*)__##_name##_array_alloc, _count);
 
 
 //  STACK_ALLOC_OVERFLOW_SAFE_ARRAY(foo, myarray, 10);
 //  myarray is of type OverflowSafeArray<foo>
 #define STACK_ALLOC_OVERFLOW_SAFE_ARRAY(_type, _name, _count)  \
-    uintptr_t __##_name##_array_alloc[1 + ((sizeof(_type)*(_count))/sizeof(uintptr_t))]; \
+    uint64_t __##_name##_array_alloc[1 + ((sizeof(_type)*(_count))/sizeof(uint64_t))]; \
     __block dyld3::OverflowSafeArray<_type> _name((_type*)__##_name##_array_alloc, _count);
 
 

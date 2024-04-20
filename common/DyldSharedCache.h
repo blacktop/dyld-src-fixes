@@ -298,6 +298,10 @@ public:
                                                       uint32_t initProt, uint32_t maxProt, uint64_t flags,
                                                       bool& stopRegion)) const;
 
+    //
+    // Gets a name for the mapping.
+    //
+    static const char*  mappingName(uint32_t maxProt, uint64_t flags);
 
     //
     // Iterates over each of the mappings in the cache and all subCaches
@@ -377,9 +381,9 @@ public:
      void                forEachLocalSymbolEntry(void (^handler)(uint64_t dylibCacheVMOffset, uint32_t nlistStartIndex, uint32_t nlistCount, bool& stop)) const;
 
     //
-    // Returns if an address range is in this cache, and if so if in a read-only area
+    // Returns if an address range is in this cache, and if so if in an immutable area
     //
-    bool                inCache(const void* addr, size_t length, bool& readOnly) const;
+    bool                inCache(const void* addr, size_t length, bool& immutable) const;
 
     //
     // Returns true if a path is an alternate path (symlink)
@@ -509,20 +513,24 @@ public:
 #if BUILDING_SHARED_CACHE_UTIL
     void              forEachPatchableUseOfExport(uint32_t imageIndex, uint32_t dylibVMOffsetOfImpl,
                                                   void (^handler)(uint32_t userImageIndex, uint32_t userVMOffset,
-                                                                  dyld3::MachOLoaded::PointerMetaData pmd, uint64_t addend)) const;
+                                                                  dyld3::MachOLoaded::PointerMetaData pmd, uint64_t addend,
+                                                                  bool isWeakImport)) const;
 #endif
     // Use this when you have a root of at imageIndex, and are trying to patch a cached dylib at userImageIndex
     bool              shouldPatchClientOfImage(uint32_t imageIndex, uint32_t userImageIndex) const;
     void              forEachPatchableUseOfExportInImage(uint32_t imageIndex, uint32_t dylibVMOffsetOfImpl, uint32_t userImageIndex,
-                                                         void (^handler)(uint32_t userVMOffset, dyld3::MachOLoaded::PointerMetaData pmd, uint64_t addend)) const;
+                                                         void (^handler)(uint32_t userVMOffset, dyld3::MachOLoaded::PointerMetaData pmd, uint64_t addend,
+                                                                         bool isWeakImport)) const;
     // Note, use this for weak-defs when you just want all uses of an export, regardless of which dylib they are in.
     void              forEachPatchableUseOfExport(uint32_t imageIndex, uint32_t dylibVMOffsetOfImpl,
                                                   void (^handler)(uint64_t cacheVMOffset,
-                                                                  dyld3::MachOLoaded::PointerMetaData pmd, uint64_t addend)) const;
+                                                                  dyld3::MachOLoaded::PointerMetaData pmd, uint64_t addend,
+                                                                  bool isWeakImport)) const;
     // Used to walk just the GOT uses of a given export.  The above method will walk both regular and GOT uses
     void              forEachPatchableGOTUseOfExport(uint32_t imageIndex, uint32_t dylibVMOffsetOfImpl,
                                                      void (^handler)(uint64_t cacheVMOffset,
-                                                                     dyld3::MachOLoaded::PointerMetaData pmd, uint64_t addend)) const;
+                                                                     dyld3::MachOLoaded::PointerMetaData pmd, uint64_t addend,
+                                                                     bool isWeakImport)) const;
 
 #if !(BUILDING_LIBDYLD || BUILDING_DYLD)
     // MRM map file generator

@@ -90,13 +90,15 @@ public:
     void            forEachCacheDylib(void (^callback)(const std::string_view& path)) const;
     void            forEachCacheSymlink(void (^callback)(const std::string_view& path)) const;
     void            addFile(const void* buffer, size_t bufferSize, std::string_view path,
-                            uint64_t inode, uint64_t modTime);
+                            uint64_t inode, uint64_t modTime, bool forceNotCacheEligible);
     void            setAliases(const std::vector<FileAlias>& aliases,
                                const std::vector<FileAlias>& intermediateAliases);
     error::Error    build();
 
-    void            getResults(std::vector<CacheBuffer>& results) const;
-    std::string     getMapFileBuffer() const;
+    // If we overflow, then build() should return an error, and this should be the list of evicted dylibs
+    std::span<const std::string_view>   getEvictedDylibs() const;
+    void                                getResults(std::vector<CacheBuffer>& results) const;
+    std::string                         getMapFileBuffer() const;
 
     // All caches have a logging prefix, UUID and JSON map which represents the development cache.
     // Universal caches may also have customer versions of these
@@ -104,8 +106,8 @@ public:
     std::string                 developmentJSONMap(std::string_view disposition) const;
     std::string                 developmentCacheUUID() const;
     std::string                 customerLoggingPrefix() const;
-    std::optional<std::string>  customerJSONMap(std::string_view disposition) const;
-    std::optional<std::string>  customerCacheUUID() const;
+    std::string                 customerJSONMap(std::string_view disposition) const;
+    std::string                 customerCacheUUID() const;
 
 #if BUILDING_CACHE_BUILDER_UNIT_TESTS
     // We need everything public to write tests
@@ -138,8 +140,10 @@ private:
     void            findCanonicalObjCProtocolNames();
     void            findObjCClasses();
     void            findObjCProtocols();
+    void            findObjCCategories();
     void            estimateObjCHashTableSizes();
     void            calculateObjCCanonicalProtocolsSize();
+    void            calculateObjCCategoriesSize();
     void            estimateSwiftHashTableSizes();
     void            calculateCacheDylibsTrie();
     void            estimatePatchTableSize();
@@ -149,7 +153,6 @@ private:
     void            addGlobalOptimizationsToSubCache(SubCache& subCache);
     void            addFinalChunksToSubCache(SubCache& subCache);
     void            computeSubCaches();
-    void            computeRegularSubCache();
     void            computeLargeSubCache();
     void            makeLargeLayoutSubCaches(SubCache* firstSubCache,
                                              std::list<SubCache>& otherCaches);
@@ -160,15 +163,16 @@ private:
     void            calculateSlideInfoSize();
     void            calculateCodeSignatureSize();
     void            printSubCaches() const;
-    error::Error    computeSubCacheDiscontiguousSimVMLayout();
     error::Error    computeSubCacheDiscontiguousVMLayout();
     error::Error    computeSubCacheContiguousVMLayout();
+    void            evictLeafDylibs(CacheVMSize reductionTarget);
     error::Error    computeSubCacheLayout();
     error::Error    allocateSubCacheBuffers();
     void            setupDylibLinkedit();
     void            setupSplitSegAdjustors();
     void            adjustObjCClasses();
     void            adjustObjCProtocols();
+    void            adjustObjCCategories();
 
     // Final passes to run, after dylib passes
     void            emitObjCSelectorStrings();
@@ -183,6 +187,7 @@ private:
     error::Error    emitUniquedGOTs();
     error::Error    emitCanonicalObjCProtocols();
     error::Error    computeObjCClassLayout();
+    error::Error    emitPreAttachedObjCCategories();
     void            computeSlideInfo();
     void            emitCacheDylibsTrie();
     error::Error    emitPatchTable();
@@ -244,6 +249,7 @@ private:
     std::vector<CacheDylib>                         cacheDylibs;
     std::vector<InputFile*>                         exeInputFiles;
     std::vector<InputFile*>                         nonCacheDylibInputFiles;
+    std::vector<std::string_view>                   evictedDylibs;
     std::vector<SubCache>                           subCaches;
     CacheVMSize                                     totalVMSize;
     std::unordered_map<std::string, CacheDylib*>    dylibAliases;
@@ -256,6 +262,7 @@ private:
     ObjCSelectorOptimizer                objcSelectorOptimizer;
     ObjCClassOptimizer                   objcClassOptimizer;
     ObjCProtocolOptimizer                objcProtocolOptimizer;
+    ObjCCategoryOptimizer                objcCategoryOptimizer;
     SwiftProtocolConformanceOptimizer    swiftProtocolConformanceOptimizer;
     DylibTrieOptimizer                   dylibTrieOptimizer;
     PatchTableOptimizer                  patchTableOptimizer;

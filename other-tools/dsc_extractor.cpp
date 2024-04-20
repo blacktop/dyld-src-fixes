@@ -22,6 +22,10 @@
  * @APPLE_LICENSE_HEADER_END@
  */
 
+#include <TargetConditionals.h>
+
+#if !TARGET_OS_EXCLAVEKIT
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -40,7 +44,7 @@
 #include "CodeSigningTypes.h"
 #include <CommonCrypto/CommonHMAC.h>
 #include <CommonCrypto/CommonDigest.h>
-#include "CommonDigestSPI.h"
+#include <CommonCrypto/CommonDigestSPI.h>
 
 #define NO_ULEB
 #include "Architectures.hpp"
@@ -1109,6 +1113,6 @@ int main(int argc, const char* argv[])
 
 #endif
 
-
+#endif // !TARGET_OS_EXCLAVEKIT
 
 

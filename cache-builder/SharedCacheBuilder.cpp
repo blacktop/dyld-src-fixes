@@ -30,7 +30,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
 #include <mach/mach_time.h>
 #include <mach/shared_region.h>
 #include <apfs/apfs_fsctl.h>
@@ -169,6 +168,9 @@ const char* const SharedCacheBuilder::_s_neverStubEliminateSymbols[] = {
     "_confstr",
     "_cp_drawable_present",
     "_cp_drawable_enqueue_present",
+    "_CGImageDestinationFinalize",
+    "_CGImageSourceCreateThumbnailAtIndex",
+    "_CGImageSourceCreateImageAtIndex",
     "_ctime",
     "_ctime_r",
     "_dispatch_after",
@@ -419,6 +421,8 @@ const char* const SharedCacheBuilder::_s_neverStubEliminateSymbols[] = {
     "__ZdlPv",
     "__Znam",
     "__Znwm",
+    "__ZnwmSt19__type_descriptor_t",
+    "__ZnamSt19__type_descriptor_t",
 
     nullptr
 };
@@ -3402,14 +3406,6 @@ void SharedCacheBuilder::assignDataSegmentAddresses(SubCache& subCache,
                 // <rdar://problem/66284631> Don't put __objc_const read-only memory as Swift has method lists we can't see
                 if ( containsObjCSection )
                     supportsDataConst = false;
-            } else if ( !strcmp(dylib.input->mappedFile.mh->installName(), "/System/Library/Frameworks/Foundation.framework/Foundation") ||
-                        !strcmp(dylib.input->mappedFile.mh->installName(), "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation") ) {
-                // <rdar://problem/69813664> _NSTheOneTruePredicate is incompatible with __DATA_CONST
-                supportsDataConst = false;
-            } else if ( !strcmp(dylib.input->mappedFile.mh->installName(), "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation") ||
-                       !strcmp(dylib.input->mappedFile.mh->installName(), "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation") ) {
-               // rdar://74112547 CF writes to kCFNull constant object
-               supportsDataConst = false;
             } else if ( !strcmp(dylib.input->mappedFile.mh->installName(), "/usr/lib/libcrypto.0.9.7.dylib") ||
                         !strcmp(dylib.input->mappedFile.mh->installName(), "/usr/lib/libcrypto.0.9.8.dylib") ) {
               // rdar://77149283 libcrypto.0.9.8.dylib writes to __DATA_CONST
@@ -3732,6 +3728,7 @@ void SharedCacheBuilder::assignReadOnlySegmentAddresses(SubCache& subCache, uint
         slideInfoSize = std::max(slideInfoSize, sizeof(dyld_cache_slide_info2));
         slideInfoSize = std::max(slideInfoSize, sizeof(dyld_cache_slide_info3));
         slideInfoSize = std::max(slideInfoSize, sizeof(dyld_cache_slide_info4));
+        slideInfoSize = std::max(slideInfoSize, sizeof(dyld_cache_slide_info5));
         // We need one slide info header per data region, plus enough space for that regions pages
         // Each region will also be padded to a page-size so that the kernel can wire it.
         for (Region& region : subCache._dataRegions) {

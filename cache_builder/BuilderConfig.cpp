@@ -42,6 +42,7 @@ cache_builder::Logger::Logger(const BuilderOptions& options)
 {
     this->printTimers = options.timePasses;
     this->printStats  = options.stats;
+    this->printDebug  = options.debug;
 }
 
 void cache_builder::Logger::log(const char* format, ...) const
@@ -85,17 +86,7 @@ cache_builder::Layout::Layout(const BuilderOptions& options)
         // x86_64 uses discontiguous mappings
         this->discontiguous.emplace();
 
-        if ( options.isSimultor() ) {
-            // The simulator has fixed addresses
-            this->discontiguous->simTextSize = CacheVMSize(1.5_GB);
-            this->discontiguous->simDataSize = CacheVMSize(1_GB);
-            this->discontiguous->simLinkeditSize = CacheVMSize(1_GB);
-            this->discontiguous->simTextBaseAddress = CacheVMAddress(X86_64_SHARED_REGION_START);
-            this->discontiguous->simDataBaseAddress = this->discontiguous->simTextBaseAddress + this->discontiguous->simTextSize;
-            this->discontiguous->simLinkeditBaseAddress = this->discontiguous->simDataBaseAddress + this->discontiguous->simDataSize;
-        } else {
-            this->discontiguous->regionAlignment = 1_GB;
-        }
+        this->discontiguous->regionAlignment = 1_GB;
     } else {
         // Everyone else uses contiguous mappings
         this->contiguous.emplace();
@@ -103,15 +94,10 @@ cache_builder::Layout::Layout(const BuilderOptions& options)
         this->contiguous->subCacheStubsLimit = CacheVMSize(110_MB);
     }
 
-    if ( !options.isSimultor() ) {
-        // Devices always get large layout.  Simulators get the regular layout
-        this->large.emplace();
-
-        if ( (archName == "x86_64") || (archName == "x86_64h") ) {
-            this->large->subCacheTextLimit = CacheVMSize(512_MB);
-        } else {
-            this->large->subCacheTextLimit = CacheVMSize(1.25_GB);
-        }
+    if ( (archName == "x86_64") || (archName == "x86_64h") ) {
+        this->subCacheTextLimit = CacheVMSize(512_MB);
+    } else {
+        this->subCacheTextLimit = CacheVMSize(1.5_GB);
     }
 
     struct CacheLayout
@@ -126,7 +112,21 @@ cache_builder::Layout::Layout(const BuilderOptions& options)
         layout.cacheSize = X86_64_SHARED_REGION_SIZE;
     } else if ( (archName == "arm64") || (archName == "arm64e") ) {
         layout.baseAddress = ARM64_SHARED_REGION_START;
-        layout.cacheSize = ARM64_SHARED_REGION_SIZE;
+
+        if ( options.isSimulator() ) {
+            // Limit to 4GB to support back deployment to older hosts with 4GB shared regions
+            layout.cacheSize = 4_GB;
+        } else if ( options.platform == dyld3::Platform::macOS ) {
+            layout.cacheSize = ARM64_SHARED_REGION_SIZE;
+        } else {
+            // Temporarily limit embedded/driverKit to 4GB
+            layout.cacheSize = 4_GB;
+        }
+
+        // Limit the max slide for arm64 based caches to 512MB.  Combined with large
+        // caches putting 1.5GB of TEXT in the first cache region, this will ensure that
+        // this 1.5GB of TEXT will stay in the same 2GB region.  <rdar://problem/49852839>
+        cacheMaxSlide = 512_MB;
     } else if ( archName == "arm64_32" ) {
         layout.baseAddress = ARM64_32_SHARED_REGION_START;
         layout.cacheSize = ARM64_32_SHARED_REGION_SIZE;
@@ -146,7 +146,7 @@ cache_builder::Layout::Layout(const BuilderOptions& options)
 SlideInfo::SlideInfo(const BuilderOptions& options, const Layout& layout)
 {
     // Compute slide info.  Note the simulator doesn't slide
-    if ( options.isSimultor() )
+    if ( options.isSimulator() )
         return;
 
     std::string_view archName = options.archs.name();
@@ -168,16 +168,24 @@ SlideInfo::SlideInfo(const BuilderOptions& options, const Layout& layout)
         }
     }
     else if ( archName == "arm64e" ) {
-        this->slideInfoFormat = SlideInfoFormat::v3;
-
         // 1 uint16_t per page
         this->slideInfoBytesPerDataPage = 2;
+
+        if ( layout.cacheSize > CacheVMSize(4_GB) ) {
+            this->slideInfoFormat = SlideInfoFormat::v5;
+
+            // 16k pages so that we can also use page-in linking for this format
+            this->slideInfoPageSize = 0x4000;
+        } else {
+            this->slideInfoFormat = SlideInfoFormat::v3;
+        }
     }
     else if ( archName == "arm64_32" ) {
         this->slideInfoFormat = SlideInfoFormat::v1;
 
         // 128 bytes per page.  Enough for a bitmap with 1-bit entry per 32-bit location
-        this->slideInfoBytesPerDataPage = 128;
+        // Plus 2-bytes per page for the TOC offset
+        this->slideInfoBytesPerDataPage = 130;
     }
     else {
         assert("Unknown arch");

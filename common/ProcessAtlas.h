@@ -27,15 +27,20 @@
 
 #include <atomic>
 #include <cstdint>
-#include <mach/mach.h>
-#include <dispatch/dispatch.h>
+#include <TargetConditionals.h>
+#include "Defines.h"
+#if !TARGET_OS_EXCLAVEKIT
+  #include <mach/mach.h>
+  #include <dispatch/dispatch.h>
+#endif
 
 #include "UUID.h"
 #include "Vector.h"
-#include "Defines.h"
 #include "Allocator.h"
 #include "OrderedSet.h"
-#include "FileManager.h"
+#if !TARGET_OS_EXCLAVEKIT
+  #include "FileManager.h"
+#endif
 #include "DyldRuntimeState.h"
 #include "dyld_cache_format.h"
 
@@ -51,6 +56,8 @@ struct MachOLoaded;
 }
 
 namespace dyld4 {
+struct FileManager;
+struct FileRecord;
 namespace Atlas {
 using dyld3::MachOLoaded;
 using lsl::UniquePtr;
@@ -112,10 +119,12 @@ struct VIS_HIDDEN Mapper {
         }
     private:
         void swap(Pointer& other) {
-            std::swap(_mapper,  other._mapper);
-            std::swap(_size,    other._size);
-            std::swap(_pointer, other._pointer);
-            std::swap(_mmapped, other._mmapped);
+            if (this == &other) { return; }
+            using std::swap;
+            swap(_mapper,  other._mapper);
+            swap(_size,    other._size);
+            swap(_pointer, other._pointer);
+            swap(_mmapped, other._mmapped);
         }
         SharedPtr<Mapper>   _mapper     = nullptr;
         uint64_t            _size       = 0;
@@ -194,7 +203,9 @@ private:
     const MachOLoaded*  ml() const;
 
     Allocator&                              _ephemeralAllocator;
+#if !TARGET_OS_EXCLAVEKIT
     mutable FileRecord                      _file;
+#endif
     mutable SharedPtr<Mapper>               _mapper             = nullptr;
     mutable UUID                            _uuid;
     mutable Mapper::Pointer<MachOLoaded>    _ml;
@@ -204,6 +215,7 @@ private:
     mutable const char*                     _installname        = nullptr;
     mutable bool                            _uuidLoaded         = false;
     mutable bool                            _installnameLoaded  = false;
+    mutable bool                            _mapperFailed       = false;
 };
 
 struct VIS_HIDDEN SharedCacheLocals {
@@ -245,7 +257,9 @@ private:
     friend struct ProcessSnapshot;
 
     Allocator&                          _ephemeralAllocator;
+#if !TARGET_OS_EXCLAVEKIT
     FileRecord                          _file;
+#endif
     UUID                                _uuid;
     uint64_t                            _size;
     Mapper::Pointer<dyld_cache_header>  _header;
@@ -255,18 +269,30 @@ private:
     bool                                _private;
 };
 
-// TODO: This should probably live somewhere else;
 struct VIS_HIDDEN Bitmap {
-    Bitmap() = default;
+    Bitmap()                            = delete;
+    Bitmap(const Bitmap&)               = delete;
+    Bitmap(Bitmap&&);
+    Bitmap& operator=(const Bitmap&)    = delete;
+    Bitmap& operator=(Bitmap&&);
     Bitmap(Allocator& allocator, size_t size);
     Bitmap(Allocator& allocator, std::span<std::byte>& data);
     void setBit(size_t bit);
     bool checkBit(size_t bit)  const;
     void emit(Vector<std::byte>& data) const;
     size_t size() const;
+    friend void swap(Bitmap& x, Bitmap& y) {
+        x.swap(y);
+    }
 private:
-    size_t                  _size;
-    UniquePtr<std::byte>    _bitmap;
+    void swap(Bitmap& other) {
+        if (this == &other) { return; }
+        using std::swap;
+        swap(_size,     other._size);
+        swap(_bitmap,   other._bitmap);
+    }
+    size_t                  _size   = 0;
+    UniquePtr<std::byte>    _bitmap = nullptr;
 };
 
 struct VIS_HIDDEN ProcessSnapshot {
@@ -324,7 +350,7 @@ private:
             return result;
         }
         void emitMappedFileInfo(uint64_t rebasedAddress, const UUID& uuid, const FileRecord& file, Vector<std::byte>& data);
-        void readMappedFileInfo(std::span<std::byte>& data, uint64_t& rebasedAddress, UUID& uuid, FileRecord& file);
+        bool readMappedFileInfo(std::span<std::byte>& data, uint64_t& rebasedAddress, UUID& uuid, FileRecord& file);
 
         void emitStringRef(const char* string, Vector<std::byte>& data);
     private:
@@ -333,7 +359,7 @@ private:
         FileManager&                    _fileManager;
         OrderedSet<UniquePtr<Image>>&   _images;
         UniquePtr<SharedCache>&         _sharedCache;
-        Bitmap&                         _bitmap;
+        UniquePtr<Bitmap>&              _bitmap;
         Vector<UUID>                    _volumeUUIDs;
         Vector<const char *>            _strings;
         Vector<char>                    _stringTableBuffer;
@@ -353,7 +379,7 @@ private:
     Allocator&                      _ephemeralAllocator;
     FileManager&                    _fileManager;
     OrderedSet<UniquePtr<Image>>    _images;
-    Bitmap                          _bitmap;
+    UniquePtr<Bitmap>               _bitmap;
     UniquePtr<SharedCache>          _sharedCache;
     SharedPtr<Mapper>               _identityMapper;
     uint64_t                        _platform           = 0;

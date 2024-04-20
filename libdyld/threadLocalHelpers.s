@@ -20,8 +20,11 @@
  * 
  * @APPLE_LICENSE_HEADER_END@
  */
- 
-#include <System/machine/cpu_capabilities.h>
+
+#include <TargetConditionals.h>
+#if !TARGET_OS_EXCLAVEKIT
+  #include <System/machine/cpu_capabilities.h>
+#endif
 
 // bool save_xxm = (*((uint32_t*)_COMM_PAGE_CPU_CAPABILITIES) & kHasAVX1_0) != 0;
 
@@ -234,6 +237,7 @@ _tlv_get_addr:
 #else
 	ldr		w16, [x0, #4]			// get key from descriptor
 #endif
+#if !TARGET_OS_EXCLAVEKIT
 	mrs		x17, TPIDRRO_EL0
 	and		x17, x17, #-8			// clear low 3 bits???
 #if __LP64__
@@ -249,6 +253,7 @@ _tlv_get_addr:
 #endif
 	add		x0, x17, x16			// return allocation+offset
 	ret		lr
+#endif // !TARGET_OS_EXCLAVEKIT
 
 LlazyAllocate:
 #if __has_feature(ptrauth_returns)

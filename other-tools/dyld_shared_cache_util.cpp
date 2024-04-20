@@ -100,6 +100,7 @@ enum Mode {
     modeObjCImpCaches,
     modeObjCClasses,
     modeObjCClassLayout,
+    modeObjCClassMethodLists,
     modeObjCClassHashTable,
     modeObjCSelectors,
     modeSwiftProtocolConformances,
@@ -131,7 +132,45 @@ struct Options {
 
 
 static void usage() {
-    fprintf(stderr, "Usage: dyld_shared_cache_util -list [ -uuid ] [-vmaddr] | -dependents <dylib-path> [ -versions ] | -linkedit | -map | -slide_info | -verbose_slide_info | -info | -extract <dylib-dir>  [ shared-cache-file ] \n");
+    fprintf(stderr, "Usage: dyld_shared_cache_util <command> [-fs-root] [-inode] [-versions] [-vmaddr] [shared-cache-file]\n"
+        "    Commands:\n"
+        "        -list [-uuid] [-vmaddr]                  list images\n"
+        "        -dependents <dylb-path>                  list dependents of dylib\n"
+        "        -linkedit                                print linkedit contents\n"
+        "        -info                                    print shared cache info\n"
+        "        -stats                                   print size stats\n"
+        "        -slide_info                              print slide info\n"
+        "        -verbose_slide_info                      print verbose slide info\n"
+        "        -fixups_in_dylib <dylib-path>            print fixups in dylib\n"
+        "        -text_info                               print locations of TEXT segments\n"
+        "        -local_symbols                           print local symbols and locations\n"
+        "        -strings                                 print C strings in images\n"
+        "        -sections                                print summary of section sizes\n"
+        "        -exports                                 list exported symbols in images\n"
+        "        -duplicate_exports                       list symbols exported by multiple images\n"
+        "        -duplicate_exports_summary               print number of duplicated symbols per image\n"
+        "        -map                                     print map of segment locations\n"
+        "        -json-map                                print map of segment locations in JSON format\n"
+        "        -verbose-json-map                        print map of segment and section locations in JSON format\n"
+        "        -json-dependents                         print dependents in JSON format\n"
+        "        -size                                    print the size of each image\n"
+        "        -objc-info                               print summary of ObjC content\n"
+        "        -objc-protocols                          list ObjC protocols\n"
+        "        -objc-imp-caches                         print contents of ObjC method caches\n"
+        "        -objc-classes                            print ObjC class names and methods in JSON format\n"
+        "        -objc-class-layout                       print size, start offset, and ivars of ObjC classes\n"
+        "        -objc-class-method-lists                 print methods and properties of ObjC classes\n"
+        "        -objc-class-hash-table                   print the contents of the ObjC class table\n"
+        "        -objc-selectors                          print all ObjC selector names and locations in JSON format\n"
+        "        -swift-proto                             print Swift protocol conformance table\n"
+        "        -extract <directory>                     extract images into the given directory\n"
+        "        -patch_table                             print symbol patch table\n"
+        "        -list_dylibs_with_section <seg> <sect>   list images that contain the given section\n"
+        "        -mach_headers                            summarize mach header of each image\n"
+        "        -load_commands                           summarize load commands of each image\n"
+        "        -cache_header                            print header of each shared cache file\n"
+        "        -dylib_symbols                           print all symbol names and locations\n"
+        "        -function_starts                         print address of beginning of each function\n");
 }
 
 static void checkMode(Mode mode) {
@@ -298,9 +337,6 @@ static void printSlideInfoForDataRegion(const DyldSharedCache* dyldCache, uint64
                 if ( loc->auth.authenticated ) {
                     uint64_t target = authValueAdd + loc->auth.offsetFromSharedCacheBase;
                     uint64_t targetValue = target;
-#if __has_feature(ptrauth_calls)
-                    targetValue = ptr.arm64e.signPointer((void*)loc, target);
-#endif
                     printf("    [% 5d + 0x%04llX]: 0x%016llX (JOP: diversity %d, address %s, %s)\n",
                            i, (uint64_t)((const uint8_t*)loc - pageStart), targetValue,
                            ptr.arm64e.authBind.diversity, ptr.arm64e.authBind.addrDiv ? "true" : "false",
@@ -381,6 +417,48 @@ static void printSlideInfoForDataRegion(const DyldSharedCache* dyldCache, uint64
                     rebaseChainV4(page, pageStartOffset);
                 }
             }
+        }
+    }
+    else if ( slideInfoHeader->version == 5 ) {
+        const dyld_cache_slide_info5* slideInfo = (dyld_cache_slide_info5*)(slideInfoHeader);
+        printf("page_size=%d\n", slideInfo->page_size);
+        printf("page_starts_count=%d\n", slideInfo->page_starts_count);
+        printf("auth_value_add=0x%016llX\n", slideInfo->value_add);
+        const uintptr_t valueAdd = (uintptr_t)(slideInfo->value_add);
+        for (int i=0; i < slideInfo->page_starts_count; ++i) {
+            uint16_t delta = slideInfo->page_starts[i];
+            if ( delta == DYLD_CACHE_SLIDE_V5_PAGE_ATTR_NO_REBASE ) {
+                printf("page[% 5d]: no rebasing\n", i);
+                continue;
+            }
+
+            printf("page[% 5d]: start=0x%04X\n", i, delta);
+            if ( !verboseSlideInfo )
+                continue;
+
+            delta = delta/sizeof(uint64_t); // initial offset is byte based
+            const uint8_t* pageStart = dataPagesStart + (i * slideInfo->page_size);
+            const dyld_cache_slide_pointer5* loc = (dyld_cache_slide_pointer5*)pageStart;
+
+            do {
+                loc += delta;
+                delta = loc->regular.next;
+
+                dyld3::MachOLoaded::ChainedFixupPointerOnDisk ptr;
+                ptr.raw64 = *((uint64_t*)loc);
+                PointerMetaData pmd(&ptr, DYLD_CHAINED_PTR_ARM64E_SHARED_CACHE);
+
+                uint64_t targetValue = valueAdd + loc->regular.runtimeOffset;
+                if ( pmd.authenticated ) {
+                    printf("    [% 5d + 0x%04llX]: 0x%016llX (JOP: diversity %d, address %s, %s)\n",
+                           i, (uint64_t)((const uint8_t*)loc - pageStart), targetValue,
+                           ptr.cache64e.auth.diversity, ptr.cache64e.auth.addrDiv ? "true" : "false",
+                           ptr.cache64e.keyName());
+                } else {
+                    targetValue = targetValue | ptr.cache64e.high8();
+                    printf("    [% 5d + 0x%04llX]: 0x%016llX\n", i, (uint64_t)((const uint8_t*)loc - pageStart), targetValue);
+                }
+            } while (delta != 0);
         }
     }
 }
@@ -567,6 +645,34 @@ static void forEachSlidValue(const DyldSharedCache* dyldCache, uint64_t dataStar
             }
         }
     }
+    else if ( slideInfoHeader->version == 5 ) {
+        const dyld_cache_slide_info5* slideInfo = (dyld_cache_slide_info5*)(slideInfoHeader);
+        const uintptr_t valueAdd = (uintptr_t)(slideInfo->value_add);
+        for (int i=0; i < slideInfo->page_starts_count; ++i) {
+            uint16_t delta = slideInfo->page_starts[i];
+            if ( delta == DYLD_CACHE_SLIDE_V5_PAGE_ATTR_NO_REBASE ) {
+                // Nothing to do here
+                continue;
+            }
+
+            delta = delta/sizeof(uint64_t); // initial offset is byte based
+            const uint8_t* pageStart = dataPagesStart + (i * slideInfo->page_size);
+            const dyld_cache_slide_pointer5* loc = (dyld_cache_slide_pointer5*)pageStart;
+            do {
+                loc += delta;
+                delta = loc->regular.next;
+
+                dyld3::MachOLoaded::ChainedFixupPointerOnDisk ptr;
+                ptr.raw64 = *((uint64_t*)loc);
+                PointerMetaData pmd(&ptr, DYLD_CHAINED_PTR_ARM64E_SHARED_CACHE);
+
+                uint64_t offsetInDataRegion = (const uint8_t*)loc - dataPagesStart;
+                uint64_t fixupVMAddr = dataStartAddress + offsetInDataRegion;
+                uint64_t targetVMAddr = valueAdd + loc->auth.runtimeOffset + ((uint64_t)pmd.high8 << 56);
+                callback(fixupVMAddr, targetVMAddr, pmd);
+            } while (delta != 0);
+        }
+    }
 }
 
 
@@ -597,7 +703,8 @@ static void dumpObjCClassLayout(const DyldSharedCache* dyldCache)
         const dyld3::MachOAnalyzer* ma = (dyld3::MachOAnalyzer*)mh;
         Diagnostics diag;
 
-        __block objc_visitor::Visitor visitor(dyldCache, ma);
+        uint64_t sharedCacheRelativeSelectorBaseVMAddress = dyldCache->sharedCacheRelativeSelectorBaseVMAddress();
+        __block objc_visitor::Visitor visitor(dyldCache, ma, VMAddress(sharedCacheRelativeSelectorBaseVMAddress));
         visitor.forEachClassAndMetaClass(^(const objc_visitor::Class& objcClass, bool& stopClass) {
             const char* className = objcClass.getName(visitor);
             bool isMetaClass = objcClass.isMetaClass;
@@ -629,6 +736,343 @@ static void dumpObjCClassLayout(const DyldSharedCache* dyldCache)
             }
         });
     });
+}
+
+static void dumpObjCClassMethodLists(const DyldSharedCache* dyldCache)
+{
+    // Map from vmAddr to the category name for that address
+
+    __block std::unordered_map<VMAddress, std::string, VMAddressHash, VMAddressEqual> categoryMap;
+    dyldCache->forEachImage(^(const mach_header *mh, const char *installName) {
+        const dyld3::MachOAnalyzer* ma = (dyld3::MachOAnalyzer*)mh;
+        Diagnostics diag;
+
+        const char* leafName = strrchr(installName, '/');
+        if ( leafName == NULL )
+            leafName = installName;
+        else
+            leafName++;
+
+        uint64_t sharedCacheRelativeSelectorBaseVMAddress = dyldCache->sharedCacheRelativeSelectorBaseVMAddress();
+        __block objc_visitor::Visitor visitor(dyldCache, ma, VMAddress(sharedCacheRelativeSelectorBaseVMAddress));
+        visitor.forEachCategory(^(const objc_visitor::Category& objcCategory, bool& stopCategory) {
+            const char* categoryName = objcCategory.getName(visitor);
+            {
+                objc_visitor::MethodList methodList = objcCategory.getClassMethods(visitor);
+                std::optional<VMAddress> vmAddr = methodList.getVMAddress();
+                if ( vmAddr.has_value() ) {
+                    categoryMap[vmAddr.value()] = std::string(categoryName) + " - " + leafName;
+                }
+            }
+            {
+                objc_visitor::MethodList methodList = objcCategory.getInstanceMethods(visitor);
+                std::optional<VMAddress> vmAddr = methodList.getVMAddress();
+                if ( vmAddr.has_value() ) {
+                    categoryMap[vmAddr.value()] = std::string(categoryName) + " - " + leafName;
+                }
+            }
+            {
+                objc_visitor::ProtocolList protocolList = objcCategory.getProtocols(visitor);
+                std::optional<VMAddress> vmAddr = protocolList.getVMAddress();
+                if ( vmAddr.has_value() ) {
+                    categoryMap[vmAddr.value()] = std::string(categoryName) + " - " + leafName;
+                }
+            }
+            {
+                objc_visitor::PropertyList propertyList = objcCategory.getClassProperties(visitor);
+                std::optional<VMAddress> vmAddr = propertyList.getVMAddress();
+                if ( vmAddr.has_value() ) {
+                    categoryMap[vmAddr.value()] = std::string(categoryName) + " - " + leafName;
+                }
+            }
+            {
+                objc_visitor::PropertyList propertyList = objcCategory.getInstanceProperties(visitor);
+                std::optional<VMAddress> vmAddr = propertyList.getVMAddress();
+                if ( vmAddr.has_value() ) {
+                    categoryMap[vmAddr.value()] = std::string(categoryName) + " - " + leafName;
+                }
+            }
+        });
+    });
+
+    __block std::map<uint64_t, const char*> dylibVMAddrMap;
+    dyldCache->forEachImage(^(const mach_header *mh, const char *installName) {
+        const dyld3::MachOAnalyzer* ma = (const dyld3::MachOAnalyzer*)mh;
+        if ( ma->hasObjC() )
+            dylibVMAddrMap[ma->preferredLoadAddress()] = installName;
+    });
+
+#if 0
+        // Get a map of all dylibs in the cache from their "objc index" to install name
+        __block std::map<uint16_t, const char*> dylibMap;
+
+        const objc::HeaderInfoRO* headerInfoRO = dyldCache->objcHeaderInfoRO();
+        const bool is64 = (strstr(dyldCache->archName(), "64") != nullptr) && (strstr(dyldCache->archName(), "64_32") == nullptr);
+        if ( is64 ) {
+            const auto* headerInfo64 = (objc::objc_headeropt_ro_t<uint64_t>*)headerInfoRO;
+            uint64_t headerInfoVMAddr = dyldCache->unslidLoadAddress();
+            headerInfoVMAddr += (uint64_t)headerInfo64 - (uint64_t)dyldCache;
+            for ( std::pair<uint64_t, const char*> vmAddrAndName : dylibVMAddrMap ) {
+                const objc::objc_header_info_ro_t<uint64_t>* element = headerInfo64->get(headerInfoVMAddr, vmAddrAndName.first);
+                if ( element != nullptr ) {
+                    dylibMap[headerInfo64->index(element)] = vmAddrAndName.second;
+                }
+            }
+        } else {
+            const auto* headerInfo32 = (objc::objc_headeropt_ro_t<uint32_t>*)headerInfoRO;
+            uint64_t headerInfoVMAddr = dyldCache->unslidLoadAddress();
+            headerInfoVMAddr += (uint64_t)headerInfo32 - (uint64_t)dyldCache;
+            for ( std::pair<uint64_t, const char*> vmAddrAndName : dylibVMAddrMap ) {
+                const objc::objc_header_info_ro_t<uint32_t>* element = headerInfo32->get(headerInfoVMAddr, vmAddrAndName.first);
+                if ( element != nullptr ) {
+                    dylibMap[headerInfo32->index(element)] = vmAddrAndName.second;
+                }
+            }
+        }
+    }
+#endif
+
+    // Print all method lists in the shared cache
+
+    struct ListOfListsEntry {
+        union {
+            struct {
+                uint64_t imageIndex: 16;
+                int64_t  offset: 48;
+            };
+            struct {
+                uint32_t entsize;
+                uint32_t count;
+            };
+        };
+    };
+
+    __block std::unordered_set<VMAddress, VMAddressHash, VMAddressEqual> seenCategories;
+    dyldCache->forEachImage(^(const mach_header *mh, const char *installName) {
+        const dyld3::MachOAnalyzer* ma = (dyld3::MachOAnalyzer*)mh;
+        Diagnostics diag;
+
+        printf("--- %s ---\n", installName);
+
+        uint64_t sharedCacheRelativeSelectorBaseVMAddress = dyldCache->sharedCacheRelativeSelectorBaseVMAddress();
+        __block objc_visitor::Visitor visitor(dyldCache, ma, VMAddress(sharedCacheRelativeSelectorBaseVMAddress));
+        visitor.forEachClassAndMetaClass(^(const objc_visitor::Class& objcClass, bool& stopClass) {
+            const char* className = objcClass.getName(visitor);
+            bool isMetaClass = objcClass.isMetaClass;
+
+            printf("%s (%s):\n", className, isMetaClass ? "metaclass" : "class");
+            // method lists
+            {
+                objc_visitor::MethodList methodList = objcClass.getBaseMethods(visitor);
+                if ( methodList.isListOfLists() ) {
+                    const ListOfListsEntry* listHeader = (ListOfListsEntry*)((uint8_t*) ((uint64_t)methodList.getLocation() & ~1));
+                    VMAddress methodListVMAddr = methodList.getVMAddress().value() - VMOffset(1ULL);
+
+                    printf("(list of %d lists) {\n", listHeader->count);
+                    for ( uint32_t i = 0; i != listHeader->count; ++i ) {
+                        const ListOfListsEntry& listEntry = (listHeader + 1)[i];
+
+                        // The list entry is a relative offset to the target
+                        // Work out the VMAddress of that target
+                        VMOffset listEntryVMOffset{(uint64_t)&listEntry - (uint64_t)listHeader};
+                        VMAddress listEntryVMAddr = methodListVMAddr + listEntryVMOffset;
+                        VMAddress targetVMAddr = listEntryVMAddr + VMOffset((uint64_t)listEntry.offset);
+
+                        auto categoryIt = categoryMap.find(targetVMAddr);
+                        if ( categoryIt != categoryMap.end() ) {
+                            seenCategories.insert(targetVMAddr);
+                            printf("  (category methods: image (%d) %s) {\n", listEntry.imageIndex, categoryIt->second.c_str());
+
+                            metadata_visitor::ResolvedValue catMethodListValue = visitor.getValueFor(targetVMAddr);
+                            objc_visitor::MethodList catMethodList(catMethodListValue);
+                            uint32_t numMethods = catMethodList.numMethods();
+                            for ( uint32_t methodIndex = 0; methodIndex != numMethods; ++methodIndex ) {
+                                objc_visitor::Method method = catMethodList.getMethod(visitor, methodIndex);
+                                const char* name = method.getName(visitor);
+                                printf("    %s\n", name);
+                            }
+
+                            printf("  }\n");
+                        } else {
+                            // If we didn't find a category then we must be processing the class
+                            // methods. These have to be last
+                            if ( (i + 1) != listHeader->count ) {
+                                fprintf(stderr, "Invalid method list on %s in %s\n", className, installName);
+                                exit(1);
+                            }
+                            printf("  (class methods: image (%d)) {\n", listEntry.imageIndex);
+
+                            metadata_visitor::ResolvedValue classMethodListValue = visitor.getValueFor(targetVMAddr);
+                            objc_visitor::MethodList classMethodList(classMethodListValue);
+                            uint32_t numMethods = classMethodList.numMethods();
+                            for ( uint32_t methodIndex = 0; methodIndex != numMethods; ++methodIndex ) {
+                                objc_visitor::Method method = classMethodList.getMethod(visitor, methodIndex);
+                                const char* name = method.getName(visitor);
+                                printf("    %s\n", name);
+                            }
+
+                            printf("  }\n");
+                        }
+                    }
+                    printf("}\n");
+                } else {
+                    printf("(class methods) {\n");
+                    uint32_t numMethods = methodList.numMethods();
+                    for ( uint32_t methodIndex = 0; methodIndex != numMethods; ++methodIndex ) {
+                        objc_visitor::Method method = methodList.getMethod(visitor, methodIndex);
+                        const char* name = method.getName(visitor);
+                        printf("  %s\n", name);
+                    }
+                    printf("}\n");
+                }
+            }
+
+            // protocol lists
+            if ( !isMetaClass) {
+                objc_visitor::ProtocolList protocolList = objcClass.getBaseProtocols(visitor);
+                if ( protocolList.isListOfLists() ) {
+
+                    const ListOfListsEntry* listHeader = (ListOfListsEntry*)((uint8_t*) ((uint64_t)protocolList.getLocation() & ~1));
+                    VMAddress protocolListVMAddr = protocolList.getVMAddress().value() - VMOffset(1ULL);
+
+                    printf("(list of %d lists) {\n", listHeader->count);
+                    for ( uint32_t i = 0; i != listHeader->count; ++i ) {
+                        const ListOfListsEntry& listEntry = (listHeader + 1)[i];
+
+                        // The list entry is a relative offset to the target
+                        // Work out the VMAddress of that target
+                        VMOffset listEntryVMOffset{(uint64_t)&listEntry - (uint64_t)listHeader};
+                        VMAddress listEntryVMAddr = protocolListVMAddr + listEntryVMOffset;
+                        VMAddress targetVMAddr = listEntryVMAddr + VMOffset((uint64_t)listEntry.offset);
+
+                        auto categoryIt = categoryMap.find(targetVMAddr);
+                        if ( categoryIt != categoryMap.end() ) {
+                            seenCategories.insert(targetVMAddr);
+                            printf("  (category protocols: image (%d) %s) {\n", listEntry.imageIndex, categoryIt->second.c_str());
+
+                            metadata_visitor::ResolvedValue catProtocolListValue = visitor.getValueFor(targetVMAddr);
+                            objc_visitor::ProtocolList catProtocolList(catProtocolListValue);
+                            uint64_t numProtocols = catProtocolList.numProtocols(visitor);
+                            for ( uint64_t protocolIndex = 0; protocolIndex != numProtocols; ++protocolIndex ) {
+                                objc_visitor::Protocol protocol = catProtocolList.getProtocol(visitor, protocolIndex);
+                                const char* name = protocol.getName(visitor);
+                                printf("    %s\n", name);
+                            }
+
+                            printf("  }\n");
+                        } else {
+                            // If we didn't find a category then we must be processing the class
+                            // protocols. These have to be last
+                            if ( (i + 1) != listHeader->count ) {
+                                fprintf(stderr, "Invalid protocol list on %s in %s\n", className, installName);
+                                exit(1);
+                            }
+                            printf("  (class protocols: image (%d)) {\n", listEntry.imageIndex);
+
+                            metadata_visitor::ResolvedValue classProtocolListValue = visitor.getValueFor(targetVMAddr);
+                            objc_visitor::ProtocolList classProtocolList(classProtocolListValue);
+                            uint64_t numProtocols = classProtocolList.numProtocols(visitor);
+                            for ( uint64_t protocolIndex = 0; protocolIndex != numProtocols; ++protocolIndex ) {
+                                objc_visitor::Protocol protocol = classProtocolList.getProtocol(visitor, protocolIndex);
+                                const char* name = protocol.getName(visitor);
+                                printf("    %s\n", name);
+                            }
+
+                            printf("  }\n");
+                        }
+                    }
+                    printf("}\n");
+                } else {
+                    printf("(class protocols) {\n");
+                    uint64_t numProtocols = protocolList.numProtocols(visitor);
+                    for ( uint64_t protocolIndex = 0; protocolIndex != numProtocols; ++protocolIndex ) {
+                        objc_visitor::Protocol protocol = protocolList.getProtocol(visitor, protocolIndex);
+                        const char* name = protocol.getName(visitor);
+                        printf("  %s\n", name);
+                    }
+                    printf("}\n");
+                }
+            }
+            // property lists
+            {
+                objc_visitor::PropertyList propertyList = objcClass.getBaseProperties(visitor);
+                if ( propertyList.isListOfLists() ) {
+                    const ListOfListsEntry* listHeader = (ListOfListsEntry*)((uint8_t*) ((uint64_t)propertyList.getLocation() & ~1));
+                    VMAddress propertyListVMAddr = propertyList.getVMAddress().value() - VMOffset(1ULL);
+
+                    printf("(list of %d lists) {\n", listHeader->count);
+                    for ( uint32_t i = 0; i != listHeader->count; ++i ) {
+                        const ListOfListsEntry& listEntry = (listHeader + 1)[i];
+
+                        // The list entry is a relative offset to the target
+                        // Work out the VMAddress of that target
+                        VMOffset listEntryVMOffset{(uint64_t)&listEntry - (uint64_t)listHeader};
+                        VMAddress listEntryVMAddr = propertyListVMAddr + listEntryVMOffset;
+                        VMAddress targetVMAddr = listEntryVMAddr + VMOffset((uint64_t)listEntry.offset);
+
+                        auto categoryIt = categoryMap.find(targetVMAddr);
+                        if ( categoryIt != categoryMap.end() ) {
+                            seenCategories.insert(targetVMAddr);
+                            printf("  (category properties: image (%d) %s) {\n", listEntry.imageIndex, categoryIt->second.c_str());
+
+                            metadata_visitor::ResolvedValue catPropertyListValue = visitor.getValueFor(targetVMAddr);
+                            objc_visitor::PropertyList catPropertyList(catPropertyListValue);
+                            uint32_t numProperties = catPropertyList.numProperties();
+                            for ( uint32_t propertyIndex = 0; propertyIndex != numProperties; ++propertyIndex ) {
+                                objc_visitor::Property property = catPropertyList.getProperty(visitor, propertyIndex);
+                                const char* name = property.getName(visitor);
+                                printf("    %s\n", name);
+                            }
+
+                            printf("  }\n");
+                        } else {
+                            // If we didn't find a category then we must be processing the class
+                            // properties. These have to be last
+                            if ( (i + 1) != listHeader->count ) {
+                                fprintf(stderr, "Invalid property list on %s in %s\n", className, installName);
+                                exit(1);
+                            }
+                            printf("  (class properties: image (%d)) {\n", listEntry.imageIndex);
+
+                            metadata_visitor::ResolvedValue classPropertyListValue = visitor.getValueFor(targetVMAddr);
+                            objc_visitor::PropertyList classPropertyList(classPropertyListValue);
+                            uint32_t numProperties = classPropertyList.numProperties();
+                            for ( uint32_t propertyIndex = 0; propertyIndex != numProperties; ++propertyIndex ) {
+                                objc_visitor::Property property = classPropertyList.getProperty(visitor, propertyIndex);
+                                const char* name = property.getName(visitor);
+                                printf("    %s\n", name);
+                            }
+
+                            printf("  }\n");
+                        }
+                    }
+                    printf("}\n");
+                } else {
+                    printf("(class properties) {\n");
+                    uint32_t numProperties = propertyList.numProperties();
+                    for ( uint32_t propertyIndex = 0; propertyIndex != numProperties; ++propertyIndex ) {
+                        objc_visitor::Property property = propertyList.getProperty(visitor, propertyIndex);
+                        const char* name = property.getName(visitor);
+                        printf("  %s\n", name);
+                    }
+                    printf("}\n");
+                }
+            }
+        });
+    });
+
+    // Check if any categories weren't attached
+    bool badCategory = false;
+    for ( auto& [vmAddr, name] : categoryMap ) {
+         if ( seenCategories.count(vmAddr) )
+             continue;
+
+        badCategory = true;
+        fprintf(stderr, "Failed to find class with category: %s\n", name.c_str());
+    }
+
+    if ( badCategory )
+        exit(1);
 }
 
 
@@ -765,6 +1209,10 @@ int main (int argc, const char* argv[]) {
                 checkMode(options.mode);
                 options.mode = modeObjCClassLayout;
             }
+            else if (strcmp(opt, "-objc-class-method-lists") == 0) {
+                checkMode(options.mode);
+                options.mode = modeObjCClassMethodLists;
+            }
             else if (strcmp(opt, "-objc-class-hash-table") == 0) {
                 checkMode(options.mode);
                 options.mode = modeObjCClassHashTable;
@@ -846,7 +1294,7 @@ int main (int argc, const char* argv[]) {
     }
 
     if ( options.mode == modeNone ) {
-        fprintf(stderr, "Error: select one of -list, -dependents, -info, -linkedit, or -map\n");
+        fprintf(stderr, "Error: no command selected\n");
         usage();
         exit(1);
     }
@@ -891,6 +1339,14 @@ int main (int argc, const char* argv[]) {
         }
         if ( options.mode == modeObjCClassLayout ) {
             fprintf(stderr, "Cannot use -objc-class-layout with a live cache.  Please run with a path to an on-disk cache file\n");
+            return 1;
+        }
+        if ( options.mode == modeObjCClassMethodLists ) {
+            fprintf(stderr, "Cannot use -objc-class-method-lists with a live cache.  Please run with a path to an on-disk cache file\n");
+            return 1;
+        }
+        if ( options.mode == modeVerboseSlideInfo ) {
+            fprintf(stderr, "Cannot use -verbose_slide_info with a live cache.  Please run with a path to an on-disk cache file\n");
             return 1;
         }
 
@@ -1350,6 +1806,49 @@ int main (int argc, const char* argv[]) {
             printf("method list selector base address:  0x%llx\n", dyldCache->unslidLoadAddress() + ((uint64_t)relativeMethodListSelectorBase - (uint64_t)dyldCache));
             printf("method list selector base value:    \"%s\"\n", (const char*)relativeMethodListSelectorBase);
         }
+
+        // Dump the objc indices
+
+        __block std::map<uint64_t, const char*> dylibVMAddrMap;
+        dyldCache->forEachImage(^(const mach_header *mh, const char *installName) {
+            const dyld3::MachOAnalyzer* ma = (const dyld3::MachOAnalyzer*)mh;
+            if ( ma->hasObjC() )
+                dylibVMAddrMap[ma->preferredLoadAddress()] = installName;
+        });
+
+        std::vector<std::pair<std::string_view, const objc::objc_image_info*>> objcDylibs;
+
+        const objc::HeaderInfoRO* headerInfoRO = dyldCache->objcHeaderInfoRO();
+        const bool is64 = (strstr(dyldCache->archName(), "64") != nullptr) && (strstr(dyldCache->archName(), "64_32") == nullptr);
+        if ( is64 ) {
+            const auto* headerInfo64 = (objc::objc_headeropt_ro_t<uint64_t>*)headerInfoRO;
+            uint64_t headerInfoVMAddr = dyldCache->unslidLoadAddress();
+            headerInfoVMAddr += (uint64_t)headerInfo64 - (uint64_t)dyldCache;
+            for ( std::pair<uint64_t, const char*> vmAddrAndName : dylibVMAddrMap ) {
+                const objc::objc_header_info_ro_t<uint64_t>* element = headerInfo64->get(headerInfoVMAddr, vmAddrAndName.first);
+                if ( element != nullptr ) {
+                    objcDylibs.resize(headerInfo64->index(element) + 1);
+                    objcDylibs[headerInfo64->index(element)] = { vmAddrAndName.second, (const objc::objc_image_info*)element->imageInfo() };
+                }
+            }
+        } else {
+            const auto* headerInfo32 = (objc::objc_headeropt_ro_t<uint32_t>*)headerInfoRO;
+            uint64_t headerInfoVMAddr = dyldCache->unslidLoadAddress();
+            headerInfoVMAddr += (uint64_t)headerInfo32 - (uint64_t)dyldCache;
+            for ( std::pair<uint64_t, const char*> vmAddrAndName : dylibVMAddrMap ) {
+                const objc::objc_header_info_ro_t<uint32_t>* element = headerInfo32->get(headerInfoVMAddr, vmAddrAndName.first);
+                if ( element != nullptr ) {
+                    objcDylibs.resize(headerInfo32->index(element) + 1);
+                    objcDylibs[headerInfo32->index(element)] = { vmAddrAndName.second, (const objc::objc_image_info*)element->imageInfo() };
+                }
+            }
+        }
+
+        printf("num objc dylibs:                      %lu\n", objcDylibs.size());
+        for ( uint32_t i = 0; i != objcDylibs.size(); ++i ) {
+            const std::pair<std::string_view, const objc::objc_image_info*> objcDylib = objcDylibs[i];
+            printf("dylib[%d]: { 0x%x, 0x%08x } %s\n", i, objcDylib.second->version, objcDylib.second->flags, objcDylib.first.data());
+        }
     }
     else if ( options.mode == modeObjCProtocols ) {
         if ( !dyldCache->hasOptimizedObjC() ) {
@@ -1365,7 +1864,8 @@ int main (int argc, const char* argv[]) {
         __block std::map<uint64_t, const char*> dylibVMAddrMap;
         dyldCache->forEachImage(^(const mach_header *mh, const char *installName) {
             const dyld3::MachOAnalyzer* ma = (const dyld3::MachOAnalyzer*)mh;
-            dylibVMAddrMap[ma->preferredLoadAddress()] = installName;
+            if ( ma->hasObjC() )
+                dylibVMAddrMap[ma->preferredLoadAddress()] = installName;
         });
 
         __block std::map<uint16_t, const char*> dylibMap;
@@ -1413,7 +1913,7 @@ int main (int argc, const char* argv[]) {
             }
 
             // class appears in more than one header
-            fprintf(stderr, "[% 5d] -> %lu duplicates = %s\n", bucketIndex, implCacheInfos.count(), protocolName);
+            fprintf(stderr, "[% 5d] -> %llu duplicates = %s\n", bucketIndex, implCacheInfos.count(), protocolName);
             for (const ObjectAndDylibIndex& objectInfo : implCacheInfos) {
                 printf("  - [% 5d] -> (% 8lld, %4d) = %s in (%s)\n",
                        bucketIndex, objectInfo.first, objectInfo.second, protocolName,
@@ -1449,7 +1949,7 @@ int main (int argc, const char* argv[]) {
             }
 
             // class appears in more than one header
-            printf("[% 5d] -> %lu duplicates = %s\n", bucketIndex, implCacheInfos.count(), className);
+            printf("[% 5d] -> %llu duplicates = %s\n", bucketIndex, implCacheInfos.count(), className);
             for (const ObjectAndDylibIndex& objectInfo : implCacheInfos) {
                 printf("  - [% 5d] -> (% 8lld, %4d) = %s\n",
                        bucketIndex, objectInfo.first, objectInfo.second, className);
@@ -1961,7 +2461,8 @@ int main (int argc, const char* argv[]) {
         osDelegate._dyldCache   = dyldCache;
         osDelegate._rootPath    = options.rootPath;
         __block ProcessConfig   config(&kernArgs, osDelegate, alloc);
-        RuntimeState            stateObject(config, alloc);
+        RuntimeLocks            locks;
+        RuntimeState            stateObject(config, locks, alloc);
         RuntimeState&           state = stateObject;
 
         config.dyldCache.addr->forEachLaunchLoaderSet(^(const char* executableRuntimePath, const PrebuiltLoaderSet* pbls) {
@@ -2028,6 +2529,9 @@ int main (int argc, const char* argv[]) {
     }
     else if ( options.mode == modeObjCClassLayout ) {
         dumpObjCClassLayout(dyldCache);
+    }
+    else if ( options.mode == modeObjCClassMethodLists ) {
+        dumpObjCClassMethodLists(dyldCache);
     }
     else if ( options.mode == modeObjCSelectors ) {
         if ( !dyldCache->hasOptimizedObjC() ) {
@@ -2763,7 +3267,8 @@ int main (int argc, const char* argv[]) {
                                PatchTable::patchKindName(patchKind), exportName);
                         dyldCache->forEachPatchableUseOfExport(imageIndex, dylibVMOffsetOfImpl,
                                                                ^(uint32_t userImageIndex, uint32_t userVMOffset,
-                                                                 dyld3::MachOLoaded::PointerMetaData pmd, uint64_t addend) {
+                                                                 dyld3::MachOLoaded::PointerMetaData pmd, uint64_t addend,
+                                                                 bool isWeakImport) {
                             // Get the image so that we can convert from dylib offset to cache offset
                             uint64_t mTime;
                             uint64_t inode;
@@ -2786,23 +3291,26 @@ int main (int argc, const char* argv[]) {
 
                             uint64_t sectionOffset = patchLocVmAddr-usageAt.vmAddr;
 
+                            const char* weakImportString = isWeakImport ? " (weak-import)" : "";
+
                             if ( addend == 0 ) {
                                 if ( pmd.authenticated ) {
-                                    printf("        used by: %s(0x%04llX) (PAC: div=%d, addr=%s, key=%s) in %s\n",
-                                           usageAt.segName, sectionOffset,
+                                    printf("        used by: %s(0x%04llX)%s (PAC: div=%d, addr=%s, key=%s) in %s\n",
+                                           usageAt.segName, sectionOffset, weakImportString,
                                            pmd.diversity, pmd.usesAddrDiversity ? "true" : "false", keyNames[pmd.key],
                                            userInstallName.data());
                                 } else {
-                                    printf("        used by: %s(0x%04llX) in %s\n", usageAt.segName, sectionOffset, userInstallName.data());
+                                    printf("        used by: %s(0x%04llX)%s in %s\n", usageAt.segName, sectionOffset, weakImportString, userInstallName.data());
                                 }
                             } else {
                                 if ( pmd.authenticated ) {
-                                    printf("        used by: %s(0x%04llX) (addend=%lld) (PAC: div=%d, addr=%s, key=%s) in %s\n",
-                                           usageAt.segName, sectionOffset, addend,
+                                    printf("        used by: %s(0x%04llX)%s (addend=%lld) (PAC: div=%d, addr=%s, key=%s) in %s\n",
+                                           usageAt.segName, sectionOffset, weakImportString, addend,
                                            pmd.diversity, pmd.usesAddrDiversity ? "true" : "false", keyNames[pmd.key],
                                            userInstallName.data());
                                 } else {
-                                    printf("        used by: %s(0x%04llX) (addend=%lld) in %s\n", usageAt.segName, sectionOffset, addend, userInstallName.data());
+                                    printf("        used by: %s(0x%04llX)%s (addend=%lld) in %s\n", usageAt.segName, sectionOffset, weakImportString,
+                                           addend, userInstallName.data());
                                 }
                             }
                         });
@@ -2810,26 +3318,28 @@ int main (int argc, const char* argv[]) {
                         // Print GOT uses
                         dyldCache->forEachPatchableGOTUseOfExport(imageIndex, dylibVMOffsetOfImpl,
                                                                   ^(uint64_t cacheVMOffset,
-                                                                    dyld3::MachOLoaded::PointerMetaData pmd, uint64_t addend) {
+                                                                    dyld3::MachOLoaded::PointerMetaData pmd, uint64_t addend,
+                                                                    bool isWeakImport) {
 
                             // FIXME: We can't get this from MachoLoaded without having a fixup location to call
                             static const char* keyNames[] = {
                                 "IA", "IB", "DA", "DB"
                             };
 
+                            const char* weakImportString = isWeakImport ? " (weak-import)" : "";
                             if ( addend == 0 ) {
                                 if ( pmd.authenticated ) {
-                                    printf("        used by: GOT (PAC: div=%d, addr=%s, key=%s)\n",
-                                           pmd.diversity, pmd.usesAddrDiversity ? "true" : "false", keyNames[pmd.key]);
+                                    printf("        used by: GOT%s (PAC: div=%d, addr=%s, key=%s)\n",
+                                           weakImportString, pmd.diversity, pmd.usesAddrDiversity ? "true" : "false", keyNames[pmd.key]);
                                 } else {
-                                    printf("        used by: GOT\n");
+                                    printf("        used by: GOT%s\n", weakImportString);
                                 }
                             } else {
                                 if ( pmd.authenticated ) {
-                                    printf("        used by: GOT (addend=%lld) (PAC: div=%d, addr=%s, key=%s)\n",
-                                           addend, pmd.diversity, pmd.usesAddrDiversity ? "true" : "false", keyNames[pmd.key]);
+                                    printf("        used by: GOT%s (addend=%lld) (PAC: div=%d, addr=%s, key=%s)\n",
+                                           weakImportString, addend, pmd.diversity, pmd.usesAddrDiversity ? "true" : "false", keyNames[pmd.key]);
                                 } else {
-                                    printf("        used by: GOT (addend=%lld)\n", addend);
+                                    printf("        used by: GOT%s (addend=%lld)\n", weakImportString, addend);
                                 }
                             }
                         });
@@ -3271,6 +3781,7 @@ int main (int argc, const char* argv[]) {
             case modeObjCImpCaches:
             case modeObjCClasses:
             case modeObjCClassLayout:
+            case modeObjCClassMethodLists:
             case modeObjCClassHashTable:
             case modeObjCSelectors:
             case modeSwiftProtocolConformances:

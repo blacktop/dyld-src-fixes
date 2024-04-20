@@ -33,6 +33,19 @@
 #include <span>
 #include <string_view>
 
+#ifndef VM_PROT_READ
+    #define VM_PROT_READ    1
+#endif
+
+#ifndef VM_PROT_WRITE
+    #define VM_PROT_WRITE   2
+#endif
+
+#ifndef VM_PROT_EXECUTE
+    #define VM_PROT_EXECUTE 4
+#endif
+
+
 namespace dyld3 {
 struct MachOFile;
 }
@@ -107,6 +120,7 @@ struct VIS_HIDDEN SegmentLayout
     bool writable() const   { return protections & VM_PROT_WRITE; }
     bool executable() const { return protections & VM_PROT_EXECUTE; }
 };
+
 
 // Contains pointers to all the pieces of LINKEDIT
 struct VIS_HIDDEN Linkedit
@@ -280,12 +294,23 @@ union VIS_HIDDEN ChainedFixupPointerOnDisk
 
     struct Firm32 : dyld_chained_ptr_32_firmware_rebase { };
 
+    union Cache64e {
+        dyld_chained_ptr_arm64e_shared_cache_rebase      regular;
+        dyld_chained_ptr_arm64e_shared_cache_auth_rebase auth;
+
+        uint64_t            high8() const;
+        const char*         keyName() const;
+        uint64_t            signPointer(void* loc, uint64_t target) const;
+        static uint64_t     signPointer(uint64_t unsignedPtr, void* loc, bool addrDiv, uint16_t diversity, uint8_t keyIsData);
+    };
+
     typedef dyld_chained_ptr_32_cache_rebase Cache32;
 
     uint64_t            raw64;
     Arm64e              arm64e;
     Generic64           generic64;
     Kernel64            kernel64;
+    Cache64e            cache64e;
 
     uint32_t            raw32;
     Generic32           generic32;

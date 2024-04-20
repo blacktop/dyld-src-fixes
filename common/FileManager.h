@@ -25,11 +25,15 @@
 #ifndef FileManager_h
 #define FileManager_h
 
+#if !TARGET_OS_EXCLAVEKIT
 #include "UUID.h"
 #include "Defines.h"
 #include "Allocator.h"
 #include "OrderedMap.h"
 #include "DyldDelegates.h"
+#if !BUILDING_DYLD
+#include <os/lock.h>
+#endif
 
 namespace dyld4 {
 
@@ -68,7 +72,7 @@ private:
     friend FileManager;
     FileRecord(FileManager& fileManager, uint64_t objectID, uint64_t device, uint64_t mtime);
     FileRecord(FileManager& fileManager, const UUID& VID, uint64_t objectID);
-    FileRecord(FileManager& fileManager, struct stat& sb);
+    FileRecord(FileManager& fileManager, const struct stat& sb);
     FileRecord(FileManager& fileManager, UniquePtr<const char>&& filePath);
     void swap(FileRecord& other);
     void stat() const;
@@ -94,8 +98,8 @@ struct VIS_HIDDEN FileManager {
     FileManager&    operator=(FileManager&& O)          = delete;
     FileManager(Allocator& allocator, const SyscallDelegate* syscall);
 
-    FileRecord      fileRecordForPath(const char* filePath);
-    FileRecord      fileRecordForStat(struct stat& sb);
+    FileRecord      fileRecordForPath(Allocator& allocator, const char* filePath);
+    FileRecord      fileRecordForStat(const struct stat& sb);
     FileRecord      fileRecordForVolumeUUIDAndObjID(const UUID& VID, uint64_t objectID);
     FileRecord      fileRecordForVolumeDevIDAndObjID(uint64_t device, uint64_t objectID);
     FileRecord      fileRecordForFileID(const FileID& fileID);
@@ -140,4 +144,5 @@ private:
 
 }; /* namespace dyld4 */
 
+#endif //!TARGET_OS_EXCLAVEKIT
 #endif /* FileManager_h */

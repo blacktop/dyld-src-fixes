@@ -22,6 +22,10 @@
  * @APPLE_LICENSE_HEADER_END@
  */
 
+#include <TargetConditionals.h>
+
+#if !TARGET_OS_EXCLAVEKIT
+
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/attr.h>
@@ -29,7 +33,7 @@
 #include <sys/param.h>
 #include <sys/ucred.h>
 #include <sys/mount.h>
-//#include <System/sys/fsgetpath.h>
+#include <System/sys/fsgetpath.h>
 
 #include "FileManager.h"
 
@@ -51,12 +55,14 @@ void FileManager::swap(FileManager& other) {
 }
 
 
-FileRecord FileManager::fileRecordForPath(const char* filePath) {
-    auto str = _allocator->strdup(filePath);
+FileRecord FileManager::fileRecordForPath(Allocator& allocator, const char* filePath) {
+    const char* str = nullptr;
+    if ( filePath )
+        str = allocator.strdup(filePath);
     return FileRecord(*this, UniquePtr<const char>(str));
 }
 
-FileRecord FileManager::fileRecordForStat(struct stat& sb) {
+FileRecord FileManager::fileRecordForStat(const struct stat& sb) {
     return FileRecord(*this, sb);
 }
 
@@ -108,13 +114,13 @@ void FileManager::reloadFSInfos() const {
             // groups that are not relevent here.
             uint64_t f_fsid = (*((uint64_t*)&fsInfos[i].f_fsid)) & 0x00ffffffff;
             if (_fsUUIDMap->find(f_fsid) != _fsUUIDMap->end()) { continue; }
-#if TARGET_OS_OSX
-            // On macOS getattrlist() can upcall when used against a non-root volume which results in a deadlock.
+
+            // getattrlist() can upcall when used against a non-root volume which results in a deadlock.
             if ((fsInfos[i].f_flags & MNT_ROOTFS) == 0) {
                 _fsUUIDMap->insert({f_fsid, UUID()});
                 continue;
             }
-#endif
+
             int             err;
             attrlist        attrList;
             VolAttrBuf      attrBuf;
@@ -184,13 +190,13 @@ UniquePtr<char> FileManager::getPath(const UUID& VID, uint64_t OID) {
 
 UniquePtr<char> FileManager::getPath(uint64_t fsid, uint64_t OID) {
     if ((fsid == 0) || (OID == 0)) { return nullptr; }
-    char path[MAXPATHLEN];
-    ssize_t result = this->fsgetpath(&path[0], MAXPATHLEN, fsid, OID);
+    char path[PATH_MAX];
+    ssize_t result = this->fsgetpath(&path[0], PATH_MAX, fsid, OID);
 #if !__LP64__
     //FIXME: Workaround for missing stat high bit on 32 bit platforms
     if (result == -1) {
         OID = 0x0fffffff00000000ULL | OID;
-        result = this->fsgetpath(&path[0], MAXPATHLEN, fsid, OID);
+        result = this->fsgetpath(&path[0], PATH_MAX, fsid, OID);
     }
 #endif
     if (result == -1) {
@@ -201,12 +207,12 @@ UniquePtr<char> FileManager::getPath(uint64_t fsid, uint64_t OID) {
 
 ssize_t FileManager::fsgetpath(char result[], size_t resultBufferSize, uint64_t fsID, uint64_t objID) const
 {
-//#if BUILDING_DYLD
+#if BUILDING_DYLD
     return _syscall->fsgetpath(result, resultBufferSize, fsID, objID);
-//#else
-//    fsid_t      fsid  = *reinterpret_cast<fsid_t*>(&fsID);
-//    return ::fsgetpath(result, resultBufferSize, &fsid, objID);
-//#endif
+#else
+    fsid_t      fsid  = *reinterpret_cast<fsid_t*>(&fsID);
+    return ::fsgetpath(result, resultBufferSize, &fsid, objID);
+#endif
 }
 
 int FileManager::getfsstat(struct statfs *buf, int bufsize, int flags) const {
@@ -243,7 +249,7 @@ FileRecord::FileRecord(FileManager& fileManager, uint64_t objectID, uint64_t dev
         }
     }
 
-FileRecord::FileRecord(FileManager& fileManager, struct stat& sb)
+FileRecord::FileRecord(FileManager& fileManager, const struct stat& sb)
     :  _fileManager(&fileManager), _objectID(sb.st_ino), _device(sb.st_dev), _volume(_fileManager->uuidForFileSystem(_device)), _mtime(sb.st_mtime), _statResult(0) {}
 
 FileRecord::FileRecord(const FileRecord& other)
@@ -290,9 +296,9 @@ int FileRecord::open(int flags) {
     if (_volume) {
         fsid = _fileManager->fsidForUUID(_volume);
     }
-//    if (fsid && _objectID) {
-//        _fd = openbyid_np((fsid_t*)&fsid, (fsobj_id_t*)_objectID, flags);
-//    }
+    if (fsid && _objectID) {
+        _fd = openbyid_np((fsid_t*)&fsid, (fsobj_id_t*)_objectID, flags);
+    }
     if (_fd == -1) {
         _fd = ::open(getPath(), flags);
     }
@@ -377,3 +383,5 @@ const UUID& FileRecord::volume() const {
 }
 
 }; /* namedpace dyld4 */
+
+#endif // !TARGET_OS_EXCLAVEKIT

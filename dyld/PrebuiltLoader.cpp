@@ -21,12 +21,17 @@
  * @APPLE_LICENSE_HEADER_END@
  */
 
+#include <TargetConditionals.h>
+
+#if !TARGET_OS_EXCLAVEKIT
+
 #include <assert.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/fcntl.h>
 
+#include "Defines.h"
 #include "UUID.h"
 #include "Loader.h"
 #include "PrebuiltLoader.h"
@@ -35,11 +40,12 @@
 #include "MachOAnalyzer.h"
 #include "DyldProcessConfig.h"
 #include "DyldRuntimeState.h"
-#include "ProcessAtlas.h"
 #include "PrebuiltObjC.h"
 #include "PrebuiltSwift.h"
 #include "OptimizerObjC.h"
 #include "objc-shared-cache.h"
+
+#if SUPPORT_PREBUILTLOADERS || BUILDING_UNIT_TESTS || BUILDING_CACHE_BUILDER_UNIT_TESTS
 
 // HACK: This is just to avoid building the version in the unit tests
 #if BUILDING_CACHE_BUILDER_UNIT_TESTS
@@ -63,20 +69,25 @@ class PrebuiltLoader;
 // MARK: --- PrebuiltLoader::BindTargetRef methods ---
 //
 
-PrebuiltLoader::BindTargetRef::BindTargetRef(const ResolvedSymbol& targetSymbol)
+PrebuiltLoader::BindTargetRef::BindTargetRef(Diagnostics& diag, const ResolvedSymbol& targetSymbol)
 {
     uint64_t value63;
     uint64_t high2;
     uint64_t high8;
     uint64_t low39;
     switch ( targetSymbol.kind ) {
-        case ResolvedSymbol::Kind::bindAbsolute:
+        case ResolvedSymbol::Kind::bindAbsolute: {
             value63    = targetSymbol.targetRuntimeOffset & 0x7FFFFFFFFFFFFFFFULL;
             high2      = targetSymbol.targetRuntimeOffset >> 62;
             _abs.kind  = 1;
             _abs.value = value63;
-            assert((high2 == 0) || (high2 == 3) && "unencodeable absolute symbol value");
+            bool encodable = (high2 == 0) || (high2 == 3);
+            if ( !encodable ) {
+                diag.error("unencodeable absolute value (0x%llx) for symbol '%s'", targetSymbol.targetRuntimeOffset, targetSymbol.targetSymbolName);
+                return;
+            }
             break;
+        }
         case ResolvedSymbol::Kind::bindToImage: {
             LoaderRef loaderRef = (targetSymbol.targetLoader != nullptr) ? targetSymbol.targetLoader->ref : LoaderRef::missingWeakImage();
 
@@ -240,10 +251,10 @@ bool PrebuiltLoader::matchesPath(const char* path) const
     return false;
 }
 
-FileID PrebuiltLoader::fileID(const FileManager& fileManager) const
+FileID PrebuiltLoader::fileID(const RuntimeState& state) const
 {
     if ( const FileValidationInfo* fvi = fileValidationInfo() )
-        return FileID(fvi->inode, fileManager.fsidForUUID(fvi->uuid), fvi->mtime, fvi->checkInodeMtime);
+        return FileID(fvi->inode, fvi->deviceID, fvi->mtime, fvi->checkInodeMtime);
     return FileID::none();
 }
 
@@ -292,6 +303,9 @@ void PrebuiltLoader::map(Diagnostics& diag, RuntimeState& state, const LoadOptio
             this->logSegmentsFromSharedCache(state);
         if ( state.config.log.libraries )
             this->logLoad(state, this->path());
+
+        if ( state.config.process.catalystRuntime && this->isCatalystOverride )
+            state.setHasOverriddenUnzipperedTwin();
 #endif
     }
     else if ( this == state.mainExecutableLoader ) {
@@ -363,12 +377,14 @@ void PrebuiltLoader::loadDependents(Diagnostics& diag, RuntimeState& state, cons
     ldrState = State::dependentsMapped;
 }
 
+#if SUPPORT_IMAGE_UNLOADING
 void PrebuiltLoader::unmap(RuntimeState& state, bool force) const
 {
     // only called during a dlopen() failure, roll back state 
     State& ldrState = this->loaderState(state);
     ldrState = State::notMapped;
 }
+#endif
 
 #if BUILDING_DYLD || BUILDING_UNIT_TESTS
 void PrebuiltLoader::applyFixups(Diagnostics& diag, RuntimeState& state, DyldCacheDataConstLazyScopedWriter& cacheDataConst, bool allowLazyBinds) const
@@ -379,7 +395,10 @@ void PrebuiltLoader::applyFixups(Diagnostics& diag, RuntimeState& state, DyldCac
     if ( this->dylibInDyldCache ) {
         // But if some lower level cached dylib has a root, we
         // need to patch this image's uses of that rooted dylib.
-        if ( state.hasOverriddenCachedDylib() ) {
+        // We also need to patch if there are unzippered twins.
+        // In that case, we need to make sure that if this binary is in the cache and linked to
+        // the macOS side of the unzippered twins, then the iOSMac unzippered twin can now patch this dylib
+        if ( state.hasOverriddenCachedDylib() || state.hasOverriddenUnzipperedTwin() ) {
             // have each other image apply to me any cache patching it has
             for ( const Loader* ldr : state.loaded ) {
                 ldr->applyCachePatchesTo(state, this, cacheDataConst);
@@ -400,9 +419,9 @@ void PrebuiltLoader::applyFixups(Diagnostics& diag, RuntimeState& state, DyldCac
         void* value = (void*)(long)target.value(state);
         if ( state.config.log.fixups ) {
             if ( target.isAbsolute() )
-                state.log("<%s/bind#%lu> -> %p\n", this->leafName(), targetAddrs.count(), value);
+                state.log("<%s/bind#%llu> -> %p\n", this->leafName(), targetAddrs.count(), value);
             else
-                state.log("<%s/bind#%lu> -> %p (%s+0x%08llX)\n", this->leafName(), targetAddrs.count(), value, target.loaderRef().loader(state)->leafName(), target.offset());
+                state.log("<%s/bind#%llu> -> %p (%s+0x%08llX)\n", this->leafName(), targetAddrs.count(), value, target.loaderRef().loader(state)->leafName(), target.offset());
         }
         targetAddrs.push_back(value);
     }
@@ -414,16 +433,16 @@ void PrebuiltLoader::applyFixups(Diagnostics& diag, RuntimeState& state, DyldCac
         // Missing weak binds need placeholders to make the target indices line up, but we should otherwise ignore them
         if ( !target.isAbsolute() && target.loaderRef().isMissingWeakImage() ) {
             if ( state.config.log.fixups )
-                state.log("<%s/bind#%lu> -> missing-weak-bind\n", this->leafName(), overrideTargetAddrs.count());
+                state.log("<%s/bind#%llu> -> missing-weak-bind\n", this->leafName(), overrideTargetAddrs.count());
 
             overrideTargetAddrs.push_back((const void*)UINTPTR_MAX);
         } else {
             void* value = (void*)(long)target.value(state);
             if ( state.config.log.fixups ) {
                 if ( target.isAbsolute() )
-                    state.log("<%s/bind#%lu> -> %p\n", this->leafName(), overrideTargetAddrs.count(), value);
+                    state.log("<%s/bind#%llu> -> %p\n", this->leafName(), overrideTargetAddrs.count(), value);
                 else
-                    state.log("<%s/bind#%lu> -> %p (%s+0x%08llX)\n", this->leafName(), overrideTargetAddrs.count(), value, target.loaderRef().loader(state)->leafName(), target.offset());
+                    state.log("<%s/bind#%llu> -> %p (%s+0x%08llX)\n", this->leafName(), overrideTargetAddrs.count(), value, target.loaderRef().loader(state)->leafName(), target.offset());
             }
             overrideTargetAddrs.push_back(value);
         }
@@ -456,16 +475,16 @@ void PrebuiltLoader::applyFixups(Diagnostics& diag, RuntimeState& state, DyldCac
 }
 #endif // BUILDING_DYLD || BUILDING_UNIT_TESTS
 
-Loader* PrebuiltLoader::dependent(const RuntimeState& state, uint32_t depIndex, DependentKind* kind) const
+Loader* PrebuiltLoader::dependent(const RuntimeState& state, uint32_t depIndex, DependentDylibAttributes* depAttrs) const
 {
     assert(depIndex < this->depCount);
-    if ( kind != nullptr ) {
+    if ( depAttrs != nullptr ) {
         if ( this->dependentKindArrayOffset != 0 ) {
-            const DependentKind* kindsArray = (DependentKind*)((uint8_t*)this + this->dependentKindArrayOffset);
-            *kind                           = kindsArray[depIndex];
+            const DependentDylibAttributes* attrsArray = (DependentDylibAttributes*)((uint8_t*)this + this->dependentKindArrayOffset);
+            *depAttrs                                  = attrsArray[depIndex];
         }
         else {
-            *kind = DependentKind::normal;
+            *depAttrs = DependentDylibAttributes::regular;
         }
     }
     const PrebuiltLoader::LoaderRef* depRefsArray = (PrebuiltLoader::LoaderRef*)((uint8_t*)this + this->dependentLoaderRefsArrayOffset);
@@ -502,7 +521,6 @@ bool PrebuiltLoader::representsCachedDylibIndex(uint16_t dylibIndex) const
     dylibIndex = 0xFFFF;
     return false; // cannot make PrebuiltLoader for images that override the dyld cache
 }
-
 
 void PrebuiltLoader::recursiveMarkBeingValidated(const RuntimeState& state) const
 {
@@ -547,6 +565,7 @@ bool PrebuiltLoader::isValid(const RuntimeState& state) const
         case State::mappingDependents:
         case State::dependentsMapped:
         case State::fixedUp:
+        case State::delayInitPending:
         case State::beingInitialized:
         case State::initialized:
             return true;
@@ -574,7 +593,7 @@ bool PrebuiltLoader::isValid(const RuntimeState& state) const
             loadersBeingValidated.push_back(ldr);
         }
     }
-    if (verbose) state.log("   have %lu beingValidated Loaders\n", loadersBeingValidated.count());
+    if (verbose) state.log("   have %llu beingValidated Loaders\n", loadersBeingValidated.count());
 
     // look at each individual dylib in beingValidated state to see if it has an override file
     for (const PrebuiltLoader* ldr : loadersBeingValidated) {
@@ -585,7 +604,7 @@ bool PrebuiltLoader::isValid(const RuntimeState& state) const
     bool more = true;
     while (more) {
         more = false;
-        if (verbose) state.log("checking shallow for %lu loaders\n", loadersBeingValidated.count());
+        if (verbose) state.log("checking shallow for %llu loaders\n", loadersBeingValidated.count());
         for (const PrebuiltLoader* ldr : loadersBeingValidated) {
             State&      ldrState    = ldr->loaderState(state);
             const State ldrOrgState = ldrState;
@@ -664,7 +683,7 @@ void PrebuiltLoader::invalidateInIsolation(const RuntimeState& state) const
                                                           }
                                                           FileID foundFileID = FileID::none();
                                                           if ( state.config.fileExists(possiblePath, &foundFileID) ) {
-                                                              FileID recordedFileID = this->fileID(state.fileManager);
+                                                              FileID recordedFileID = this->fileID(state);
                                                               // Note: sim caches will have valid() fileIDs, others won't
                                                               if ( recordedFileID.valid() ) {
                                                                   if ( foundFileID != recordedFileID ) {
@@ -696,7 +715,7 @@ void PrebuiltLoader::invalidateInIsolation(const RuntimeState& state) const
     else {
 #if BUILDING_DYLD
         // not in dyld cache
-        FileID recordedFileID = this->fileID(state.fileManager);
+        FileID recordedFileID = this->fileID(state);
         if ( recordedFileID.valid() ) {
             // have recorded file inode (such as for embedded framework in 3rd party app)
             FileID foundFileID = FileID::none();
@@ -749,6 +768,11 @@ bool PrebuiltLoader::dyldDoesObjCFixups() const
     return this->dylibInDyldCache;
 }
 
+const SectionLocations* PrebuiltLoader::getSectionLocations() const
+{
+    return &this->sectionLocations;
+}
+
 Array<Loader::Region> PrebuiltLoader::segments() const
 {
     return Array<Region>((Region*)((uint8_t*)this + regionsOffset), regionsCount, regionsCount);
@@ -797,6 +821,33 @@ void PrebuiltLoader::runInitializers(RuntimeState& state) const
 }
 #endif // BUILDING_DYLD || BUILDING_UNIT_TESTS
 
+bool PrebuiltLoader::isDelayInit(RuntimeState& state) const
+{
+    return this->loaderState(state) == State::delayInitPending;
+}
+
+void PrebuiltLoader::setDelayInit(RuntimeState& state, bool value) const
+{
+    // This is used in the mark-and-sweep to determine which dylibs should be delay-inited.
+    // But, PrebuiltLoaders are r/o and don't have a place to store this bit.
+    // So, instead we manipulate the "class State" byte used by this PrebuiltLoader.
+    // For newly loaded dylibs, the state will be "fixedUp" when the mark-and-sweep is done.
+    // Older loaders are in "initialized" state.  So, when value==true (mark) and the state is "fixedUp"
+    // we move the state to "delayInitPending", and when value==false (sweep) and the stat is
+    // "delayInitPending", we move it back to "fixedUp".
+    PrebuiltLoader::State& ldrState = this->loaderState(state);
+    if ( value ) {
+        // in "mark" phase
+        if ( ldrState == State::fixedUp )
+            ldrState = State::delayInitPending;
+    }
+    else {
+        // in "sweep" phase
+        if ( ldrState == State::delayInitPending )
+            ldrState = State::fixedUp;
+    }
+}
+
 bool PrebuiltLoader::isInitialized(const RuntimeState& state) const
 {
     return this->loaderState(state) == State::initialized;
@@ -819,7 +870,7 @@ void PrebuiltLoader::setMF(RuntimeState& state, const dyld3::MachOFile* mf) cons
 ////////////////////////  other functions /////////////////////////////////
 
 PrebuiltLoader::PrebuiltLoader(const Loader& jitLoader)
-    : Loader(InitialOptions(jitLoader), true, false, 0)
+    : Loader(InitialOptions(jitLoader), true, false, 0, false)
 {
 }
 
@@ -1066,7 +1117,7 @@ void PrebuiltLoader::serialize(Diagnostics& diag, RuntimeState& state, const Jus
                                const PrebuiltSwift& prebuiltSwift, BumpAllocator& allocator)
 {
     // use allocator and placement new to instantiate PrebuiltLoader object
-    size_t serializationStart = allocator.size();
+    uint64_t serializationStart = allocator.size();
     allocator.zeroFill(sizeof(PrebuiltLoader));
     BumpAllocatorPtr<PrebuiltLoader> p(allocator, serializationStart);
     new (p.get()) PrebuiltLoader(jitLoader);
@@ -1097,15 +1148,15 @@ void PrebuiltLoader::serialize(Diagnostics& diag, RuntimeState& state, const Jus
     uint16_t depLoaderRefsArrayOffset = allocator.size() - serializationStart;
     p->dependentLoaderRefsArrayOffset = depLoaderRefsArrayOffset;
     allocator.zeroFill(depCount * sizeof(LoaderRef));
-    BumpAllocatorPtr<LoaderRef> depArray(allocator, serializationStart + depLoaderRefsArrayOffset);
-    Loader::DependentKind kinds[depCount+1];
+    BumpAllocatorPtr<LoaderRef>      depArray(allocator, serializationStart + depLoaderRefsArrayOffset);
+    Loader::DependentDylibAttributes depAttrs[depCount+1];
     bool                  hasNonRegularLink = false;
     for ( uint32_t depIndex = 0; depIndex < depCount; ++depIndex ) {
-        Loader* depLoader = jitLoader.dependent(state, depIndex, &kinds[depIndex]);
-        if ( kinds[depIndex] != Loader::DependentKind::normal )
+        Loader* depLoader = jitLoader.dependent(state, depIndex, &depAttrs[depIndex]);
+        if ( depAttrs[depIndex] != Loader::DependentDylibAttributes::regular )
             hasNonRegularLink = true;
         if ( depLoader == nullptr ) {
-            assert(kinds[depIndex] == Loader::DependentKind::weakLink);
+            assert(depAttrs[depIndex].weakLink);
             depArray.get()[depIndex] = LoaderRef::missingWeakImage();
         }
         else {
@@ -1116,12 +1167,12 @@ void PrebuiltLoader::serialize(Diagnostics& diag, RuntimeState& state, const Jus
     // if any non-regular linking of dependents, append array for that
     p->dependentKindArrayOffset = 0;
     if ( hasNonRegularLink ) {
-        static_assert(sizeof(Loader::DependentKind) == 1, "DependentKind expect to be one byte");
+        static_assert(sizeof(Loader::DependentDylibAttributes) == 1, "DependentDylibAttributes expect to be one byte");
         uint16_t dependentKindArrayOff = allocator.size() - serializationStart;
         p->dependentKindArrayOffset    = dependentKindArrayOff;
-        allocator.zeroFill(depCount * sizeof(Loader::DependentKind));
-        BumpAllocatorPtr<Loader::DependentKind> kindArray(allocator, serializationStart + dependentKindArrayOff);
-        memcpy(kindArray.get(), kinds, depCount * sizeof(Loader::DependentKind));
+        allocator.zeroFill(depCount * sizeof(Loader::DependentDylibAttributes));
+        BumpAllocatorPtr<Loader::DependentDylibAttributes> kindArray(allocator, serializationStart + dependentKindArrayOff);
+        memcpy(kindArray.get(), depAttrs, depCount * sizeof(Loader::DependentDylibAttributes));
     }
 
     // record exports-trie location
@@ -1147,8 +1198,8 @@ void PrebuiltLoader::serialize(Diagnostics& diag, RuntimeState& state, const Jus
     // append FileValidationInfo
     if ( !jitLoader.dylibInDyldCache || state.config.dyldCache.dylibsExpectedOnDisk ) {
         allocator.align(__alignof__(FileValidationInfo));
-        FileValidationInfo info = jitLoader.getFileValidationInfo(state.fileManager);
-        uintptr_t          off  = allocator.size() - serializationStart;
+        FileValidationInfo info = jitLoader.getFileValidationInfo(state);
+        uint64_t          off  = allocator.size() - serializationStart;
         p->fileValidationOffset = off;
         assert(p->fileValidationOffset == off && "uint16_t fileValidationOffset overflow");
         allocator.append(&info, sizeof(FileValidationInfo));
@@ -1158,12 +1209,15 @@ void PrebuiltLoader::serialize(Diagnostics& diag, RuntimeState& state, const Jus
     p->vmSpace = (uint32_t)mf->mappedSize();
     jitLoader.withRegions(mf, ^(const Array<Region>& regions) {
         allocator.align(__alignof__(Region));
-        uintptr_t off    = allocator.size() - serializationStart;
+        uint64_t off    = allocator.size() - serializationStart;
         p->regionsOffset = off;
         assert(p->regionsOffset == off && "uint16_t regionsOffset overflow");
         p->regionsCount = regions.count();
         allocator.append(&regions[0], sizeof(Region) * regions.count());
     });
+
+    // append section locations
+    p->sectionLocations = *jitLoader.getSectionLocations();
 
     // add catalyst support info
     bool isMacOSOrCataylyst = (state.config.process.basePlatform == dyld3::Platform::macOS) || (state.config.process.basePlatform == dyld3::Platform::iOSMac);
@@ -1204,27 +1258,37 @@ void PrebuiltLoader::serialize(Diagnostics& diag, RuntimeState& state, const Jus
     STACK_ALLOC_OVERFLOW_SAFE_ARRAY(BindTargetRef, overrideBindTargets, 16);
     if ( !jitLoader.dylibInDyldCache ) {
         allocator.align(__alignof__(BindTargetRef));
-        uintptr_t off           = allocator.size() - serializationStart;
+        uint64_t off           = allocator.size() - serializationStart;
         p->bindTargetRefsOffset = off;
         assert(p->bindTargetRefsOffset == off && "uint16_t bindTargetRefsOffset overflow");
         p->bindTargetRefsCount = 0;
         jitLoader.forEachBindTarget(diag, state, cacheWeakDefFixup, true, ^(const ResolvedSymbol& resolvedTarget, bool& stop) {
             // Regular and lazy binds
-            BindTargetRef bindRef(resolvedTarget);
+            BindTargetRef bindRef(diag, resolvedTarget);
+            if ( diag.hasError() ) {
+                stop = true;
+                return;
+            }
             allocator.append(&bindRef, sizeof(BindTargetRef));
             p->bindTargetRefsCount += 1;
             assert(p->bindTargetRefsCount != 0 && "bindTargetRefsCount overflow");
         }, ^(const ResolvedSymbol& resolvedTarget, bool& stop) {
             // Opcode based weak binds
-            BindTargetRef bindRef(resolvedTarget);
+            BindTargetRef bindRef(diag, resolvedTarget);
+            if ( diag.hasError() ) {
+                stop = true;
+                return;
+            }
             overrideBindTargets.push_back(bindRef);
         });
+        if ( diag.hasError() )
+            return;
     }
 
     // Everything from this point onwards needs 32-bit offsets
     if ( !overrideBindTargets.empty() ) {
         allocator.align(__alignof__(BindTargetRef));
-        uintptr_t off           = allocator.size() - serializationStart;
+        uint64_t off           = allocator.size() - serializationStart;
         p->overrideBindTargetRefsOffset = (uint32_t)off;
         p->overrideBindTargetRefsCount = (uint32_t)overrideBindTargets.count();
         allocator.append(&overrideBindTargets[0], sizeof(BindTargetRef) * overrideBindTargets.count());
@@ -1305,6 +1369,7 @@ void PrebuiltLoader::print(RuntimeState& state, FILE* out, bool printComments) c
     if ( this->dylibInDyldCache ) {
         fprintf(out, "      \"overridable\": \"%s\",\n", this->isOverridable ? "true" : "false");
         fprintf(out, "      \"supports-catalyst\": \"%s\",\n", this->supportsCatalyst ? "true" : "false");
+        fprintf(out, "      \"catalyst-override\": \"%s\",\n", this->isCatalystOverride ? "true" : "false");
         if ( this->indexOfTwin != kNoUnzipperedTwin ) {
             if ( this->supportsCatalyst )
                 fprintf(out, "      \"mac-twin\": \"c.%d\",", this->indexOfTwin);
@@ -1348,6 +1413,7 @@ void PrebuiltLoader::print(RuntimeState& state, FILE* out, bool printComments) c
         fprintf(out, "      \"file-info\":  {\n");
         if ( fileInfo->checkInodeMtime ) {
             fprintf(out, "          \"slice-offset\":    \"0x%llX\",\n", fileInfo->sliceOffset);
+            fprintf(out, "          \"deviceID\":        \"0x%llX\",\n", fileInfo->deviceID);
             fprintf(out, "          \"inode\":           \"0x%llX\",\n", fileInfo->inode);
             fprintf(out, "          \"mod-time\":        \"0x%llX\",\n", fileInfo->mtime);
         }
@@ -1378,29 +1444,31 @@ void PrebuiltLoader::print(RuntimeState& state, FILE* out, bool printComments) c
         if ( needComma )
             fprintf(out, ",");
         PrebuiltLoader::LoaderRef dep     = depsArray[depIndex];
-        const char*               kindStr = "regular";
+        char                      depAttrsStr[128];
+        DependentDylibAttributes  depAttrs  = DependentDylibAttributes::regular;
         if ( this->dependentKindArrayOffset != 0 ) {
-            const DependentKind* kindsArray = (DependentKind*)((uint8_t*)this + this->dependentKindArrayOffset);
-            switch ( kindsArray[depIndex] ) {
-                case DependentKind::normal:
-                    break;
-                case DependentKind::weakLink:
-                    kindStr = "weak";
-                    break;
-                case DependentKind::upward:
-                    kindStr = "upward";
-                    break;
-                case DependentKind::reexport:
-                    kindStr = "reexport";
-                    break;
-                default:
-                    kindStr = "???";
-                    break;
+            const DependentDylibAttributes* kindsArray = (DependentDylibAttributes*)((uint8_t*)this + this->dependentKindArrayOffset);
+            depAttrs = kindsArray[depIndex];
+        }
+        else {
+            if ( depAttrs == DependentDylibAttributes::regular ) {
+                strlcpy(depAttrsStr, "regular", sizeof(depAttrsStr));
+            }
+            else {
+                depAttrsStr[0] = '\0';
+                if ( depAttrs.weakLink )
+                    strlcat(depAttrsStr, "weak ", sizeof(depAttrsStr));
+                if ( depAttrs.upward )
+                    strlcat(depAttrsStr, "upward ", sizeof(depAttrsStr));
+                if ( depAttrs.reExport )
+                    strlcat(depAttrsStr, "re-export ", sizeof(depAttrsStr));
+                if ( depAttrs.delayInit )
+                    strlcat(depAttrsStr, "delay ", sizeof(depAttrsStr));
             }
         }
         const char* depPath = dep.isMissingWeakImage() ? "missing weak link" : dep.loader(state)->path();
         fprintf(out, "\n          {\n");
-        fprintf(out, "              \"kind\":           \"%s\",\n", kindStr);
+        fprintf(out, "              \"kind\":           \"%s\",\n", depAttrsStr);
         fprintf(out, "              \"loader\":         \"%c.%d\"", dep.app ? 'a' : 'c', dep.index);
         if ( printComments )
             fprintf(out, "     # %s\n", depPath);
@@ -1565,7 +1633,7 @@ bool PrebuiltLoaderSet::isValid(RuntimeState& state) const
 
     return !somethingInvalid;
 }
-#endif
+#endif // SUPPORT_VM_LAYOUT
 
 const PrebuiltLoader* PrebuiltLoaderSet::findLoader(const char* path) const
 {
@@ -1611,16 +1679,16 @@ const ObjCSelectorOpt* PrebuiltLoaderSet::objcSelectorOpt() const {
     return (const ObjCSelectorOpt*)((uint8_t*)this + this->objcSelectorHashTableOffset);
 }
 
-const ObjCClassOpt* PrebuiltLoaderSet::objcClassOpt() const {
+const ObjCDataStructOpt* PrebuiltLoaderSet::objcClassOpt() const {
     if ( this->objcClassHashTableOffset == 0 )
         return nullptr;
-    return (const ObjCClassOpt*)((uint8_t*)this + this->objcClassHashTableOffset);
+    return (const ObjCDataStructOpt*)((uint8_t*)this + this->objcClassHashTableOffset);
 }
 
-const ObjCClassOpt* PrebuiltLoaderSet::objcProtocolOpt() const {
+const ObjCDataStructOpt* PrebuiltLoaderSet::objcProtocolOpt() const {
     if ( this->objcProtocolHashTableOffset == 0 )
         return nullptr;
-    return (const ObjCClassOpt*)((uint8_t*)this + this->objcProtocolHashTableOffset);
+    return (const ObjCDataStructOpt*)((uint8_t*)this + this->objcProtocolHashTableOffset);
 }
 
 const uint64_t* PrebuiltLoaderSet::swiftTypeProtocolTable() const {
@@ -1650,7 +1718,7 @@ bool PrebuiltLoaderSet::hasOptimizedSwift() const {
 void PrebuiltLoaderSet::logDuplicateObjCClasses(RuntimeState& state) const
 {
 #if BUILDING_DYLD || BUILDING_UNIT_TESTS
-    if ( const ObjCClassOpt* classesHashTable = objcClassOpt() ) {
+    if ( const ObjCDataStructOpt* classesHashTable = objcClassOpt() ) {
         if ( !classesHashTable->hasDuplicates() || !state.config.log.initializers )
             return;
 
@@ -1661,7 +1729,7 @@ void PrebuiltLoaderSet::logDuplicateObjCClasses(RuntimeState& state) const
             duplicateClassesToIgnore[className] = true;
         });
 
-        classesHashTable->forEachClass(state, ^(const PrebuiltLoader::BindTargetRef &nameTarget,
+        classesHashTable->forEachDataStruct(state, ^(const PrebuiltLoader::BindTargetRef &nameTarget,
                                                 const Array<PrebuiltLoader::BindTargetRef> &implTargets) {
             // Skip entries without duplicates
             if ( implTargets.count() == 1 )
@@ -1683,7 +1751,7 @@ void PrebuiltLoaderSet::logDuplicateObjCClasses(RuntimeState& state) const
             }
         });
     }
-#endif
+#endif // BUILDING_DYLD || BUILDING_UNIT_TESTS
 }
 
 #if BUILDING_CLOSURE_UTIL
@@ -1749,11 +1817,11 @@ void PrebuiltLoaderSet::print(RuntimeState& state, FILE* out, bool printComments
     }
 
     // Objc classes
-    if ( const ObjCClassOpt* clsOpt = this->objcClassOpt() ) {
+    if ( const ObjCDataStructOpt* clsOpt = this->objcClassOpt() ) {
         fprintf(out, ",\n  \"objc-class-table\": [");
         needComma = false;
 
-        clsOpt->forEachClass(state, ^(const PrebuiltLoader::BindTargetRef& nameTarget,
+        clsOpt->forEachDataStruct(state, ^(const PrebuiltLoader::BindTargetRef& nameTarget,
                                       const Array<PrebuiltLoader::BindTargetRef>& implTargets) {
             const Loader::LoaderRef& nameRef = nameTarget.loaderRef();
             if ( needComma )
@@ -1791,11 +1859,11 @@ void PrebuiltLoaderSet::print(RuntimeState& state, FILE* out, bool printComments
     }
 
     // Objc protocols
-    if ( const ObjCClassOpt* protocolOpt = this->objcProtocolOpt() ) {
+    if ( const ObjCDataStructOpt* protocolOpt = this->objcProtocolOpt() ) {
         fprintf(out, ",\n  \"objc-protocol-table\": [");
         needComma = false;
 
-        protocolOpt->forEachClass(state, ^(const PrebuiltLoader::BindTargetRef& nameTarget,
+        protocolOpt->forEachDataStruct(state, ^(const PrebuiltLoader::BindTargetRef& nameTarget,
                                            const Array<PrebuiltLoader::BindTargetRef>& implTargets) {
             const Loader::LoaderRef& nameRef = nameTarget.loaderRef();
             if ( needComma )
@@ -2069,7 +2137,7 @@ const PrebuiltLoaderSet* PrebuiltLoaderSet::makeLaunchSet(Diagnostics& diag, Run
     }
 
     // initialize header of PrebuiltLoaderSet
-    const uintptr_t count = jitLoaders.count();
+    const uint64_t count = jitLoaders.count();
     __block BumpAllocator   allocator;
     allocator.zeroFill(sizeof(PrebuiltLoaderSet));
     BumpAllocatorPtr<PrebuiltLoaderSet> set(allocator, 0);
@@ -2105,7 +2173,7 @@ const PrebuiltLoaderSet* PrebuiltLoaderSet::makeLaunchSet(Diagnostics& diag, Run
     STACK_ALLOC_OVERFLOW_SAFE_ARRAY(CachePatch, cachePatches, 16);
     Loader::CacheWeakDefOverride cacheWeakDefFixup = ^(uint32_t cachedDylibIndex, uint32_t cachedDylibVMOffset, const Loader::ResolvedSymbol& target) {
         //state.log("patch index=%d, cacheOffset=0x%08x, symbol=%s, targetLoader=%s\n", cachedDylibIndex, exportCacheOffset, target.targetSymbolName, target.targetLoader->leafName());
-        CachePatch patch = { cachedDylibIndex, cachedDylibVMOffset, PrebuiltLoader::BindTargetRef(target) };
+        CachePatch patch = { cachedDylibIndex, cachedDylibVMOffset, PrebuiltLoader::BindTargetRef(diag, target) };
         cachePatches.push_back(patch);
     };
 
@@ -2159,6 +2227,10 @@ const PrebuiltLoaderSet* PrebuiltLoaderSet::makeLaunchSet(Diagnostics& diag, Run
         }
         // foreign type conformances hash table
         if ( !prebuiltSwift.foreignProtocolConformances.array().empty() ) {
+            // HACK: Before we serialize the table, null out the "originalPointer".  We need to remove it
+            prebuiltSwift.foreignProtocolConformances.forEachKey(^(SwiftForeignTypeProtocolConformanceDiskLocationKey& key) {
+                key.originalPointer = 0;
+            });
             set->swiftForeignTypeConformanceTableOffset = (uint32_t)allocator.size();
             prebuiltSwift.foreignProtocolConformances.serialize(allocator);
             allocator.align(8);
@@ -2261,33 +2333,33 @@ const PrebuiltLoaderSet* PrebuiltLoaderSet::makeDyldCachePrebuiltLoaders(Diagnos
 // MARK: --- BumpAllocator methods ---
 //
 
-void BumpAllocator::append(const void* payload, size_t payloadSize)
+void BumpAllocator::append(const void* payload, uint64_t payloadSize)
 {
-    size_t startSize = size();
+    uint64_t startSize = size();
     zeroFill(payloadSize);
     uint8_t* p = _vmAllocationStart + startSize;
-    memcpy(p, payload, payloadSize);
+    memcpy(p, payload, (size_t)payloadSize);
 }
 
-void BumpAllocator::zeroFill(size_t reqSize)
+void BumpAllocator::zeroFill(uint64_t reqSize)
 {
     const size_t allocationChunk = 1024*1024;
-    size_t remaining = _vmAllocationSize - this->size();
+    uint64_t remaining = _vmAllocationSize - this->size();
     if ( reqSize > remaining ) {
         // if current buffer too small, grow it
-        size_t growth = _vmAllocationSize;
+        uint64_t growth = _vmAllocationSize;
         if ( growth < allocationChunk )
             growth = allocationChunk;
         if ( growth < reqSize )
             growth = allocationChunk * ((reqSize / allocationChunk) + 1);
         vm_address_t newAllocationAddr;
-        size_t       newAllocationSize = _vmAllocationSize + growth;
-        ::vm_allocate(mach_task_self(), &newAllocationAddr, newAllocationSize, VM_FLAGS_ANYWHERE | VM_MAKE_TAG(VM_MEMORY_DYLD));
+        uint64_t     newAllocationSize = _vmAllocationSize + growth;
+        ::vm_allocate(mach_task_self(), &newAllocationAddr, (vm_size_t)newAllocationSize, VM_FLAGS_ANYWHERE | VM_MAKE_TAG(VM_MEMORY_DYLD));
         assert(newAllocationAddr != 0);
-        size_t currentInUse = this->size();
+        uint64_t currentInUse = this->size();
         if ( _vmAllocationStart != nullptr ) {
-            ::memcpy((void*)newAllocationAddr, _vmAllocationStart, currentInUse);
-            ::vm_deallocate(mach_task_self(), (vm_address_t)_vmAllocationStart, _vmAllocationSize);
+            ::memcpy((void*)newAllocationAddr, _vmAllocationStart, (size_t)currentInUse);
+            ::vm_deallocate(mach_task_self(), (vm_address_t)_vmAllocationStart, (vm_size_t)_vmAllocationSize);
         }
         _usageEnd          = (uint8_t*)(newAllocationAddr + currentInUse);
         _vmAllocationStart = (uint8_t*)newAllocationAddr;
@@ -2313,7 +2385,7 @@ const void* BumpAllocator::finalize()
     uintptr_t used        = round_page(this->size());
     if ( used < _vmAllocationSize ) {
         uintptr_t deallocStart = bufferStart + used;
-        ::vm_deallocate(mach_task_self(), deallocStart, _vmAllocationSize - used);
+        ::vm_deallocate(mach_task_self(), deallocStart, (vm_size_t)(_vmAllocationSize - used));
         _usageEnd         = nullptr;
         _vmAllocationSize = used;
     }
@@ -2326,7 +2398,7 @@ const void* BumpAllocator::finalize()
 BumpAllocator::~BumpAllocator()
 {
     if ( _vmAllocationStart != nullptr ) {
-        ::vm_deallocate(mach_task_self(), (vm_address_t)_vmAllocationStart, _vmAllocationSize);
+        ::vm_deallocate(mach_task_self(), (vm_address_t)_vmAllocationStart, (vm_size_t)_vmAllocationSize);
         _vmAllocationStart  = nullptr;
         _vmAllocationSize   = 0;
         _usageEnd           = nullptr;
@@ -2354,3 +2426,7 @@ void MissingPaths::forEachPath(void (^callback)(const char* path)) const
 
 
 } // namespace dyld4
+
+#endif // SUPPORT_PREBUILTLOADERS || BUILDING_UNIT_TESTS || BUILDING_CACHE_BUILDER_UNIT_TESTS
+
+#endif // !TARGET_OS_EXCLAVEKIT

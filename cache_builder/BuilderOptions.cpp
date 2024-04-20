@@ -43,9 +43,14 @@ BuilderOptions::BuilderOptions(std::string_view archName, dyld3::Platform platfo
 {
 }
 
-bool BuilderOptions::isSimultor() const
+bool BuilderOptions::isSimulator() const
 {
     return dyld3::MachOFile::isSimulatorPlatform(this->platform);
+}
+
+bool BuilderOptions::isExclaveKit() const
+{
+    return dyld3::MachOFile::isExclaveKitPlatform(this->platform);
 }
 
 //

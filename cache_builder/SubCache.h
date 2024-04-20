@@ -127,6 +127,7 @@ public:
     void addCodeSignatureChunk();
     void addObjCOptsHeaderChunk(ObjCOptimizer& objcOptimizer);
     void addObjCHeaderInfoReadOnlyChunk(ObjCOptimizer& objcOptimizer);
+    void addObjCImageInfoChunk(ObjCOptimizer& objcOptimizer);
     void addObjCSelectorStringsChunk(ObjCSelectorOptimizer& objCSelectorOptimizer);
     void addObjCSelectorHashTableChunk(ObjCSelectorOptimizer& objCSelectorOptimizer);
     void addObjCClassNameStringsChunk(ObjCClassOptimizer& objcClassOptimizer);
@@ -134,9 +135,11 @@ public:
     void addObjCProtocolNameStringsChunk(ObjCProtocolOptimizer& objcProtocolOptimizer);
     void addObjCProtocolHashTableChunk(ObjCProtocolOptimizer& objcProtocolOptimizer);
     void addObjCProtocolSwiftDemangledNamesChunk(ObjCProtocolOptimizer& objcProtocolOptimizer);
-    void addObjCIMPCachesChunk(ObjCIMPCachesOptimizer& objcIMPCachesOptimizer);
     void addObjCCanonicalProtocolsChunk(const BuilderConfig& config,
                                         ObjCProtocolOptimizer& objcProtocolOptimizer);
+    void addObjCCategoriesChunk(const BuilderConfig& config,
+                                ObjCCategoryOptimizer& objcCategoryOptimizer);
+    void addObjCIMPCachesChunk(ObjCIMPCachesOptimizer& objcIMPCachesOptimizer);
     void addCacheTrieChunk(DylibTrieOptimizer& dylibTrieOptimizer);
     void addPatchTableChunk(PatchTableOptimizer& patchTableOptimizer);
     void addCacheDylibsLoaderChunk(PrebuiltLoaderBuilder& builder);
@@ -238,6 +241,9 @@ private:
     static error::Error computeSlideInfoV3(const BuilderConfig& config,
                                            SlideInfoChunk* slideChunk,
                                            Region& region);
+    static error::Error computeSlideInfoV5(const BuilderConfig& config,
+                                           SlideInfoChunk* slideChunk,
+                                           Region& region);
     static error::Error computeSlideInfoForRegion(const BuilderConfig& config,
                                                   SlideInfoChunk* slideChunk,
                                                   Region& region);
@@ -270,6 +276,7 @@ public:
     std::unique_ptr<ObjCOptsHeaderChunk>                        objcOptsHeader;
     std::unique_ptr<ObjCHeaderInfoReadOnlyChunk>                objcHeaderInfoRO;
     std::unique_ptr<ObjCHeaderInfoReadWriteChunk>               objcHeaderInfoRW;
+    std::unique_ptr<ObjCImageInfoChunk>                         objcImageInfo;
     std::unique_ptr<ObjCStringsChunk>                           objcSelectorStrings;
     std::unique_ptr<ObjCSelectorHashTableChunk>                 objcSelectorsHashTable;
     std::unique_ptr<ObjCStringsChunk>                           objcClassNameStrings;
@@ -277,6 +284,7 @@ public:
     std::unique_ptr<ObjCStringsChunk>                           objcProtocolNameStrings;
     std::unique_ptr<ObjCProtocolHashTableChunk>                 objcProtocolsHashTable;
     std::unique_ptr<ObjCCanonicalProtocolsChunk>                objcCanonicalProtocols;
+    std::unique_ptr<ObjCPreAttachedCategoriesChunk>             objcCategories;
     std::unique_ptr<ObjCStringsChunk>                           objcSwiftDemangledNameStrings;
     std::unique_ptr<ObjCIMPCachesChunk>                         objcIMPCaches;
     std::unique_ptr<SwiftOptsHeaderChunk>                       swiftOptsHeader;
