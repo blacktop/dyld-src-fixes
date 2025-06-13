@@ -35,22 +35,30 @@
 #include <platform/platform.h>
 #endif
 
+// mach_o
+#include "Platform.h"
+#include "Header.h"
+#include "FunctionVariants.h"
+
+// common
 #include "Defines.h"
 #include "Array.h"
-#include "DyldSharedCache.h"
-#include "SharedCacheRuntime.h"
-#include "DyldDelegates.h"
-#include "Allocator.h"
-
+#include "CString.h"
 #if BUILDING_CACHE_BUILDER
 #include "MachOFile.h"
 #else
 #include "MachOAnalyzer.h"
 #endif
 
+// dyld
+#include "DyldDelegates.h"
+#include "Allocator.h"
+#include "SharedCacheRuntime.h"
 #if BUILDING_CACHE_BUILDER || BUILDING_CACHE_BUILDER_UNIT_TESTS
 #include "Vector.h"
 #endif
+
+class DyldSharedCache;
 
 namespace dyld4 {
 
@@ -59,55 +67,52 @@ using dyld3::MachOFile;
 using dyld3::MachOLoaded;
 using dyld3::MachOAnalyzer;
 using dyld3::GradedArchs;
+using mach_o::Header;
+using mach_o::FunctionVariants;
 
 
 class APIs;
 
-#if BUILDING_DYLD
+#if BUILDING_DYLD || BUILDING_UNIT_TESTS
 struct StructuredError {
     uintptr_t     kind              = 0;
     const char*   clientOfDylibPath = nullptr;
     const char*   targetDylibPath   = nullptr;
     const char*   symbolName        = nullptr;
  };
-void halt(const char* message, const StructuredError* errInfo=nullptr)  __attribute__((noreturn));
-#endif
+void halt(const char* message, const StructuredError* errInfo=nullptr)  __attribute__((__noreturn__));
+void missing_symbol_abort()  __attribute__((__noreturn__));
+#endif // BUILDING_DYLD || BUILDING_UNIT_TESTS
 void console(const char* format, ...) __attribute__((format(printf, 1, 2)));
 
 struct ProgramVars
 {
-    const void*      mh;
-    int*             NXArgcPtr;
-    const char***    NXArgvPtr;
-    const char***    environPtr;
-    const char**     __prognamePtr;
+    const void*      mh             = nullptr;
+    int*             NXArgcPtr      = nullptr;
+    const char***    NXArgvPtr      = nullptr;
+    const char***    environPtr     = nullptr;
+    const char**     __prognamePtr  = nullptr;
 #if TARGET_OS_EXCLAVEKIT
     void             *entry_vec;
     void            (*finalize_process_startup)(int(*main)(int argc, const char* const argv[], const char* const envp[], const char* const apple[]));
 #endif
 };
 
+// for use with function-variant feature bits
+typedef __uint128_t  FunctionVariantFlags;
+
+
 // how static initializers are called
   typedef void (*Initializer)(int argc, const char* const argv[], const char* const envp[], const char* const apple[], const ProgramVars* vars);
 
 
 //
-// This struct is how libdyld finds dyld.  At launch, dyld stuffs the first field
-// in the __DATA,__dyld4 section with a pointer to a v-table in dyld.  The
-// rest of the struct is pointers to the crt globals that programs might use
-// from libdyld.dylib.  libsystem_c.dylib needs to know these so that putenv()
-// can update "environ".  Some old programs have their own copy of these globals
-// (from crt1.o), so dyld may switch these ProgramVars.
+// At launch, dyld stuffs the start of __TPRO_CONST,__dyld_apis section with a pointer to a v-table in dyld. 
 //
-struct LibdyldDyld4Section {
+struct LibdyldAPIsSection {
     APIs*               apis;
-    void*               allImageInfos;  // set by dyld to point to the dyld_all_image_infos struct
-	dyld4::ProgramVars  defaultVars;    // set by libdyld to have addresses of default crt globals in libdyld.dylib
-    dyld3::DyldLookFunc dyldLookupFuncAddr;
-    void* (*tlv_get_addrAddr)(dyld3::MachOAnalyzer::TLV_Thunk*);
 };
 
-extern volatile LibdyldDyld4Section gDyld;
 
 #if TARGET_OS_EXCLAVEKIT
 struct PreMappedFileEntry {
@@ -123,6 +128,7 @@ struct KernelArgs
 #if TARGET_OS_EXCLAVEKIT
     xrt__entry_vec_t*           entry_vec;
     const void*                 mappingDescriptor; // set only after call to liblibc_plat_parse_entry_vec
+    bool                        dyldSharedCacheEnabled;
 #else
   #if SUPPORT_VM_LAYOUT
     const MachOAnalyzer*  mainExecutable;
@@ -173,10 +179,11 @@ public:
     public:
                                     Process(const KernelArgs* kernArgs, SyscallDelegate&, Allocator&);
 #if SUPPORT_VM_LAYOUT
-        const MachOAnalyzer*        mainExecutable;
+        const MachOAnalyzer*        mainExecutableMF;
 #else
-        mach_o::MachOFileRef        mainExecutable = { nullptr };
+        mach_o::MachOFileRef        mainExecutableMF = { nullptr };
 #endif
+        const mach_o::Header*       mainExecutableHdr;
         const char*                 mainExecutablePath;
         const char*                 mainUnrealPath;             // raw path used to launch
         uint64_t                    mainExecutableFSID;
@@ -185,9 +192,10 @@ public:
         uint32_t                    mainExecutableSDKVersionSet;
         uint32_t                    mainExecutableMinOSVersion;
         uint32_t                    mainExecutableMinOSVersionSet;
-        dyld3::Platform             basePlatform;
-        dyld3::Platform             platform;
+        mach_o::Platform            basePlatform;
+        mach_o::Platform            platform;
         const char*                 dyldPath;
+        const Header*               dyldHdr;
         uint64_t                    dyldFSID;
         uint64_t                    dyldObjID;
 #if TARGET_OS_SIMULATOR
@@ -198,6 +206,11 @@ public:
         xrt__entry_vec_t*                              entry_vec;
         uint32_t                                       startupContractVersion;
         dyld3::OverflowSafeArray<PreMappedFileEntry>   preMappedFiles;
+        void*                                          preMappedCache;
+        const char*                                    preMappedCachePath;
+        size_t                                         preMappedCacheSize;
+        bool                                           sharedCacheFileEnabled; //TODO: remove when transition file is removed
+        bool                                           sharedCachePageInLinking;
 #else
         DyldCommPage                commPage;
 #endif
@@ -211,17 +224,24 @@ public:
         bool                        isTranslated;
         bool                        catalystRuntime; // Mac Catalyst app or iOS-on-mac app
         bool                        enableDataConst; // Temporarily allow disabling __DATA_CONST for bringup
+        bool                        enableTproHeap; // Enable HW TPRO protections for the dyld heap (and TPRO_CONST)
         bool                        enableTproDataConst; // Enable HW TPRO protections for __DATA_CONST
-        bool                        enableCompactInfo; // Temporarily allow disabling Compact Info during bringup
+        bool                        enableProtectedStack; // Enable HW TPRO protections for the stack
         bool                        proactivelyUseWeakDefMap;
         int                         pageInLinkingMode;
+        FunctionVariantFlags        perProcessFunctionVariantFlags;    // evaluated in-process
+        FunctionVariantFlags        systemWideFunctionVariantFlags;    // copied from dyld cache or evaluted in-process
+        FunctionVariantFlags        processorFunctionVariantFlags;     // copied from dyld cache or evaluted in-process
+
         const char*                 appleParam(const char* key) const;
         const char*                 environ(const char* key) const;
+        void                        evaluateFunctionVariantFlags(const ProcessConfig& config);
+        uint64_t                    selectFromFunctionVariants(const FunctionVariants& fvs, uint32_t fvTableIndex) const;
 
     private:
         friend class ProcessConfig;
 
-        uint32_t                        findVersionSetEquivalent(dyld3::Platform versionPlatform, uint32_t version) const;
+        uint32_t                        findVersionSetEquivalent(mach_o::Platform versionPlatform, uint32_t version) const;
         std::pair<uint64_t, uint64_t>   fileIDFromFileHexStrings(const char* encodedFileInfo);
         const char*                     pathFromFileHexStrings(SyscallDelegate& sys, Allocator& allocator, const char* encodedFileInfo);
         std::pair<uint64_t, uint64_t>   getDyldFileID();
@@ -230,13 +250,15 @@ public:
         const char*                     getMainPath(SyscallDelegate& syscall, Allocator& allocator);
         std::pair<uint64_t, uint64_t>   getMainFileID();
         const char*                     getMainUnrealPath(SyscallDelegate& syscall, Allocator& allocator);
-        dyld3::Platform                 getMainPlatform();
+        mach_o::Platform                getMainPlatform();
         const GradedArchs*              getMainArchs(SyscallDelegate& osDelegate);
         bool                            isInternalSimulator(SyscallDelegate& syscall) const;
-        bool                            usesCatalyst();
-        bool                            defaultDataConst();
-        bool                            defaultTproDataConst();
-        bool                            defaultCompactInfo();
+        bool                            usesCatalyst() const;
+        bool                            defaultDataConst() const;
+        bool                            defaultTproDataConst() const;
+        bool                            defaultTproStack() const;
+        bool                            defaultTproHW() const;
+        void                            setPerProcessFunctionVariantFlags(const ProcessConfig& config);
     };
 
     //
@@ -251,6 +273,8 @@ public:
         bool                        internalInstall; // always returns false for simulator
         bool                        dlsymBlocked;
         bool                        dlsymAbort;
+        const char*                 dlsymAllowList;
+        bool                        lockdownMode;
 #if !TARGET_OS_EXCLAVEKIT
         bool                        allowAtPaths;
         bool                        allowEnvVarsPrint;
@@ -260,6 +284,8 @@ public:
         bool                        allowInsertFailures;
         bool                        allowInterposing;
         bool                        allowEmbeddedVars;
+        bool                        allowDevelopmentVars;
+        bool                        allowLibSystemOverrides;
         bool                        skipMain;
         bool                        justBuildClosure;
 
@@ -290,6 +316,7 @@ public:
         int                         descriptor;
         bool                        useStderr;
         bool                        useFile;
+        CString                     linksWith;
 
      private:
     };
@@ -300,11 +327,12 @@ public:
     class DyldCache
     {
     public:
-                                    DyldCache(Process&, const Security&, const Logging&, SyscallDelegate&, Allocator&);
+                                    DyldCache(Process&, const Security&, const Logging&, SyscallDelegate&, Allocator&, const ProcessConfig&);
 
         const DyldSharedCache*          addr;
-        uint64_t                        fsID;
-        uint64_t                        fsObjID;
+#if !TARGET_OS_EXCLAVEKIT
+        FileIdTuple                     mainFileID;
+#endif // !TARGET_OS_EXCLAVEKIT
 #if SUPPORT_VM_LAYOUT
         uintptr_t                       slide;
 #endif
@@ -320,12 +348,20 @@ public:
         uint64_t                        objcHeaderInfoROUnslidVMAddr;
         uint64_t                        objcProtocolClassCacheOffset;
         PatchTable                      patchTable;
-        dyld3::Platform                 platform;
+        mach_o::Platform                platform;
         uint32_t                        osVersion;
         uint32_t                        dylibCount;
         bool                            development;
         bool                            dylibsExpectedOnDisk;
         bool                            privateCache;
+        bool                            allowLibSystemOverrides;
+        FunctionVariantFlags            systemWideFunctionVariantFlags;
+        FunctionVariantFlags            processorFunctionVariantFlags;
+
+        // This is used to track the cases where the shared cache supports roots, and which roots are eligible.
+        // This is a combination of the kind of shared cache (customer vs development) but also whether
+        // other circumstances such as boot-time/env-var checks mean that we know for sure roots are or are not supported
+        bool                            rootsAreSupported;
 
 #if BUILDING_CACHE_BUILDER || BUILDING_CACHE_BUILDER_UNIT_TESTS
         // In the cache builder, the dylibs might not be mapped in their runtime layout,
@@ -349,19 +385,25 @@ public:
         // us to not link DyldSharedCache in to the cache builder, where it would be unsafe to use due
         // to file layout vs VM layout vs builder layout
         static bool                 isAlwaysOverridablePath(const char* dylibPath);
+        static bool                 isProtectedLibSystemPath(const char* dylibPath);
         bool                        isOverridablePath(const char* dylibPath) const;
         const char*                 getCanonicalPath(const char *path) const;
         const char*                 getIndexedImagePath(uint32_t index) const;
         const dyld3::MachOFile*     getIndexedImageEntry(uint32_t index,
                                                          uint64_t& mTime, uint64_t& inode) const;
 
-        void                        adjustDevelopmentMode() const;
+        // There are env vars which can change the default search paths, eg, DYLD_LIBRARY_PATH.
+        // Adjust whether roots are supported, given that these are set.
+        void                        adjustRootsSupportForEnvVars();
+
+        bool                        sharedCacheLoadersAreAlwaysValid() const { return !rootsAreSupported; }
 
     private:
         friend class ProcessConfig;
         bool                        uuidOfFileMatchesDyldCache(const Process& process, const SyscallDelegate& syscall, const char* path) const;
         void                        setPlatformOSVersion(const Process& proc);
         void                        setupDyldCommPage(Process& process, const Security& security, SyscallDelegate& syscall);
+        void                        setSystemWideFunctionVariantFlags();
     };
 
     //
@@ -380,7 +422,7 @@ public:
         // This returns true if we are a Type such as those
         static bool                     isOnDiskOnlyType(Type& t) { return (t == catalystPrefixOnDisk) || (t == rawPathOnDisk); }
 
-        void                            forEachPathVariant(const char* requestedPath, dyld3::Platform platform, bool requestorNeedsFallbacks, bool skipFallbacks, bool& stop,
+        void                            forEachPathVariant(const char* requestedPath, mach_o::Platform platform, bool requestorNeedsFallbacks, bool skipFallbacks, bool& stop,
                                                            void (^handler)(const char* possiblePath, Type type, bool& stop)) const;
         void                            forEachInsertedDylib(void (^handler)(const char* dylibPath, bool &stop)) const;
         bool                            dontUsePrebuiltForApp() const;
@@ -400,7 +442,7 @@ public:
     private:
         void                            setEnvVars(const char* envp[], const char* mainExePath);
         void                            addEnvVar(const Process& process, const Security& security, Allocator&, const char* keyEqualsValue, bool isLC_DYLD_ENV, char* crashMsg);
-        void                            processVersionedPaths(const Process& proc, SyscallDelegate&, const DyldCache&, dyld3::Platform, const GradedArchs&, Allocator& allocator);
+        void                            processVersionedPaths(const Process& proc, SyscallDelegate&, const DyldCache&, mach_o::Platform, const GradedArchs&, Allocator& allocator);
         void                            forEachEnvVar(void (^handler)(const char* envVar)) const;
         void                            forEachExecutableEnvVar(void (^handler)(const char* envVar)) const;
 
@@ -408,11 +450,11 @@ public:
         static void                     forEachInColonList(const char* list1, const char* list2, bool& stop, void (^callback)(const char* path, bool& stop));
         void                            handleListEnvVar(const char* key, const char** list, void (^handler)(const char* envVar)) const;
         void                            handleEnvVar(const char* key, const char* value, void (^handler)(const char* envVar)) const;
-        void                            forEachDylibFallback(dyld3::Platform platform, bool requestorNeedsFallbacks, bool& stop, void (^handler)(const char* fallbackDir, Type type, bool& stop)) const;
-        void                            forEachFrameworkFallback(dyld3::Platform platform, bool requestorNeedsFallbacks, bool& stop, void (^handler)(const char* fallbackDir, Type type, bool& stop)) const;
+        void                            forEachDylibFallback(mach_o::Platform platform, bool requestorNeedsFallbacks, bool& stop, void (^handler)(const char* fallbackDir, Type type, bool& stop)) const;
+        void                            forEachFrameworkFallback(mach_o::Platform platform, bool requestorNeedsFallbacks, bool& stop, void (^handler)(const char* fallbackDir, Type type, bool& stop)) const;
         void                            forEachImageSuffix(const char* path, Type type, bool& stop, void (^handler)(const char* possiblePath, Type type, bool& stop)) const;
         void                            addSuffix(const char* path, const char* suffix, char* result) const;
-        void                            checkVersionedPath(SyscallDelegate& delegate, const DyldCache&, Allocator&, const char* path, dyld3::Platform, const GradedArchs&);
+        void                            checkVersionedPath(SyscallDelegate& delegate, const DyldCache&, Allocator&, const char* path, mach_o::Platform, const GradedArchs&);
         void                            addPathOverride(Allocator& allocator, const char* installName, const char* overridePath);
 
         enum class FallbackPathMode { classic, restricted, none };
@@ -448,6 +490,10 @@ public:
 
     // if there is a dyld cache and the supplied path is in the dyld cache at that path or a symlink, return canonical path
     const char* canonicalDylibPathInCache(const char* dylibPath) const;
+
+    static FunctionVariantFlags   evaluatePerProcessVariantFlags(const ProcessConfig& config);
+    static FunctionVariantFlags   evaluateSystemWideFunctionVariantFlags(const ProcessConfig& config);
+    static FunctionVariantFlags   evaluateProcessorSpecificFunctionVariantFlags(const ProcessConfig& config);
 
 
     // all instance variables are organized into groups

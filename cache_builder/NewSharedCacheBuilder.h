@@ -43,6 +43,7 @@
 #include "SubCache.h"
 #include "Timer.h"
 #include "Types.h"
+#include "PropertyList.h"
 
 #include <list>
 #include <memory>
@@ -87,6 +88,7 @@ public:
     SharedCacheBuilder(BuilderOptions& options, const dyld3::closure::FileSystem& fileSystem);
 
     void            forEachWarning(void (^callback)(const std::string_view& str)) const;
+    void            forEachError(void (^callback)(const std::string_view& str)) const;
     void            forEachCacheDylib(void (^callback)(const std::string_view& path)) const;
     void            forEachCacheSymlink(void (^callback)(const std::string_view& path)) const;
     void            addFile(const void* buffer, size_t bufferSize, std::string_view path,
@@ -97,8 +99,9 @@ public:
 
     // If we overflow, then build() should return an error, and this should be the list of evicted dylibs
     std::span<const std::string_view>   getEvictedDylibs() const;
-    void                                getResults(std::vector<CacheBuffer>& results) const;
+    void                                getResults(std::vector<CacheBuffer>& results, std::vector<std::byte>& atlas) const;
     std::string                         getMapFileBuffer() const;
+    std::string_view                    getSwiftPrespecializedDylibBuildError() const;
 
     // All caches have a logging prefix, UUID and JSON map which represents the development cache.
     // Universal caches may also have customer versions of these
@@ -130,6 +133,11 @@ private:
     void            verifySelfContained();
     void            calculateDylibAliases();
     void            sortDylibs();
+
+    bool            shouldBuildSwiftPrespecializedDylib();
+    bool            reserveSwiftPrespecializedInputFile();
+    error::Error    buildSwiftPrespecializedDylibJSON();
+    error::Error    createSwiftPrespecializedDylib();
     error::Error    calculateDylibDependents();
     void            categorizeDylibSegments();
     void            categorizeDylibLinkedit();
@@ -147,7 +155,9 @@ private:
     void            estimateSwiftHashTableSizes();
     void            calculateCacheDylibsTrie();
     void            estimatePatchTableSize();
+    void            estimateFunctionVariantsSize();
     void            estimateCacheLoadersSize();
+    void            estimatePrewarmingSize();
     void            setupStubOptimizer();
     void            addObjCOptimizationsToSubCache(SubCache& subCache);
     void            addGlobalOptimizationsToSubCache(SubCache& subCache);
@@ -160,6 +170,7 @@ private:
     error::Error    calculateSubCacheSymbolStrings();
     error::Error    calculateUniqueGOTs();
     void            sortSubCacheSegments();
+    void            addAlignmentChunks();
     void            calculateSlideInfoSize();
     void            calculateCodeSignatureSize();
     void            printSubCaches() const;
@@ -191,15 +202,20 @@ private:
     void            computeSlideInfo();
     void            emitCacheDylibsTrie();
     error::Error    emitPatchTable();
+    void            emitFunctionVariants();
     error::Error    emitCacheDylibsPrebuiltLoaders();
     error::Error    emitExecutablePrebuiltLoaders();
     void            emitSymbolTable();
     void            emitUnmappedLocalSymbols();
-    void            writeSubCacheHeader(SubCache& subCache);
+    error::Error    emitPrewarmingData();
     uint64_t        getMaxSlide() const;
     void            addObjcSegments();
+    error::Error    patchLinkedDylibs(CacheDylib& dylib);
     void            computeCacheHeaders();
     static bool     regionIsSharedCacheMapping(const Region& region);
+    void            addSubCacheFileInfo(uint64_t cacheVMAddress, PropertyList::Array &files, const SubCache &subCache);
+    void            addCacheAtlasInfo(PropertyList::Dictionary *customerCacheAtlas, const SubCache &subCache);
+    void            buildAtlas();
     void            codeSign();
 
     std::string     generateJSONMap(std::string_view disposition,
@@ -251,10 +267,15 @@ private:
     std::vector<InputFile*>                         nonCacheDylibInputFiles;
     std::vector<std::string_view>                   evictedDylibs;
     std::vector<SubCache>                           subCaches;
+    std::vector<std::byte>                          atlasData;
     CacheVMSize                                     totalVMSize;
     std::unordered_map<std::string, CacheDylib*>    dylibAliases;
     bool                                            dylibHasMissingDependency = false;
     std::vector<std::string>                        warnings;
+    std::vector<std::string>                        errors;
+    std::string                                     swiftPrespecializedDylibJSON;
+    CacheDylib*                                     swiftPrespecializedDylib = nullptr;
+    std::string                                     swiftPrespecializedDylibBuildError;
 
     // Some optimizers are run just once per cache, so live at the top level here
     ObjCOptimizer                        objcOptimizer;
@@ -263,12 +284,14 @@ private:
     ObjCClassOptimizer                   objcClassOptimizer;
     ObjCProtocolOptimizer                objcProtocolOptimizer;
     ObjCCategoryOptimizer                objcCategoryOptimizer;
-    SwiftProtocolConformanceOptimizer    swiftProtocolConformanceOptimizer;
+    SwiftOptimizer                       swiftOptimizer;
     DylibTrieOptimizer                   dylibTrieOptimizer;
     PatchTableOptimizer                  patchTableOptimizer;
     PrebuiltLoaderBuilder                prebuiltLoaderBuilder;
     UnmappedSymbolsOptimizer             unmappedSymbolsOptimizer;
     StubOptimizer                        stubOptimizer;
+    FunctionVariantsOptimizer            functionVariantsOptimizer;
+    PrewarmingOptimizer                  prewarmingOptimizer;
 };
 
 } // namespace cache_builder

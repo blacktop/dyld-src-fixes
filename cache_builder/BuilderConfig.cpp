@@ -25,6 +25,7 @@
 #include "BuilderConfig.h"
 #include "BuilderOptions.h"
 #include "CodeSigningTypes.h"
+#include "Platform.h"
 
 #include "dyld_cache_config.h"
 
@@ -32,6 +33,8 @@
 
 using namespace cache_builder;
 using dyld3::GradedArchs;
+
+using mach_o::Platform;
 
 //
 // MARK: --- cache_builder::Logger methods ---
@@ -75,9 +78,15 @@ static bool hasAuthRegion(std::string_view archName)
     return archName == "arm64e";
 }
 
+static uint32_t supportsTPROMapping(std::string_view archName)
+{
+    return (archName != "x86_64") && (archName != "x86_64h");
+}
+
 cache_builder::Layout::Layout(const BuilderOptions& options)
     : is64(options.archs.supports64())
     , hasAuthRegion(::hasAuthRegion(options.archs.name()))
+    , tproIsInData(!::supportsTPROMapping(options.archs.name()))
     , pageSize(defaultPageSize(options.archs.name()))
 {
     std::string_view archName = options.archs.name();
@@ -87,17 +96,19 @@ cache_builder::Layout::Layout(const BuilderOptions& options)
         this->discontiguous.emplace();
 
         this->discontiguous->regionAlignment = 1_GB;
+        this->discontiguous->subCacheTextLimit = CacheVMSize(512_MB);
     } else {
         // Everyone else uses contiguous mappings
         this->contiguous.emplace();
         this->contiguous->regionPadding = CacheVMSize(32_MB);
-        this->contiguous->subCacheStubsLimit = CacheVMSize(110_MB);
-    }
 
-    if ( (archName == "x86_64") || (archName == "x86_64h") ) {
-        this->subCacheTextLimit = CacheVMSize(512_MB);
-    } else {
-        this->subCacheTextLimit = CacheVMSize(1.5_GB);
+        // Note minus a little to account for rdar://146432183
+        this->contiguous->subCacheTextDataLimit = CacheVMSize(2_GB - 16_MB);
+        this->contiguous->subCacheStubsLimit = CacheVMSize(110_MB);
+
+        // Note we have 2 padding regions in total in a given TEXT/DATA/AUTH/... region
+        // 1 between TEXT/DATA_CONST and DATA, then another from DATA to LINKEDIT.
+        this->contiguous->subCachePadding = this->contiguous->regionPadding + this->contiguous->regionPadding;
     }
 
     struct CacheLayout
@@ -116,11 +127,8 @@ cache_builder::Layout::Layout(const BuilderOptions& options)
         if ( options.isSimulator() ) {
             // Limit to 4GB to support back deployment to older hosts with 4GB shared regions
             layout.cacheSize = 4_GB;
-        } else if ( options.platform == dyld3::Platform::macOS ) {
-            layout.cacheSize = ARM64_SHARED_REGION_SIZE;
         } else {
-            // Temporarily limit embedded/driverKit to 4GB
-            layout.cacheSize = 4_GB;
+            layout.cacheSize = ARM64_SHARED_REGION_SIZE;
         }
 
         // Limit the max slide for arm64 based caches to 512MB.  Combined with large
@@ -129,14 +137,18 @@ cache_builder::Layout::Layout(const BuilderOptions& options)
         cacheMaxSlide = 512_MB;
     } else if ( archName == "arm64_32" ) {
         layout.baseAddress = ARM64_32_SHARED_REGION_START;
-        layout.cacheSize = ARM64_32_SHARED_REGION_SIZE;
+        layout.cacheSize = 2_GB;
+
+        // The cache contents can't exceed 2GB, but use the space above it for the slide
+        if ( ARM64_32_SHARED_REGION_SIZE >= layout.cacheSize ) {
+            this->cacheFixedSlide = ARM64_32_SHARED_REGION_SIZE - layout.cacheSize;
+        }
     } else {
         assert("Unknown arch");
     }
 
     this->cacheBaseAddress          = CacheVMAddress(layout.baseAddress);
     this->cacheSize                 = CacheVMSize(layout.cacheSize);
-    this->allLinkeditInLastSubCache = this->cacheSize <= CacheVMSize(4_GB);
 }
 
 //
@@ -196,14 +208,14 @@ SlideInfo::SlideInfo(const BuilderOptions& options, const Layout& layout)
 // MARK: --- cache_builder::CodeSign methods ---
 //
 
-static cache_builder::CodeSign::Mode platformCodeSigningDigestMode(dyld3::Platform platform)
+static cache_builder::CodeSign::Mode platformCodeSigningDigestMode(Platform platform)
 {
-    if ( platform == dyld3::Platform::watchOS )
+    if ( platform == Platform::watchOS )
         return cache_builder::CodeSign::Mode::agile;
     return cache_builder::CodeSign::Mode::onlySHA256;
 }
 
-static uint32_t codeSigningPageSize(dyld3::Platform platform, const GradedArchs& arch)
+static uint32_t codeSigningPageSize(Platform platform, const GradedArchs& arch)
 {
     std::string_view archName = arch.name();
     if ( (archName == "arm64e") || (archName == "arm64_32") )
@@ -211,7 +223,7 @@ static uint32_t codeSigningPageSize(dyld3::Platform platform, const GradedArchs&
 
     // arm64 on iOS is new enough for 16k pages, as is arm64 on macOS (ie the simulator)
     if ( archName == "arm64") {
-        if ( dyld3::MachOFile::isSimulatorPlatform(platform) || (platform == dyld3::Platform::iOS) )
+        if ( platform.isSimulator() || (platform == Platform::iOS) )
             return CS_PAGE_SIZE_16K;
         return CS_PAGE_SIZE_4K;
     }

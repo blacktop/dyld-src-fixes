@@ -30,9 +30,11 @@
 #include "OptimizerObjC.h"
 #include "PrebuiltSwift.h"
 #include "SwiftVisitor.h"
+#include "Header.h"
 
 #if SUPPORT_PREBUILTLOADERS || BUILDING_UNIT_TESTS || BUILDING_CACHE_BUILDER_UNIT_TESTS
 
+using mach_o::Header;
 using metadata_visitor::ResolvedValue;
 using metadata_visitor::SwiftPointer;
 using metadata_visitor::SwiftVisitor;
@@ -45,7 +47,7 @@ static bool getBindTarget(RuntimeState& state, const uint64_t vmAddr, PrebuiltLo
     bool found = false;
     for (const Loader* ldr : state.loaded) {
         const mach_o::MachOFileRef mf = ldr->mf(state);
-        uint64_t baseAddress = mf->preferredLoadAddress();
+        uint64_t baseAddress = ((const Header*)mf)->preferredLoadAddress();
         uint64_t mappedSize = mf->mappedSize();
 
         if ( vmAddr < baseAddress )
@@ -87,6 +89,19 @@ static bool getBindTarget(RuntimeState& state, const void* runtimeAddress, Prebu
 // dyld at runtime can just chase pointers, but in offline tools, we need to build
 // a map of where all the fixups will point, to let us chase pointers
 #if BUILDING_CACHE_BUILDER || BUILDING_CLOSURE_UTIL || BUILDING_CACHE_BUILDER_UNIT_TESTS
+
+struct HashUInt64 {
+    static size_t hash(const uint64_t& v, void* state) {
+        return std::hash<uint64_t>{}(v);
+    }
+};
+
+struct EqualUInt64 {
+    static bool equal(uint64_t s1, uint64_t s2, void* state) {
+        return s1 == s2;
+    }
+};
+
 typedef std::pair<Loader::ResolvedSymbol, uint64_t> TargetAndAddend;
 typedef dyld3::Map<uint64_t, TargetAndAddend, HashUInt64, EqualUInt64> VMAddrToFixupTargetMap;
 
@@ -113,7 +128,7 @@ static void getFixupTargets(RuntimeState& state, Diagnostics& diag, const JustIn
     ldr->withLayout(diag, state, ^(const mach_o::Layout &layout) {
         mach_o::Fixups fixups(layout);
 
-        uint64_t loadAddress = mf->preferredLoadAddress();
+        uint64_t loadAddress = ((const Header*)mf)->preferredLoadAddress();
         if ( mf->hasChainedFixups() ) {
             // walk all chains
             auto handler = ^(dyld3::MachOFile::ChainedFixupPointerOnDisk *fixupLocation,
@@ -271,7 +286,7 @@ static SwiftVisitor makeSwiftVisitor(Diagnostics& diag, RuntimeState& state,
     return swiftVisitor;
 #else
     const dyld3::MachOFile* mf = ldr->mf(state);
-    VMAddress dylibBaseAddress(mf->preferredLoadAddress());
+    VMAddress dylibBaseAddress(((const Header*)mf)->preferredLoadAddress());
 
     __block std::vector<metadata_visitor::Segment> segments;
     __block std::vector<uint64_t> bindTargets;
@@ -380,7 +395,7 @@ bool PrebuiltSwift::findProtocolConformances(Diagnostics& diag, PrebuiltObjC& pr
             continue;
 
         const mach_o::MachOFileRef mf = ldr->mf(state);
-        const uint64_t loadAddress = mf->preferredLoadAddress();
+        const uint64_t loadAddress = ((const Header*)mf)->preferredLoadAddress();
 
 #if BUILDING_CACHE_BUILDER || BUILDING_CLOSURE_UTIL || BUILDING_CACHE_BUILDER_UNIT_TESTS
         const JustInTimeLoader* jitLoader = (const JustInTimeLoader*)ldr;
@@ -401,10 +416,10 @@ bool PrebuiltSwift::findProtocolConformances(Diagnostics& diag, PrebuiltObjC& pr
 #if BUILDING_CACHE_BUILDER || BUILDING_CLOSURE_UTIL || BUILDING_CACHE_BUILDER_UNIT_TESTS
             auto it = vmAddrToFixupTargetMap.find(ptr.targetValue.vmAddress().rawValue());
             if ( it != vmAddrToFixupTargetMap.end() ) {
-                PrebuiltLoader::BindTargetRef bindTarget(diag, it->second.first);
+                PrebuiltLoader::BindTargetRef bindTarget(diag, state, it->second.first);
                 if ( diag.hasError() )
                     return false;
-                if ( bindTarget.isAbsolute() && (bindTarget.offset() == 0) )
+                if ( bindTarget.isAbsolute() && (bindTarget.absValue() == 0) )
                     return true;
             }
 #else
@@ -548,7 +563,7 @@ bool PrebuiltSwift::findProtocolConformances(Diagnostics& diag, PrebuiltObjC& pr
                     } else {
                         // A different loader, so make a visitor for it.
                         SwiftVisitor otherVisitor = makeSwiftVisitor(diag, state, typeBindTarget->loader);
-                        VMAddress otherLoadAddress(typeBindTarget->loader->mf(state)->preferredLoadAddress());
+                        VMAddress otherLoadAddress(((const Header*)typeBindTarget->loader->mf(state))->preferredLoadAddress());
                         VMAddress typeDescVMAddr = otherLoadAddress + VMOffset(typeBindTarget->runtimeOffset);
                         ResolvedValue typeDescValue = otherVisitor.getValueFor(typeDescVMAddr);
                         TypeContextDescriptor typeDesc(typeDescValue);
@@ -576,7 +591,7 @@ bool PrebuiltSwift::findProtocolConformances(Diagnostics& diag, PrebuiltObjC& pr
 
                         PrebuiltLoader::BindTarget foreignBindTarget;
                         foreignBindTarget.loader = ldr;
-                        foreignBindTarget.runtimeOffset = nameVMAddr.rawValue() - ldr->mf(state)->preferredLoadAddress();
+                        foreignBindTarget.runtimeOffset = nameVMAddr.rawValue() - ((const Header*)ldr->mf(state))->preferredLoadAddress();
 
                         SwiftForeignTypeProtocolConformanceDiskLocationKey protoLocKey = {
                             (uint64_t)fullName.data(),
@@ -590,7 +605,8 @@ bool PrebuiltSwift::findProtocolConformances(Diagnostics& diag, PrebuiltObjC& pr
                             PrebuiltLoader::BindTargetRef(conformanceBindTarget)
                         };
 
-                        foreignProtocolConformances.insert({ protoLocKey, protoLoc });
+                        bool unusedAlreadyHaveNodeWithKey;
+                        foreignProtocolConformances.insert({ protoLocKey, protoLoc }, unusedAlreadyHaveNodeWithKey);
                     }
 
                     SwiftTypeProtocolConformanceDiskLocationKey protoLocKey = {
@@ -603,7 +619,8 @@ bool PrebuiltSwift::findProtocolConformances(Diagnostics& diag, PrebuiltObjC& pr
                         PrebuiltLoader::BindTargetRef(conformanceBindTarget)
                     };
 
-                    typeProtocolConformances.insert({ protoLocKey, protoLoc });
+                    bool unusedAlreadyHaveNodeWithKey;
+                    typeProtocolConformances.insert({ protoLocKey, protoLoc }, unusedAlreadyHaveNodeWithKey);
                     break;
                 }
                 case SwiftConformance::SwiftProtocolConformanceFlags::TypeReferenceKind::directObjCClassName: {
@@ -615,15 +632,17 @@ bool PrebuiltSwift::findProtocolConformances(Diagnostics& diag, PrebuiltObjC& pr
                     };
 
                     __block bool foundClass = false;
-                    prebuiltObjC.classMap.forEachEntry(className, ^(const Loader::BindTarget* values[], uint32_t valuesCount) {
-                        for (uint32_t i = 0; i < valuesCount; i++) {
+                    prebuilt_objc::ObjCStringKey classMapKey = { className };
+                    prebuiltObjC.classMap.forEachEntry(classMapKey, ^(const Array<const prebuilt_objc::ObjCObjectLocation*>& values) {
+                        for ( const prebuilt_objc::ObjCObjectLocation* nameAndImpl : values) {
                             foundClass = true;
-                            const Loader::BindTarget& metadataBindTarget = *values[i];
+                            const Loader::BindTarget& metadataBindTarget = nameAndImpl->objectLocation;
                             SwiftMetadataProtocolConformanceDiskLocationKey protoLocKey = {
                                 PrebuiltLoader::BindTargetRef(metadataBindTarget),
                                 PrebuiltLoader::BindTargetRef(protocolBindTarget.value())
                             };
-                            metadataProtocolConformances.insert({ protoLocKey, protoLoc });
+                            bool unusedAlreadyHaveNodeWithKey;
+                            metadataProtocolConformances.insert({ protoLocKey, protoLoc }, unusedAlreadyHaveNodeWithKey);
                         }
                     });
 
@@ -639,7 +658,8 @@ bool PrebuiltSwift::findProtocolConformances(Diagnostics& diag, PrebuiltObjC& pr
                             PrebuiltLoader::BindTargetRef(protocolBindTarget.value())
                         };
 
-                        metadataProtocolConformances.insert({ protoLocKey, protoLoc });
+                        bool unusedAlreadyHaveNodeWithKey;
+                        metadataProtocolConformances.insert({ protoLocKey, protoLoc }, unusedAlreadyHaveNodeWithKey);
                     });
 
                     if ( !foundClass ) {
@@ -660,7 +680,8 @@ bool PrebuiltSwift::findProtocolConformances(Diagnostics& diag, PrebuiltObjC& pr
                         PrebuiltLoader::BindTargetRef(conformanceBindTarget)
                     };
 
-                    metadataProtocolConformances.insert({ protoLocKey, protoLoc });
+                    bool unusedAlreadyHaveNodeWithKey;
+                    metadataProtocolConformances.insert({ protoLocKey, protoLoc }, unusedAlreadyHaveNodeWithKey);
                     break;
                 }
             }

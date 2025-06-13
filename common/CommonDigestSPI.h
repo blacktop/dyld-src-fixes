@@ -28,9 +28,9 @@
 #include <sys/types.h>
 
 #if defined(_MSC_VER)
-#include <availability.h>
+    #include <availability.h>
 #else
-#include <os/availability.h>
+    #include <os/availability.h>
 #endif
 
 #include <CommonCrypto/CommonDigest.h>
@@ -55,17 +55,18 @@ extern "C" {
     @constant     kCCDigestSHA512        SHA-2 512 bit digest
  */
 
-enum {
-    kCCDigestNone = 0,
+enum
+{
+    kCCDigestNone                                                                                     = 0,
     kCCDigestMD2    API_DEPRECATED(CC_DIGEST_DEPRECATION_WARNING, macos(10.4, 10.13), ios(5.0, 11.0)) = 1,
     kCCDigestMD4    API_DEPRECATED(CC_DIGEST_DEPRECATION_WARNING, macos(10.4, 10.13), ios(5.0, 11.0)) = 2,
     kCCDigestMD5    API_DEPRECATED(CC_DIGEST_DEPRECATION_WARNING, macos(10.4, 10.15), ios(5.0, 13.0)) = 3,
     kCCDigestRMD160 API_DEPRECATED(CC_DIGEST_DEPRECATION_WARNING, macos(10.4, 10.15), ios(5.0, 13.0)) = 5,
     kCCDigestSHA1   API_DEPRECATED(CC_DIGEST_DEPRECATION_WARNING, macos(10.4, 10.15), ios(5.0, 13.0)) = 8,
-    kCCDigestSHA224 = 9,
-    kCCDigestSHA256 = 10,
-    kCCDigestSHA384 = 11,
-    kCCDigestSHA512 = 12,
+    kCCDigestSHA224                                                                                   = 9,
+    kCCDigestSHA256                                                                                   = 10,
+    kCCDigestSHA384                                                                                   = 11,
+    kCCDigestSHA512                                                                                   = 12,
 
     kCCDigestMax
 };
@@ -81,7 +82,8 @@ typedef uint32_t CCDigestAlgorithm;
  */
 
 #define CC_DIGEST_SIZE 1032
-typedef struct CCDigestCtx_t {
+typedef struct CCDigestCtx_t
+{
     uint8_t context[CC_DIGEST_SIZE];
 } CCDigestCtx, *CCDigestRef;
 
@@ -130,7 +132,7 @@ int CCDigestInit(CCDigestAlgorithm algorithm, CCDigestRef ctx)
  */
 
 int CCDigest(CCDigestAlgorithm algorithm,
-    const uint8_t* data, size_t length, uint8_t* output)
+             const uint8_t* data, size_t length, uint8_t* output)
     API_AVAILABLE(macos(10.7), ios(5.0));
 
 /*!

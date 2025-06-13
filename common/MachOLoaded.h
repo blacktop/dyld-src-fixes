@@ -43,7 +43,7 @@ struct VIS_HIDDEN MachOLoaded : public MachOFile
                                           bool* resultPointsToInstructions) const;
 
     // for DYLD_PRINT_SEGMENTS
-    const char*         segmentName(uint32_t segIndex) const;
+    std::string_view    segmentName(uint32_t segIndex) const;
 
     // used to see if main executable overlaps shared region
     bool                intersectsRange(uintptr_t start, uintptr_t length) const;
@@ -55,11 +55,7 @@ struct VIS_HIDDEN MachOLoaded : public MachOFile
     bool                findClosestSymbol(uint64_t unSlidAddr, const char** symbolName, uint64_t* symbolUnslidAddr) const;
 
     // for _dyld_find_unwind_sections()
-    const void*         findSectionContent(const char* segName, const char* sectName, uint64_t& size,
-                                           bool matchSegNameAsPrefix = false) const;
-
-    // used by cache builder during error handling in chain bind processing
-    const char*             dependentDylibLoadPath(uint32_t depIndex) const;
+    const void*         findSectionContent(const char* segName, const char* sectName, uint64_t& size) const;
 
     // used by dyld/libdyld to apply fixups
 //#if BUILDING_DYLD || BUILDING_LIBDYLD

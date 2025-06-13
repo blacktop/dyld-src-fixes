@@ -169,6 +169,7 @@ struct Visitor
 #if BUILDING_CACHE_BUILDER || BUILDING_CACHE_BUILDER_UNIT_TESTS || POINTERS_ARE_UNSLID
     VMAddress                   getOnDiskDylibChainedPointerBaseAddress() const;
     const dyld3::MachOFile*     mf() const;
+    const mach_o::Header*       hdr() const;
     bool                        isOnDiskBinary() const;
 #endif
 
@@ -213,6 +214,7 @@ protected:
         v2_x86_64_tbi   = 2,
         v3              = 3,
         v4              = 4,
+        v5              = 5,
     };
     SharedCacheFormat sharedCacheChainedPointerFormat   = SharedCacheFormat::none;
 #endif

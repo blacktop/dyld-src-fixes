@@ -80,6 +80,10 @@ struct VIS_HIDDEN MachOFileRef
     {
         return (dyld3::MachOFile*)this->mf;
     }
+    
+    explicit operator const mach_o::Header*() const {
+        return (const mach_o::Header*)this->mf;
+    }
 
     const uint8_t* getOffsetInToFile(uint64_t offset) const
     {
@@ -201,7 +205,10 @@ struct VIS_HIDDEN LinkeditLayout
     // LC_DYLD_EXPORTS_TRIE or LC_DYLD_INFO::export_offs
     Linkedit                exportsTrie;
 
-    // LC_SEGMENT_SPLIT_INFO
+    // LC_FUNCTION_VARIANTS
+    Linkedit                functionVariants;
+
+   // LC_SEGMENT_SPLIT_INFO
     Linkedit                splitSegInfo;
 
     // LC_FUNCTION_STARTS
@@ -227,6 +234,7 @@ struct VIS_HIDDEN Layout
 
     // FIXME: Should we have a SectionContent or similar class?
     bool isSwiftLibrary() const;
+    std::optional<uint32_t> getObjcInfoFlags() const;
     bool hasSection(std::string_view segmentName, std::string_view sectionName) const;
 
     // This used to live in MachOAnalyzer, but we can validate everything based on the above struct
@@ -258,13 +266,16 @@ struct VIS_HIDDEN Layout
 union VIS_HIDDEN ChainedFixupPointerOnDisk
 {
     union Arm64e {
-        dyld_chained_ptr_arm64e_auth_rebase authRebase;
-        dyld_chained_ptr_arm64e_auth_bind   authBind;
-        dyld_chained_ptr_arm64e_rebase      rebase;
-        dyld_chained_ptr_arm64e_bind        bind;
-        dyld_chained_ptr_arm64e_bind24      bind24;
-        dyld_chained_ptr_arm64e_auth_bind24 authBind24;
-
+        dyld_chained_ptr_arm64e_auth_rebase             authRebase;
+        dyld_chained_ptr_arm64e_auth_bind               authBind;
+        dyld_chained_ptr_arm64e_rebase                  rebase;
+        dyld_chained_ptr_arm64e_bind                    bind;
+        dyld_chained_ptr_arm64e_bind24                  bind24;
+        dyld_chained_ptr_arm64e_auth_bind24             authBind24;
+#if  (__MACH_O_FIXUP_CHAINS__ >= 7)
+        dyld_chained_ptr_arm64e_segmented_rebase        segRebase;
+        dyld_chained_ptr_arm64e_auth_segmented_rebase   authSegRebase;
+#endif
         uint64_t            signExtendedAddend() const;
         uint64_t            unpackTarget() const;
         const char*         keyName() const;
@@ -436,6 +447,7 @@ struct VIS_HIDDEN SplitSeg
 {
     SplitSeg(const Layout& layout);
 
+    bool hasMarker() const;
     bool isV1() const;
     bool isV2() const;
     bool hasValue() const;

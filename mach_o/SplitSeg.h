@@ -28,12 +28,7 @@
 #include <span>
 #include <stdint.h>
 
-#if BUILDING_MACHO_WRITER
-  #include <vector>
-  #include <unordered_map>
-#endif
-
-#include "Defines.h"
+#include "MachODefines.h"
 #include "Error.h"
 
 #define DYLD_CACHE_ADJ_V2_FORMAT 0x7F
@@ -66,34 +61,21 @@ public:
                         // construct from a chunk of LINKEDIT
                         SplitSegInfo(const uint8_t* start, size_t size);
 
-    struct Entry { uint8_t kind; uint64_t fromSectionIndex; uint64_t fromSectionOffset; uint64_t toSectionIndex; uint64_t toSectionOffset; };
+    struct Entry   { uint8_t kind; uint8_t fromSectionIndex; uint8_t toSectionIndex; uint64_t fromSectionOffset; uint64_t toSectionOffset; };
 
     Error   valid() const;
+    bool    hasMarker() const;
     bool    isV1() const;
     bool    isV2() const;
 
     Error   forEachReferenceV2(void (^callback)(const Entry& entry, bool& stop)) const;
 
-#if BUILDING_MACHO_WRITER
-                        // used build split seg info
-                        // Note: entries so not need to be sorted
-                        SplitSegInfo(std::span<const Entry> entries);
-    static size_t       estimateSplitSegInfoSize(std::span<const Entry> entries);
-
-    std::span<const uint8_t>  bytes() const { return _bytes; }
-#endif
-
     static uint32_t     splitSegInfoSize(bool is64);
 
-private:
+protected:
 
     const uint8_t*       _infoStart;
     const uint8_t*       _infoEnd;
-#if BUILDING_MACHO_WRITER
-    std::vector<uint8_t> _bytes;
-    Error                _buildError;
-    static const bool    _verbose = false;
-#endif
 };
 
 

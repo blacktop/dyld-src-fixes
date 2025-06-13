@@ -63,6 +63,8 @@
 #include <iterator>
 
 #include <mach-o/loader.h>
+
+#include "Array.h"
 #include "Defines.h"
 
 #if __cplusplus <= 201103L
@@ -74,6 +76,11 @@ namespace std {
 	}
 }
 #endif
+
+#ifndef EXPORT_SYMBOL_FLAGS_FUNCTION_VARIANT
+  #define EXPORT_SYMBOL_FLAGS_FUNCTION_VARIANT  0x20
+#endif
+
 
 namespace TrieUtils {
 
@@ -176,7 +183,7 @@ struct VIS_HIDDEN Trie {
 		// empty trie has no entries
 		if ( start == end )
 			return false;
-		char cummulativeString[32768];
+        STACK_ALLOC_OVERFLOW_SAFE_ARRAY(char, cummulativeString, 4096);
 		std::vector<EntryWithOffset> entries;
 		if ( !processExportNode(start, start, end, cummulativeString, 0, entries) )
 			return false;
@@ -337,7 +344,7 @@ private:
 #endif
 
 	static inline bool processExportNode(const uint8_t* const start, const uint8_t* p, const uint8_t* const end,
-										 char* cummulativeString, int curStrOffset,
+                                         dyld3::OverflowSafeArray<char>& cummulativeString, int curStrOffset,
 										 std::vector<EntryWithOffset>& output)
 	{
 		if ( p >= end )
@@ -351,7 +358,7 @@ private:
 		if ( terminalSize != 0 ) {
 			EntryWithOffset e;
 			e.nodeOffset = p-start;
-			e.entry.name = cummulativeString;
+            e.entry.name = cummulativeString.begin();
 			e.entry.info.loadData(p,end);
 			output.push_back(e);
 		}
@@ -401,6 +408,8 @@ struct ExportInfo {
 			size = TrieUtils::uleb128_size(flags) + TrieUtils::uleb128_size(address);
 			if ( flags & EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER )
 				size += TrieUtils::uleb128_size(other);
+            if ( flags & EXPORT_SYMBOL_FLAGS_FUNCTION_VARIANT )
+                size += TrieUtils::uleb128_size(other);
 		}
 		return size;
 	}
@@ -432,6 +441,14 @@ struct ExportInfo {
 			TrieUtils::append_uleb128(address, out);
 			TrieUtils::append_uleb128(other, out);
 		}
+        else if ( flags & EXPORT_SYMBOL_FLAGS_FUNCTION_VARIANT ) {
+            // nodes with export info: size, flags, address, other
+            uint32_t nodeSize = TrieUtils::uleb128_size(flags) + TrieUtils::uleb128_size(address) + TrieUtils::uleb128_size(other);
+            out.push_back(nodeSize);
+            TrieUtils::append_uleb128(flags, out);
+            TrieUtils::append_uleb128(address, out);
+            TrieUtils::append_uleb128(other, out);
+        }
 		else {
 			// nodes with export info: size, flags, address
 			uint32_t nodeSize = TrieUtils::uleb128_size(flags) + TrieUtils::uleb128_size(address);
@@ -451,6 +468,8 @@ struct ExportInfo {
 			TrieUtils::parse_uleb128(p, end, address);
 			if ( flags & EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER )
 				TrieUtils::parse_uleb128(p, end, other);
+            else if ( flags & EXPORT_SYMBOL_FLAGS_FUNCTION_VARIANT )
+                TrieUtils::parse_uleb128(p, end, other);
 		}
 	}
 

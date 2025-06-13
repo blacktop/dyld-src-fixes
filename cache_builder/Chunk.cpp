@@ -68,6 +68,9 @@ namespace cache_builder
             // FIXME: Not sure why this is 16.  Seems like 8 would be sufficient.
             nlist       = 16,
 
+            // This chunk points to data which contains a uint128_t or similar, so needs 128-bit alignment
+            struct128   = 16,
+
             // Inside the cache there is minimal overhead for 16K alignment even on 4K hardware
             page        = 16*1024,
         };
@@ -112,6 +115,11 @@ SlidChunk* Chunk::isSlidChunk()
     return nullptr;
 }
 
+const AlignChunk* Chunk::isAlignChunk() const
+{
+    return nullptr;
+}
+
 const DylibSegmentChunk* Chunk::isDylibSegmentChunk() const
 {
     return nullptr;
@@ -128,6 +136,11 @@ StubsChunk* Chunk::isStubsChunk()
 }
 
 UniquedGOTsChunk* Chunk::isUniquedGOTsChunk()
+{
+    return nullptr;
+}
+
+const DylibSegmentChunk* Chunk::isTPROChunk() const
 {
     return nullptr;
 }
@@ -455,6 +468,30 @@ const char* SwiftProtocolConformancesHashTableChunk::name() const
 }
 
 //
+// MARK: --- PointerHashTableChunk methods ---
+//
+
+PointerHashTableChunk::PointerHashTableChunk()
+    : Chunk(Kind::pointerHashTable, Alignment::struct64)
+{
+}
+
+PointerHashTableChunk::~PointerHashTableChunk()
+{
+
+}
+
+void PointerHashTableChunk::dump() const
+{
+    printf("PointerHashTableChunk\n");
+}
+
+const char* PointerHashTableChunk::name() const
+{
+    return "pointer hash table";
+}
+
+//
 // MARK: --- ObjCProtocolHashTableChunk methods ---
 //
 
@@ -598,12 +635,37 @@ const char* PatchTableChunk::name() const
     return "cache patch table";
 }
 
+
+//
+// MARK: --- FunctionVariantsPatchTableChunk methods ---
+//
+
+FunctionVariantsPatchTableChunk::FunctionVariantsPatchTableChunk()
+: Chunk(Kind::cacheFunctionVariantsPatchTable, Alignment::struct64)
+{
+}
+
+FunctionVariantsPatchTableChunk::~FunctionVariantsPatchTableChunk()
+{
+}
+
+void FunctionVariantsPatchTableChunk::dump() const
+{
+    printf("FunctionVariantsPatchTableChunk\n");
+}
+
+const char* FunctionVariantsPatchTableChunk::name() const
+{
+    return "function variants table";
+}
+
+
 //
 // MARK: --- PrebuiltLoaderChunk methods ---
 //
 
 PrebuiltLoaderChunk::PrebuiltLoaderChunk(Kind kind)
-    : Chunk(kind, Alignment::struct64)
+    : Chunk(kind, Alignment::struct128)
 {
 }
 
@@ -675,6 +737,13 @@ const DylibSegmentChunk* DylibSegmentChunk::isDylibSegmentChunk() const
     return this;
 }
 
+const DylibSegmentChunk* DylibSegmentChunk::isTPROChunk() const
+{
+    if ( this->kind == Kind::tproDataConst )
+        return this;
+    return nullptr;
+}
+
 //
 // MARK: --- LinkeditDataChunk methods ---
 //
@@ -711,7 +780,10 @@ const char* LinkeditDataChunk::name() const
             chunkName = "linkedit function starts";
             break;
         case Chunk::Kind::linkeditDataInCode:
-            chunkName = "linkedit Mr Data (in code)";
+            chunkName = "linkedit data-in-code";
+            break;
+        case Chunk::Kind::linkeditFunctionVariants  :
+            chunkName = "linkedit function-variants-table";
             break;
         case Chunk::Kind::linkeditExportTrie:
             chunkName = "linkedit export trie";
@@ -742,6 +814,12 @@ bool LinkeditDataChunk::isNSymbolStrings() const
 {
     return this->kind == Chunk::Kind::linkeditSymbolStrings;
 }
+
+bool LinkeditDataChunk::isFunctionVariantsTable() const
+{
+    return this->kind == Chunk::Kind::linkeditFunctionVariants;
+}
+
 
 //
 // MARK: --- NListChunk methods ---
@@ -878,4 +956,59 @@ const char* DynamicConfigChunk::name() const
 bool DynamicConfigChunk::isZeroFill() const
 {
     return true;
+}
+
+//
+// MARK: --- AlignChunk methods ---
+//
+
+AlignChunk::AlignChunk()
+    : Chunk(Kind::align, Alignment::page)
+{
+    // This never has a size so just set it now
+    this->cacheVMSize = CacheVMSize(0ULL);
+    this->subCacheFileSize = CacheFileSize(0ULL);
+}
+
+AlignChunk::~AlignChunk()
+{
+
+}
+
+void AlignChunk::dump() const
+{
+    printf("AlignChunk\n");
+}
+
+const char* AlignChunk::name() const
+{
+    return "align";
+}
+
+const AlignChunk* AlignChunk::isAlignChunk() const {
+    return this;
+}
+
+//
+// MARK: --- PrewarmingChunk methods ---
+//
+
+PrewarmingChunk::PrewarmingChunk(Kind kind)
+    : Chunk(kind, Alignment::uleb)
+{
+}
+
+PrewarmingChunk::~PrewarmingChunk()
+{
+
+}
+
+void PrewarmingChunk::dump() const
+{
+    printf("PrewarmingChunk\n");
+}
+
+const char* PrewarmingChunk::name() const
+{
+    return "prewarming data";
 }

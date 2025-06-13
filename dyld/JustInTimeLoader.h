@@ -51,16 +51,17 @@ class JustInTimeLoader : public Loader
 {
 public:
     // these are the "virtual" methods that override Loader
-    const dyld3::MachOFile*     mf(RuntimeState& state) const;
+    const dyld3::MachOFile*     mf(const RuntimeState& state) const;
 #if SUPPORT_VM_LAYOUT
-    const MachOLoaded*          loadAddress(RuntimeState&) const;
+    const MachOLoaded*          loadAddress(const RuntimeState&) const;
 #endif
-    const char*                 path() const;
+    const char*                 path(const RuntimeState& state) const;
+    const char*                 installName(const RuntimeState& state) const;
     bool                        contains(RuntimeState& state, const void* addr, const void** segAddr, uint64_t* segSize, uint8_t* segPerms) const;
-    bool                        matchesPath(const char* path) const;
+    bool                        matchesPath(const RuntimeState& state, const char* path) const;
     FileID                      fileID(const RuntimeState& state) const;
     uint32_t                    dependentCount() const;
-    Loader*                     dependent(const RuntimeState& state, uint32_t depIndex, DependentDylibAttributes* depAttrs=nullptr) const;
+    Loader*                     dependent(const RuntimeState& state, uint32_t depIndex, LinkedDylibAttributes* depAttrs=nullptr) const;
     bool                        getExportsTrie(uint64_t& runtimeOffset, uint32_t& size) const;
     bool                        hiddenFromFlat(bool forceGlobal) const;
     bool                        representsCachedDylibIndex(uint16_t dylibIndex) const;
@@ -68,11 +69,12 @@ public:
 #if SUPPORT_IMAGE_UNLOADING
     void                        unmap(RuntimeState& state, bool force=false) const;
 #endif
-    void                        applyFixups(Diagnostics&, RuntimeState& state, DyldCacheDataConstLazyScopedWriter&, bool allowLazyBinds) const;
+    void                        applyFixups(Diagnostics&, RuntimeState& state, DyldCacheDataConstLazyScopedWriter&, bool allowLazyBinds,
+                                            lsl::Vector<PseudoDylibSymbolToMaterialize>* materializingSymbols) const;
     bool                        overridesDylibInCache(const DylibPatch*& patchTable, uint16_t& cacheDylibOverriddenIndex) const;
     bool                        dyldDoesObjCFixups() const;
     const SectionLocations*     getSectionLocations() const;
-    void                        withLayout(Diagnostics &diag, RuntimeState& state, void (^callback)(const mach_o::Layout &layout)) const;
+    void                        withLayout(Diagnostics &diag, const RuntimeState& state, void (^callback)(const mach_o::Layout &layout)) const;
     // these are private "virtual" methods
     bool                        hasBeenFixedUp(RuntimeState&) const;
     bool                        beginInitializers(RuntimeState&);
@@ -85,7 +87,6 @@ public:
     bool                isOverrideOfCachedDylib() const { return overridesCache; }
     const PseudoDylib*  pseudoDylib() const { return pd; }
 
-
     FileValidationInfo  getFileValidationInfo(RuntimeState& state) const;
     static void         withRegions(const MachOFile* mf, void (^callback)(const Array<Region>& regions));
 
@@ -93,7 +94,7 @@ public:
     static void         handleStrongWeakDefOverrides(RuntimeState& state, DyldCacheDataConstLazyScopedWriter& cacheDataConst);
 #endif
 
-    static void         parseSectionLocations(const dyld3::MachOFile* mf, SectionLocations& metadata);
+    static void         parseSectionLocations(const mach_o::Header* hdr, SectionLocations& metadata);
 
     // Wehn patching an iOSMac dylib, we may need an additional patch table for the macOS twin. This returns that patch table
     const DylibPatch*   getCatalystMacTwinPatches() const;
@@ -161,7 +162,7 @@ protected:
     FileID               fileIdent;
     const DylibPatch*    overridePatches                = nullptr;
     const DylibPatch*    overridePatchesCatalystMacTwin = nullptr;
-    const PseudoDylib*   pd                             = nullptr;
+    ConstAuthPseudoDylib pd                             = nullptr;
     uint32_t             exportsTrieRuntimeOffset       = 0;
     uint32_t             exportsTrieSize                = 0;
     SectionLocations     sectionLocations;
@@ -169,7 +170,7 @@ protected:
     // DependentsKind[]: If allDepsAreNormal is false, then we have an array here too, with 1 entry per dependent
 
 
-    DependentDylibAttributes&   dependentAttrs(uint32_t depIndex);
+    LinkedDylibAttributes&      dependentAttrs(uint32_t depIndex);
                                 JustInTimeLoader(const MachOFile* mh, const Loader::InitialOptions& options, const FileID& fileID, const mach_o::Layout* layout, bool isPremapped);
 };
 

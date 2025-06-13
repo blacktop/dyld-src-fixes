@@ -27,7 +27,7 @@
 
 #include "CString.h"
 
-#include "Defines.h"
+#include "MachODefines.h"
 
 namespace mach_o {
 
@@ -37,6 +37,7 @@ struct MappedSegment
 {
     uint64_t            runtimeOffset;
     uint64_t            runtimeSize;
+    uint64_t            fileOffset;
     void*               content;
     std::string_view    segName;
     bool                readable;
@@ -54,7 +55,7 @@ struct MappedSegment
  *
  *
  */
-struct Fixup
+struct VIS_HIDDEN Fixup
 {
     const void*             location;
     const MappedSegment*    segment;
@@ -80,7 +81,7 @@ struct Fixup
     bool            operator!=(const Fixup& other) const { return !this->operator==(other); }
     bool            operator<(const Fixup& other) const  { return (this->location < other.location); }
     const char*     keyName() const;
-    
+
     struct BindTarget
     {
         CString     symbolName;
@@ -127,6 +128,7 @@ struct Fixup
         auth.diversity          = div;
     }
 
+    static const char*     keyName(uint8_t keyNum);
 
 };
 

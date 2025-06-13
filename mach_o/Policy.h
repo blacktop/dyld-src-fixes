@@ -27,7 +27,7 @@
 
 #include <string_view>
 
-#include "Defines.h"
+#include "MachODefines.h"
 #include "Platform.h"
 #include "Architecture.h"
 
@@ -64,7 +64,7 @@ namespace mach_o {
 class VIS_HIDDEN Policy
 {
 public:
-                Policy(Architecture arch, PlatformAndVersions pvs, uint32_t filetype, bool pathMayBeInSharedCache=false);
+                Policy(Architecture arch, PlatformAndVersions pvs, uint32_t filetype, bool pathMayBeInSharedCache=false, bool kernel=false, bool staticExec=false);
 
     enum Usage { preferUse, mustUse, preferDontUse, mustNotUse };
 
@@ -73,15 +73,20 @@ public:
     Usage       useDataConst() const;
     Usage       useConstClassRefs() const;
     Usage       useGOTforClassRefs() const;
+    Usage       useConstInterpose() const;
     Usage       useChainedFixups() const;
     Usage       useOpcodeFixups() const;
     Usage       useRelativeMethodLists() const;
+    Usage       optimizeClassPatching() const;
+    Usage       optimizeSingletonPatching() const;
     Usage       useAuthStubsInKexts() const;
     Usage       useDataConstForSelRefs() const;
     Usage       useSourceVersionLoadCommand() const;
     Usage       useLegacyLinkedit() const;
     bool        use4KBLoadCommandsPadding() const;
     bool        canUseDelayInit() const;
+    uint16_t    chainedFixupsFormat() const;
+    bool        useProtectedStack() const;
 
     // restrictions
     bool        enforceReadOnlyLinkedit() const;
@@ -99,9 +104,13 @@ public:
     bool        enforceNoDuplicateDylibs() const;
     bool        enforceNoDuplicateRPaths() const;
     bool        enforceDataSegmentPermissions() const;
+    bool        enforceDataConstSegmentPermissions() const;
+    bool        enforceImageListRemoveMainExecutable() const;
+    bool        enforceSetSimulatorSharedCachePath() const;
 
 private:
     bool              dyldLoadsOutput() const;
+    bool              kernelOrKext() const;
 
     Platform::Epoch   _featureEpoch;
     Platform::Epoch   _enforcementEpoch;
@@ -109,6 +118,8 @@ private:
     PlatformAndVersions   _pvs;
     uint32_t          _filetype;
     bool              _pathMayBeInSharedCache;
+    bool              _kernel;
+    bool              _staticExec;
 };
 
 

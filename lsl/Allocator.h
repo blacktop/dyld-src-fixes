@@ -27,29 +27,194 @@
 
 #include <TargetConditionals.h>
 #include "Defines.h"
+#include "BitUtils.h"
+#include "AuthenticatedValue.h"
 
+#include <bit>
+#include <span>
+#include <atomic>
 #include <limits>
 #include <cassert>
 #include <compare>
 #include <cstddef>
 #include <utility>
+
+
 #if !TARGET_OS_EXCLAVEKIT
 //#include <_simple.h>
 #include <mach/vm_statistics.h>
 #include <os/lock.h>
 #include <pthread.h>
+#include <sys/mman.h>
 #endif // !TARGET_OS_EXCLAVEKIT
 
+
+#if ENABLE_CRASH_REPORTER
+//#include <CrashReporterClient.h>
+#endif
+
 #include <new>
+#include <stdio.h>
+
+#if DYLD_FEATURE_USE_HW_TPRO
+#define __ptrauth_dyld_tpro_stack           __ptrauth(ptrauth_key_process_independent_data, 1, ptrauth_string_discriminator("__ptrauth_dyld_tpro_stack"))
+#endif // DYLD_FEATURE_USE_HW_TPRO
+
+// FIXME: Copied from LibSsystemHelpers.h
+#if TARGET_OS_EXCLAVEKIT
+typedef int                         kern_return_t;
+#endif
 
 namespace dyld4 {
 class RuntimeState;
 };
 
+namespace callback_impl
+{
+
+template <typename F>
+struct return_type : public return_type<decltype(&F::operator())>
+{
+};
+
+template <class ClassTy, class R, class... A>
+struct return_type<R(ClassTy::*)(A...) const>
+{
+    typedef R type;
+};
+
+template <class R, class... A>
+struct return_type<R (*)(A...)>
+{
+    typedef R type;
+};
+
+template <class R, class... A>
+struct return_type<R (^)(A...)>
+{
+    typedef R type;
+};
+
+} // namespace callback_impl
+
 namespace lsl {
 
 struct Allocator;
-struct PersistentAllocator;
+
+//
+// MARK: --- ProtectedStackReturnType ---
+//
+// The work() lambda called by the with*() functions may be called
+// from a read-write stack, but ultimately return to a variable in the read-only TPRO-stack.
+// That is ok if the result is in a register, but struct returns are a problem
+// if the write is to a stack which is currently not writable.
+// This wraps up all allowed values which we can guarantee fit in a register
+struct ProtectedStackReturnType
+{
+    // Copied from LibSystemHelpers
+    typedef bool (*FuncLookup)(const char* name, void** addr);
+
+    ProtectedStackReturnType() = default;
+
+    // convert from required type to this wrapper
+    ProtectedStackReturnType(size_t val) {
+        v.size = val;
+    }
+    ProtectedStackReturnType(kern_return_t val) {
+        v.kr = val;
+    }
+    ProtectedStackReturnType(bool val) {
+        v.boolean = val;
+    }
+    ProtectedStackReturnType(void* val) {
+        v.voidptr = val;
+    }
+    ProtectedStackReturnType(char* val) {
+        v.charptr = val;
+    }
+    ProtectedStackReturnType(const char* val) {
+        v.constcharptr = val;
+    }
+    ProtectedStackReturnType(FuncLookup val) {
+        v.funcptr = val;
+    }
+
+    // Convert back to result types
+    operator size_t() const         { return v.size; }
+    operator kern_return_t() const  { return v.kr; }
+    operator bool() const           { return v.boolean; }
+    operator void*() const          { return v.voidptr; }
+    operator const char*() const    { return v.charptr; }
+    operator char*() const          { return v.charptr; }
+    operator FuncLookup() const     { return v.funcptr; }
+
+private:
+    union {
+        size_t          size;
+        kern_return_t   kr;
+        bool            boolean;
+        void*           voidptr;
+        char*           charptr;
+        const char*     constcharptr;
+        FuncLookup      funcptr;
+    } v;
+};
+
+static_assert(sizeof(ProtectedStackReturnType) == sizeof(uintptr_t));
+
+//
+// MARK: --- ProtectedStack ---
+//
+
+class VIS_HIDDEN ProtectedStack
+{
+public:
+    ProtectedStack(bool isEnabledInProcess);
+
+    // Allocates a new stack, to avoid keeping dirty memory around from a previous use
+    // If there is no stack, just allocates one.  If there's an existing stack it will
+    // deallocate it and allocate a new one.
+    void reset();
+
+    void withProtectedStack(void (^work)(void));
+    void withNestedProtectedStack(void (^work)(void));
+    ProtectedStackReturnType withNestedRegularStack(ProtectedStackReturnType (^work)(void));
+
+    bool enabled() const;
+
+    // Returns true if the stack is being used on the current frame
+    bool onStackInCurrentFrame() const;
+
+    // Returns true if the stack is being used on the given frame
+    bool onStackInFrame(const void* frameAddr) const;
+
+    // Returns true if the stack is being used on any frame in this thread
+    bool onStackInAnyFrameInThisThread() const;
+
+    void getRange(const void*& stackBottom, const void*& stackTop) const;
+
+private:
+    void allocateStack();
+
+    static const void* getCurrentThreadId();
+
+#if DYLD_FEATURE_USE_HW_TPRO
+    // Worker threads gets 512KB, so match that for the dyld stack
+    constexpr static uint64_t stackSize             = 512 * 1024;
+    constexpr static uint64_t guardPageSize         = 16 * 1024;
+    void* __ptrauth_dyld_tpro_stack topOfStack      = nullptr;
+    void* __ptrauth_dyld_tpro_stack bottomOfStack   = nullptr;
+    void* __ptrauth_dyld_tpro_stack stackBuffer     = nullptr;
+
+    // We might go RW->RO->RW->...
+    // These track the next stack location to push a new TPRO/regular frame
+    void* __ptrauth_dyld_tpro_stack nextTPROStackAddr       = nullptr;
+    void* __ptrauth_dyld_tpro_stack nextRegularStackAddr    = nullptr;
+
+    // which thread owns the TPRO stack, ie, has the writer lock
+    const void* __ptrauth_dyld_tpro_stack threadId = nullptr;
+#endif // DYLD_FEATURE_USE_HW_TPRO
+};
 
 #if !TARGET_OS_EXCLAVEKIT
 #pragma mark -
@@ -77,11 +242,6 @@ struct VIS_HIDDEN Lock {
     Lock(Lock&&)                    = default;
     Lock& operator=(Lock&&)         = default;
     Lock& operator=(const Lock&)    = default;
-
-//    Lock(Lock&& other) {
-//        swap(other);
-//    }
-//    Lock& operator=(const Lock&) = default;
     Lock(dyld4::RuntimeState* runtimeState, os_unfair_lock_t lock) : _runtimeState(runtimeState), _lock(lock) {}
 
     void assertNotOwner();
@@ -103,14 +263,10 @@ private:
 #pragma mark Memory Manager
 
 struct VIS_HIDDEN MemoryManager {
-    struct WriteProtectionState {
-        uintptr_t   signature;
-        intptr_t    data;
-    };
     // a tuple of an allocated <pointer, size>
     struct Buffer {
-        void*   address;
-        uint64_t  size;
+        void*   address = nullptr;
+        uint64_t  size  = 0;
         [[gnu::pure]] void*     lastAddress() const;                // end() ??
         bool                    align(uint64_t alignment, uint64_t size);
 
@@ -118,107 +274,94 @@ struct VIS_HIDDEN MemoryManager {
         bool                    valid() const;
         void                    dump() const;
         bool                    succeeds(const Buffer&) const;
-        void                    remainders(const Buffer& other, Buffer& prefix, Buffer& postfix) const;
-        Buffer                  findSpace(uint64_t targetSize, uint64_t targetAlignment, uint64_t prefix) const;
+        void                    remainders(const Buffer& other, Buffer& prefix) const;
+        Buffer                  findSpace(uint64_t targetSize, uint64_t targetAlignment) const;
+        void                    consumeSpace(uint64_t consumedSpace);
         explicit                operator bool() const;
         auto                    operator<=>(const Buffer&) const = default;
     };
 
-    MemoryManager()                     = default;
-    MemoryManager(const MemoryManager&) = delete;
-    MemoryManager(MemoryManager&& other) {
-        swap(other);
-    }
-    MemoryManager& operator=(const MemoryManager&) = delete;
-    MemoryManager& operator=(MemoryManager&& other) {
-        swap(other);
-        return *this;
-    }
-    // TODO: Parse mlock() params out for compact info
-    MemoryManager(const char** apple) {
-        // Eventually we will use this to parse parameters for controlling comapct info mlock()
-        // We need to do this before allocator is created
-#if BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
-        if (_simple_getenv(apple, "dyld_hw_tpro") != nullptr) {
-            // Start in a writable state to allow bootstrap
-            _tproEnable = true;
-        }
-#endif //  BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
-    }
+    MemoryManager()                                 = delete;
+    MemoryManager(const MemoryManager&)             = delete;
+    MemoryManager(MemoryManager&& other)            = delete;
+    MemoryManager& operator=(const MemoryManager&)  = delete;
+    MemoryManager& operator=(MemoryManager&& other) = delete;
 
+    // Support for creating allocatos
+    static Allocator&       defaultAllocator();
+
+    static void init(const char** envp = nullptr, const char** apple = nullptr, void* dyldSharedCache = nullptr);
+    static MemoryManager& memoryManager();
+
+    void setDyldCacheAddr(void* sharedCache);
+    void setProtectedStack(ProtectedStack& protectedStack);
 #if !TARGET_OS_EXCLAVEKIT
-    MemoryManager(Lock&& lock) : _lock(std::move(lock)) {}
-
-    void adoptLock(Lock&& lock) {
-        _lock = std::move(lock);
-    }
+    MemoryManager(Lock&& lock);
+    void adoptLock(Lock&& lock);
 #endif // !TARGET_OS_EXCLAVEKIT
 
+#if DYLD_FEATURE_EMBEDDED_PAGE_ALLOCATOR
     [[nodiscard]] static void*      allocate_pages(uint64_t size);
     static void                     deallocate_pages(void* p, uint64_t size);
-    [[nodiscard]] Buffer            vm_allocate_bytes(uint64_t size);
+#endif /* DYLD_FEATURE_EMBEDDED_PAGE_ALLOCATOR */
+    [[nodiscard]] Buffer            vm_allocate_bytes(uint64_t size, bool tproEnabled);
     void static                     vm_deallocate_bytes(void* p, uint64_t size);
-    template<typename F>
-    ALWAYS_INLINE void          withWritableMemory(F work) {
-#if BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
-        // Purposefully spill into a signed stack slot to prevent attackers replacing the this pointer
-        MemoryManager* __ptrauth_dyld_tpro0 memoryManager = this;
-        WriteProtectionState previousState;
-        // Barrier to prevent optimizing away memoryManager-> to this->
-        os_compiler_barrier();
-        memoryManager->makeWriteable(previousState);
-#endif // BUILD_DYLD && !TARGET_OS_EXCLAVEKIT
-        work();
-#if BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
-        memoryManager->restorePreviousState(previousState);
-#endif // BUILD_DYLD && !TARGET_OS_EXCLAVEKIT
-    }
 
     template<typename F>
-    ALWAYS_INLINE void          withReadOnlyMemory(F work) {
-#if BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
-        // Purposefully spill into a signed stack slot to prevent attackers replacing the this pointer
-        MemoryManager* __ptrauth_dyld_tpro1 memoryManager = this;
-        WriteProtectionState previousState;
-        // Barrier to prevent optimizing away memoryManager-> to this->
-        os_compiler_barrier();
-        memoryManager->makeReadOnly(previousState);
-#endif // BUILD_DYLD && !TARGET_OS_EXCLAVEKIT
-        work();
-#if BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
-        memoryManager->restorePreviousState(previousState);
-#endif // BUILD_DYLD && !TARGET_OS_EXCLAVEKIT
+    ALWAYS_INLINE static void withWritableMemory(F work) {
+        MemoryManager& memoryManager = MemoryManager::memoryManager();
+        memoryManager.withWritableMemoryInternal(work);
     }
+
 private:
-    friend struct PersistentAllocator;
-
-#if !TARGET_OS_EXCLAVEKIT
-    [[nodiscard]] Lock::Guard lockGuard();
-#endif // !TARGET_OS_EXCLAVEKIT
-    void writeProtect(bool protect);
-
-    __attribute__((always_inline))
-    void makeWriteable(WriteProtectionState& previousState) {
-#if BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
-        if (_tproEnable) {
+    template<typename F>
+    ALWAYS_INLINE void withWritableMemoryInternal(F work) {
+#if DYLD_FEATURE_USE_HW_TPRO
+        // If we were on the TPRO stack in a higher frame then move back to it now
+        if ( (_protectedStack != nullptr) && _protectedStack->onStackInAnyFrameInThisThread() ) {
             os_compiler_barrier();
-            // Stacks are in  memory, so it is possible to attack tpro via writing the stack vars in another thread. To protect
-            // against this we create a signature that mixes the value of writable and its address then validate it later. If the
-            // barriers work the state will never spill to the stack between varification and usage.
-            previousState.data      = os_thread_self_restrict_tpro_is_writable();
-  #if __has_feature(ptrauth_calls)
-            previousState.signature = ptrauth_sign_generic_data(previousState.data, (uintptr_t)&previousState.data | (uintptr_t)this);
-#endif /* __has_feature(ptrauth_calls) */
-            if (!previousState.data) {
-                os_thread_self_restrict_tpro_to_rw();
-            }
+            os_thread_self_restrict_tpro_to_rw();
             os_compiler_barrier();
+
+            _protectedStack->withNestedProtectedStack(^() {
+                work();
+            });
+
+            os_compiler_barrier();
+            os_thread_self_restrict_tpro_to_ro();
+            os_compiler_barrier();
+
             return;
         }
-        previousState.data      = 1;
-#if __has_feature(ptrauth_calls)
-        previousState.signature = ptrauth_sign_generic_data(previousState.data, (uintptr_t)&previousState.data | (uintptr_t)this);
-#endif /* __has_feature(ptrauth_calls) */
+
+        if ( tproEnabled() ) {
+            os_compiler_barrier();
+            bool isWritable = os_thread_self_restrict_tpro_is_writable();
+            os_compiler_barrier();
+
+            if ( isWritable ) {
+                // already writable, so just do the work without switching state
+                work();
+            } else {
+                // not writable, so switch state
+                os_compiler_barrier();
+                os_thread_self_restrict_tpro_to_rw();
+                os_compiler_barrier();
+
+                work();
+
+                os_compiler_barrier();
+                os_thread_self_restrict_tpro_to_ro();
+                os_compiler_barrier();
+            }
+            return;
+        }
+#endif // DYLD_FEATURE_USE_HW_TPRO
+
+        // not tpro
+
+
+#if DYLD_FEATURE_MPROTECT_ALLOCATOR
         {
             __unused auto lock = lockGuard();
             if (_writeableCount == 0) {
@@ -226,30 +369,102 @@ private:
             }
             ++_writeableCount;
         }
-#endif // BUILD_DYLD && !TARGET_OS_EXCLAVEKIT
-    }
-    __attribute__((always_inline))
-    void makeReadOnly(WriteProtectionState& previousState) {
-#if BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
-        if (_tproEnable) {
-            os_compiler_barrier();
-            // Stacks are in  memory, so it is possible to attack tpro via writing the stack vars in another thread. To protect
-            // against this we create a signature that mixes the value of writable and its address then validate it later. If the
-            // barriers work the state will never spill to the stack between varification and usage.
-            previousState.data      = os_thread_self_restrict_tpro_is_writable();
-#if __has_feature(ptrauth_calls)
-            previousState.signature = ptrauth_sign_generic_data(previousState.data, (uintptr_t)&previousState.data | (uintptr_t)this);
-#endif /* __has_feature(ptrauth_calls) */
-            if (previousState.data) {
-                os_thread_self_restrict_tpro_to_ro();
+#endif // DYLD_FEATURE_MPROTECT_ALLOCATOR
+
+        work();
+
+#if DYLD_FEATURE_MPROTECT_ALLOCATOR
+        {
+            __unused auto lock = lockGuard();
+            _writeableCount -= 1;
+            if (_writeableCount == 0) {
+                writeProtect(true);
             }
-            os_compiler_barrier();
+        }
+#endif // DYLD_FEATURE_MPROTECT_ALLOCATOR
+    }
+
+public:
+    // Note, there is only one protected stack, so care needs to be taken
+    // to avoid multiple threads using it at the same time.
+    // As of writing, this is done by only taking the protected stack when
+    // the loaders lock is also taken.
+    template<typename F>
+    ALWAYS_INLINE static void withProtectedStack(F work) {
+#if DYLD_FEATURE_USE_HW_TPRO
+        MemoryManager& memoryManager = MemoryManager::memoryManager();
+
+        // We shouldn't be on the TPRO stack yet
+        assert(!memoryManager._protectedStack->onStackInAnyFrameInThisThread());
+
+        memoryManager._protectedStack->withProtectedStack(^() {
+            work();
+        });
+
+        // reset the protected stack, to release its dirty memory
+        memoryManager._protectedStack->reset();
+#else
+        work();
+#endif // DYLD_FEATURE_USE_HW_TPRO
+    }
+
+    template<typename F>
+    ALWAYS_INLINE static void withReadOnlyMemory(F work) {
+        MemoryManager& memoryManager = MemoryManager::memoryManager();
+        memoryManager.withReadOnlyMemoryInternal(work);
+    }
+
+private:
+    template<typename F>
+    ALWAYS_INLINE void withReadOnlyMemoryInternal(F work) {
+#if DYLD_FEATURE_USE_HW_TPRO
+        // If we're on the protected stack then we need to move back to the regular one
+        // before we go RO
+        if ( (_protectedStack != nullptr) && _protectedStack->onStackInCurrentFrame() ) {
+            _protectedStack->withNestedRegularStack(^{
+                os_compiler_barrier();
+                os_thread_self_restrict_tpro_to_ro();
+                os_compiler_barrier();
+
+                work();
+
+                os_compiler_barrier();
+                os_thread_self_restrict_tpro_to_rw();
+                os_compiler_barrier();
+
+                return ProtectedStackReturnType();
+            });
             return;
         }
-        previousState.data      = -1;
-#if __has_feature(ptrauth_calls)
-        previousState.signature = ptrauth_sign_generic_data(previousState.data, (uintptr_t)&previousState.data | (uintptr_t)this);
-#endif /* __has_feature(ptrauth_calls) */
+
+        if ( tproEnabled() ) {
+            os_compiler_barrier();
+            bool isReadOnly = !os_thread_self_restrict_tpro_is_writable();
+            os_compiler_barrier();
+
+            if ( isReadOnly ) {
+                // already read-only, so just do the work without switching state
+                work();
+            } else {
+                // not read-only, so switch state
+                os_compiler_barrier();
+                os_thread_self_restrict_tpro_to_ro();
+                os_compiler_barrier();
+
+                work();
+
+                os_compiler_barrier();
+                os_thread_self_restrict_tpro_to_rw();
+                os_compiler_barrier();
+            }
+            return;
+        }
+#endif // DYLD_FEATURE_USE_HW_TPRO
+
+        // not tpro
+
+
+#if DYLD_FEATURE_MPROTECT_ALLOCATOR
         {
             __unused auto lock = lockGuard();
             --_writeableCount;
@@ -257,125 +472,285 @@ private:
                 writeProtect(true);
             }
         }
-#endif // BUILD_DYLD && !TARGET_OS_EXCLAVEKIT
-    }
-    __attribute__((always_inline))
-    void restorePreviousState(WriteProtectionState& previousState) {
-#if BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
-        if (_tproEnable) {
-            os_compiler_barrier();
-#if __has_feature(ptrauth_calls)
-            uintptr_t signedWritableState = ptrauth_sign_generic_data(previousState.data, (uintptr_t)&previousState.data | (uintptr_t)this);
-            if (previousState.signature != signedWritableState) {
-                // Someone tampered with writableState. Process is under attack, we need to abort();
-                abort();
-            }
-#endif /* __has_feature(ptrauth_calls) */
+#endif // DYLD_FEATURE_MPROTECT_ALLOCATOR
 
-            uintptr_t state = os_thread_self_restrict_tpro_is_writable();
-            if (state != previousState.data) {
-                if (previousState.data) {
-                    os_thread_self_restrict_tpro_to_rw();
-                } else {
-                    os_thread_self_restrict_tpro_to_ro();
-                }
-            }
-            os_compiler_barrier();
-            return;
-        }
-#if __has_feature(ptrauth_calls)
-        uintptr_t signedWritableState = ptrauth_sign_generic_data(previousState.data, (uintptr_t)&previousState.data | (uintptr_t)this);
-        if (previousState.signature != signedWritableState) {
-            // Someone tampered with writable state. Process is under attack, we need to abort();
-            abort();
-        }
-#endif /* __has_feature(ptrauth_calls) */
+        work();
+
+#if DYLD_FEATURE_MPROTECT_ALLOCATOR
         {
             __unused auto lock = lockGuard();
-            if (previousState.data == -1) {
-                if (_writeableCount == 0) {
-                    writeProtect(false);
-                }
-                _writeableCount += 1;
-            } else if (previousState.data == 1) {
-                _writeableCount -= 1;
-                if (_writeableCount == 0) {
-                    writeProtect(true);
-                }
+            if (_writeableCount == 0) {
+                writeProtect(false);
             }
+            _writeableCount += 1;
         }
-#endif // BUILD_DYLD && !TARGET_OS_EXCLAVEKIT
-    }
-    void swap(MemoryManager& other) {
-        using std::swap;
-#if !TARGET_OS_EXCLAVEKIT
-        swap(_lock,                     other._lock);
-#endif // !TARGET_OS_EXCLAVEKIT
-        swap(_allocator,                other._allocator);
-        swap(_writeableCount,           other._writeableCount);
-
-        // We don't actually swap this because it is a process wide setting, and we may need it to be set correctly
-        // even in the bootstrapMemoryProtector adfter move construction
-        _tproEnable = other._tproEnable;
+#endif //  DYLD_FEATURE_MPROTECT_ALLOCATOR
     }
 
-    int vmFlags() const {
-        int result = 0;
-#if BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
-        if (_tproEnable) {
-            // add tpro for memory protection on platform that support it
-            result |= VM_FLAGS_TPRO;
+public:
+    template<typename F>
+    ALWAYS_INLINE static auto withReadOnlyTPROMemory(F work) -> callback_impl::return_type<decltype(&F::operator())>::type
+    {
+        typedef typename callback_impl::return_type<decltype(&F::operator())>::type RetTy;
+
+#if DYLD_FEATURE_USE_HW_TPRO
+        MemoryManager& memoryManager = MemoryManager::memoryManager();
+
+        // If we're on the protected stack then we need to move back to the regular one
+        // before we go RO
+        if ( (memoryManager._protectedStack != nullptr) && memoryManager._protectedStack->onStackInCurrentFrame() ) {
+            ProtectedStackReturnType result = memoryManager._protectedStack->withNestedRegularStack(^{
+                os_compiler_barrier();
+                os_thread_self_restrict_tpro_to_ro();
+                os_compiler_barrier();
+
+                ProtectedStackReturnType workResult = work();
+
+                os_compiler_barrier();
+                os_thread_self_restrict_tpro_to_rw();
+                os_compiler_barrier();
+
+                return workResult;
+            });
+
+            return result;
         }
-        // Only include the dyld tag for allocations made by dyld
-        result |= VM_MAKE_TAG(VM_MEMORY_DYLD);
-#endif // BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
+
+        if ( memoryManager.tproEnabled() ) {
+            os_compiler_barrier();
+            bool isReadOnly = !os_thread_self_restrict_tpro_is_writable();
+            os_compiler_barrier();
+
+            RetTy result;
+            if ( isReadOnly ) {
+                // already read-only, so just do the work without switching state
+                result = work();
+            } else {
+                // not read-only, so switch state
+                os_compiler_barrier();
+                os_thread_self_restrict_tpro_to_ro();
+                os_compiler_barrier();
+
+                result = work();
+
+                os_compiler_barrier();
+                os_thread_self_restrict_tpro_to_rw();
+                os_compiler_barrier();
+            }
+            return result;
+        }
+#endif // DYLD_FEATURE_USE_HW_TPRO
+
+        // not tpro, don't switch state, but do the work
+        RetTy result = work();
         return result;
     }
+
+#if DYLD_FEATURE_USE_HW_TPRO
+    bool tproEnabled() const { return _tproEnable; }
+#endif
+
+#if SUPPORT_ROSETTA
+    bool isTranslated() const { return _translated; }
+#endif
+
+
+private:
+    friend struct Allocator;
+#if !TARGET_OS_EXCLAVEKIT
+    [[nodiscard]] Lock::Guard lockGuard();
+#endif // !TARGET_OS_EXCLAVEKIT
+    MemoryManager(const char** envp, const char** apple, void* dyldSharedCache);
+    void writeProtect(bool protect);
+    int vmFlags(bool tproEnabled) const;
 
 #if !TARGET_OS_EXCLAVEKIT
     Lock                    _lock;
 #endif // !TARGET_OS_EXCLAVEKIT
-    PersistentAllocator*    _allocator                  = nullptr;
+    Allocator*              _defaultAllocator           = nullptr;
     uint64_t                _writeableCount             = 0;
+
+#if DYLD_FEATURE_USE_HW_TPRO
     bool                    _tproEnable                 = false;
+#endif // DYLD_FEATURE_USE_HW_TPRO
+#if SUPPORT_ROSETTA
+    bool                    _translated                 = false;
+#endif /* SUPPORT_ROSETTA */
+#if BUILDING_DYLD
+    void*                   _sharedCache                = nullptr;
+#endif // BUILDING_DYLD
+
+#if DYLD_FEATURE_USE_HW_TPRO
+    ProtectedStack*         _protectedStack             = nullptr;
+#endif
+
+    // This is info we are stashing for CRSetCrashLogMessage2 later. They are just for debugging.
+    uint64_t                requestedAlignment          = 0;
+    uint64_t                requestedSize               = 0;
+    uint64_t                requestedTargetAlignment    = 0;
+    uint64_t                requestedTargetSize         = 0;
 };
 
-// C++ does not (generally speaking) support destructive moves. In the case of heap allocated (allocator backed objects) where the
-// collectoin classes explicitly call destructors we can often get the some of the same performance by tricks invoking move construction
-// and eliding calls to destruct the previous location, etc.
+template<typename T>
+struct VIS_HIDDEN UniquePtr;
 
-struct VIS_HIDDEN AllocationMetadata {
-    enum Type {
-        NormalPtr   = 0,
-        UniquePtr   = 1,
-        SharedPtr   = 2
-    };
-    AllocationMetadata(Allocator* allocator, uint64_t size);
-    static AllocationMetadata*  getForPointer(void*);
-    Allocator&                  allocator() const; // allocator offset 24 bit
-    uint64_t                    size() const; // 1 bit granule size : 21 granule count
-    Type                        type() const;
-    void                        setType(Type type);
-    void freeObject();
-    void incrementRefCount();
-    bool decrementRefCount();
-    void incrementWeakRefCount();
-    bool decrementWeakRefCount();
-    static uint64_t goodSize(uint64_t);
-    template<typename T> static uint64_t goodSize() {
-        return goodSize(sizeof(T));
+template<typename T>
+struct VIS_HIDDEN SharedPtr;
+
+
+
+struct __attribute__((aligned(16))) VIS_HIDDEN Allocator {
+    using Buffer = MemoryManager::Buffer;
+    static const uint64_t    kGranuleSize                    = (16);
+
+    // smart pointers
+    template< class T, class... Args >
+    NO_DEBUG UniquePtr<T> makeUnique(Args&&... args ) {
+        void* storage = aligned_alloc(alignof(T), sizeof(T));
+        return UniquePtr<T>(new (storage) T(std::forward<Args>(args)...));
     }
-//private:
-    //TODO: This can be packed tighter, and will need to be if we ever do weak refs
-    static constexpr uint8_t granules[]     = {4, 15, 26, 37};
-    uint64_t                _allocator      : 49; // 8 byte min alignment
-    uint64_t                _size           : 11;
-    uint64_t                _sizeClass      : 2;
-    uint64_t                _type           : 2;
-    //FIXME: When libc++ supports std::atomic_ref we can use those, for now due horrible tricks with casts
-    uint32_t                _refCount       = 0;  // SharedPtr refCount
-    uint32_t                _weakRefCount   = 0;  // WeakPtr refCount
+
+    template< class T, class... Args >
+    NO_DEBUG SharedPtr<T> makeShared(Args&&... args ) {
+        void* storage = aligned_alloc(alignof(T), sizeof(T));
+        return SharedPtr<T>(new (storage) T(std::forward<Args>(args)...));
+    }
+
+    // Simple interfaces
+    void*                   malloc(uint64_t size);
+    void*                   aligned_alloc(uint64_t alignment, uint64_t size);
+    void                    free(void* ptr);
+    // realloc() does not follow posix semantics. If it cannnot realloc in place it returns false
+    bool                    realloc(void* ptr, uint64_t size);
+    static void             freeObject(void* ptr);
+    char*                   strdup(const char*);
+    bool                    owned(const void* p, uint64_t nbytes) const;
+    static uint64_t         size(const void* p);
+
+#if DYLD_FEATURE_USE_INTERNAL_ALLOCATOR
+    struct Pool;
+    Allocator(MemoryManager& memoryManager, Pool& pool);
+    Allocator(MemoryManager& memoryManager);
+    ~Allocator();
+
+    // For by stack allocators
+    void setInitialPool(Pool& pool);
+
+    void setBestFit(bool);
+    void validate() const;
+    void dump() const;
+    void reset();
+    void forEachPool(void (^callback)(const Pool&));
+    void forEachVMAllocatedBuffer(void (^callback)(const Buffer&));
+
+    Allocator& operator=(Allocator&& other);
+
+    uint64_t      allocated_bytes() const;
+    // For debugging
+    //    virtual void        validate() const {};
+    //    virtual void        debugDump() const {};
+    struct __attribute__((aligned(16))) AllocationMetadata {
+        static const uint64_t kNextBlockAllocatedFlag       = 0x01ULL;
+        static const uint64_t kNextBlockLastBlockFlag       = 0x02ULL;
+        static const uint64_t kNextBlockAddressMask         = ~(kNextBlockAllocatedFlag | kNextBlockLastBlockFlag);
+        static const uint64_t kPreviousBlockIsAllocatorFlag = 0x01ULL;
+        static const uint64_t kPreviousBlockAddressMask      = ~(kPreviousBlockIsAllocatorFlag);
+        AllocationMetadata() = delete;
+        AllocationMetadata(Pool* pool, uint64_t size);
+        AllocationMetadata(AllocationMetadata *prev, uint64_t size, uint64_t flags, uint64_t prevFlags);
+        void* firstAddress() const;
+        void* lastAddress() const;
+        uint64_t size() const;
+        void reserve(uint64_t size, bool allocated);
+        void coalesce(Pool* pool);
+        bool allocated() const;
+        bool free() const;
+        AllocationMetadata* previous() const;
+        AllocationMetadata* next() const;
+        bool last() const;
+        Pool* pool(bool useHints = true) const;
+
+        void deallocate();
+        static AllocationMetadata* forPtr(void* ptr);
+        void markAllocated();
+        void returnToNext(uint64_t size);
+        bool consumeFromNext(uint64_t size);
+
+        void validate() const;
+        void logAddressSpace(const char* prefix) const;
+    private:
+        void setPoolHint(Pool* pool);
+        // We use the low bit of previous to indicate if the pointer points to another metadata, or the pool
+        // 0: metadata
+        // 1: pool
+        uint64_t    _prev = 0;
+        // We use the low bit of next to indicate if the space between this and the next metadata is free or used
+        // 0: free
+        // 1: allocated
+        // and the next bit to indicate if it is the last metadata in the pool
+        // 0: normal metadata
+        // 2: last metadata
+        uint64_t    _next = 0;
+    };
+    struct __attribute__((aligned(16))) Pool {
+        Pool()              = default;
+        Pool(const Pool&)   = delete;
+        Pool(Pool&&)        = delete;
+        Pool(Allocator* allocator, Pool* prevPool, uint64_t size, bool tproEnabled);
+        Pool(Allocator* allocator, Pool* prevPool, Buffer region, bool tproEnabled);
+        Pool(Allocator* allocator, Pool* prevPool, Buffer region, Buffer freeRegion, bool tproEnabled);
+        void* aligned_alloc(uint64_t alignment, uint64_t size);
+        void* aligned_alloc_best_fit(uint64_t alignment, uint64_t size);
+        void free(void* ptr);
+        void makeNextPool(Allocator* allocator, uint64_t newPoolSize);
+        Pool* nextPool() const;
+        Pool* prevPool() const;
+        static Pool* forPtr(void* ptr);
+        const Buffer& poolBuffer() const;
+        Allocator* allocator() const;
+        void validate() const;
+        void dump() const;
+        bool vmAllocated() const {
+            return _vmAllocated;
+        }
+        void* highWaterMark() const {
+            return _highWaterMark;
+        }
+    private:
+        friend struct AllocationMetadata;
+        Allocator*          _allocator          = nullptr;
+        Pool*               _nextPool           = nullptr;
+        Pool*               _prevPool           = nullptr;
+        AllocationMetadata* _lastFreeMetadata   = nullptr;
+        const Buffer        _poolBuffer;
+        void*               _highWaterMark      = 0;
+        bool                _vmAllocated        = false;
+
+#if DYLD_FEATURE_USE_HW_TPRO
+    bool                    _tproEnabled        = false;
+#endif // DYLD_FEATURE_USE_HW_TPRO
+    };
+    Pool*               _firstPool      = nullptr;
+    Pool*               _currentPool    = nullptr;
+    uint64_t            _allocatedBytes = 0;
+    uint64_t            _logID          = 0;
+    bool                _bestFit        = false;
+#endif /* DYLD_FEATURE_USE_INTERNAL_ALLOCATOR */
+private:
+    friend MemoryManager;
+    Allocator() = default;
 };
+
+#if DYLD_FEATURE_USE_INTERNAL_ALLOCATOR
+struct VIS_HIDDEN AllocatorGuard {
+    AllocatorGuard(Allocator& allocator) : _allocator(allocator) {}
+    ~AllocatorGuard() {
+        _allocator.~Allocator();
+    }
+private:
+    Allocator& _allocator;
+};
+#endif /* !DYLD_FEATURE_USE_INTERNAL_ALLOCATOR */
 
 template<typename T>
 struct VIS_HIDDEN UniquePtr {
@@ -383,9 +758,6 @@ struct VIS_HIDDEN UniquePtr {
     constexpr UniquePtr(std::nullptr_t) : UniquePtr() {};
     template<class  U> explicit UniquePtr(U* data) : _data(data) {
         if (!_data) { return; }
-        auto metadata = AllocationMetadata::getForPointer((void*)_data);
-        assert(metadata->type() == AllocationMetadata::NormalPtr);
-        metadata->setType(AllocationMetadata::UniquePtr);
     }
     UniquePtr(const UniquePtr&) = delete;
     UniquePtr(UniquePtr&& other) {
@@ -407,11 +779,8 @@ struct VIS_HIDDEN UniquePtr {
     };
     ~UniquePtr() {
         if (_data) {
-            auto metadata = AllocationMetadata::getForPointer((void*)_data);
-            assert(metadata->type() == AllocationMetadata::UniquePtr);
             _data->~T();
-            metadata->setType(AllocationMetadata::NormalPtr);
-            metadata->freeObject();
+            Allocator::freeObject((void*)_data);
         }
     }
     explicit operator bool() const {
@@ -439,11 +808,6 @@ struct VIS_HIDDEN UniquePtr {
     }
     T* release() {
         auto result = _data;
-        if (_data) {
-            auto metadata = AllocationMetadata::getForPointer((void*)_data);
-            assert(metadata->type() == AllocationMetadata::UniquePtr);
-            metadata->setType(AllocationMetadata::NormalPtr);
-        }
         _data = nullptr;
         return result;
     }
@@ -453,6 +817,15 @@ struct VIS_HIDDEN UniquePtr {
     //TODO: Move this to opeator<=> once C++20 imp is more complete
     bool operator<(const UniquePtr& other) const {
         return *_data < *other._data;
+    }
+    uint64_t size() const {
+        return Allocator::size((void*)_data);
+    }
+    std::span<std::byte> bytes() const {
+        if (_data) {
+            return std::span<std::byte>((std::byte*)_data, size());
+        }
+        return std::span<std::byte>();
     }
 private:
     void swap(UniquePtr& other) {
@@ -471,28 +844,50 @@ private:
 
 template<typename T>
 struct VIS_HIDDEN SharedPtr {
-    SharedPtr() = default;
-    constexpr SharedPtr(std::nullptr_t) : SharedPtr() {};
-    explicit SharedPtr(T* data) : _data(data) {
-        if (!_data) { return; }
-        auto metadata = AllocationMetadata::getForPointer(_data);
-        if (metadata->type() == AllocationMetadata::NormalPtr) {
-            metadata->setType(AllocationMetadata::SharedPtr);
-            // FIXME: Do we need a barrier here?
-        } else {
-            metadata->incrementRefCount();
+    struct Ctrl {
+        Ctrl() = delete;
+        Ctrl(T* data) : _data(data) {}
+        void incrementRefCount() {
+            //__c11_atomic_fetch_add((_Atomic uint32_t*)&_refCount, 1, __ATOMIC_RELAXED);
+            _refCount.fetch_add(1, std::memory_order_relaxed);
         }
+        void decrementRefCount() {
+            //__c11_atomic_fetch_sub((_Atomic uint32_t*)&_refCount, 1, __ATOMIC_ACQ_REL)
+            if (_refCount.fetch_sub(1, std::memory_order_acq_rel) == 0) {
+                if (_data) {
+                    _data->~T();
+                    Allocator::freeObject((void*)_data);
+                }
+                Allocator::freeObject((void*)this);
+            }
+        }
+        T* data() const {
+            return _data;
+        }
+        std::atomic<uint32_t>  _refCount{0};
+        T*  _data = nullptr;
+    };
+    SharedPtr() = default;
+    constexpr SharedPtr(std::nullptr_t) : _ctrl(nullptr) {}
+    explicit SharedPtr(T* data) : _ctrl(nullptr) {
+#if !DYLD_FEATURE_USE_INTERNAL_ALLOCATOR
+        void* ctrlData = ::aligned_alloc(alignof(Ctrl),sizeof(Ctrl));
+#else
+        auto metadata = Allocator::AllocationMetadata::forPtr((void*)data);
+        auto allocator = metadata->pool()->allocator();
+        void* ctrlData = allocator->aligned_alloc(alignof(Ctrl),sizeof(Ctrl));
+#endif
+        _ctrl = new (ctrlData) Ctrl(data);
     }
-    SharedPtr(const SharedPtr& other) : _data(other._data) {
-        if (!_data) { return; }
-        auto metadata = AllocationMetadata::getForPointer(_data);
-        metadata->incrementRefCount();
+
+    SharedPtr(const SharedPtr& other) : _ctrl(other._ctrl) {
+        if (!_ctrl) { return; }
+        _ctrl->incrementRefCount();
     };
     template<class U>
     SharedPtr(const SharedPtr<U>& other) : SharedPtr((T*)other._data) {
-        if (!_data) { return; }
-        auto metadata = AllocationMetadata::getForPointer(_data);
-        metadata->incrementRefCount();
+        if (!_ctrl) { return; }
+        _ctrl->incrementRefCount();
     }
     SharedPtr(SharedPtr&& other) {
         swap(other);
@@ -522,154 +917,105 @@ struct VIS_HIDDEN SharedPtr {
         return *this;
     };
     ~SharedPtr() {
-        if (!_data) { return; }
-        auto metadata = AllocationMetadata::getForPointer(_data);
-        if (metadata->decrementRefCount()) {
-            _data->~T();
-            metadata->freeObject();
-        }
+        if (!_ctrl) { return; }
+        _ctrl->decrementRefCount();
     }
     explicit operator bool() const {
-        return (_data != nullptr);
+        if (!_ctrl) { return false; }
+        return (_ctrl->data() != nullptr);
     }
     T& operator*() {
-        return *_data;
+        assert(_ctrl != nullptr);
+        return *_ctrl->data();
     }
     T* operator->() {
-        return _data;
+        if (!_ctrl) { return nullptr; }
+        return _ctrl->data();
     }
     const T& operator*() const {
-        return *((const T*)_data);
+        assert(_ctrl != nullptr);
+        return *((const T*)_ctrl->data());
     }
     const T* operator->() const {
-        return (const T*)_data;
+        assert(_ctrl != nullptr);
+        return (const T*)_ctrl->data();
     }
     template<typename F>
     auto withUnsafe(F f) {
-        return f(_data);
+        assert(_ctrl != nullptr);
+        return f(_ctrl->data());
     }
     template<typename F>
     auto withUnsafe(const F f) const {
-        return f(_data);
+        assert(_ctrl != nullptr);
+        return f(_ctrl->data());
     }
     friend void swap(SharedPtr& x, SharedPtr& y) {
         x.swap(y);
     }
     //TODO: Move this to opeator<=> once C++20 imp is more complete
     bool operator<(const SharedPtr& other) const {
-        return *_data < *other._data;
+        return *_ctrl->data() < *other._ctrl->data();
     }
 private:
     void swap(SharedPtr& other) {
         if (&other == this) { return; }
-        std::swap(_data, other._data);
+        std::swap(_ctrl, other._ctrl);
     }
     template<typename U>
     void swap(SharedPtr<U>& other) {
         auto tmp = (SharedPtr*)&other;
         if (tmp == this) { return; }
-        std::swap(_data, tmp->_data);
+        std::swap(_ctrl, tmp->_ctrl);
     }
     template<typename U> friend struct SharedPtr;
-    T*  _data = nullptr;
-};
-
-struct VIS_HIDDEN Allocator {
-    using Buffer = MemoryManager::Buffer;
-
-    static const uint64_t    kGranuleSize                    = (16);
-
-    // smart pointers
-    template< class T, class... Args >
-    NO_DEBUG UniquePtr<T> makeUnique(Args&&... args ) {
-        void* storage = aligned_alloc(alignof(T), sizeof(T));
-        return UniquePtr<T>(new (storage) T(std::forward<Args>(args)...));
-    }
-
-    template< class T, class... Args >
-    NO_DEBUG SharedPtr<T> makeShared(Args&&... args ) {
-        void* storage = aligned_alloc(alignof(T), sizeof(T));
-        return SharedPtr<T>(new (storage) T(std::forward<Args>(args)...));
-    }
-
-    // Simple interfaces
-    //   These present an interface similiar to normal malloc, and return managed pointers than can be used
-    //   with the SharedPtr and UniquePtr classes
-    void*                   malloc(uint64_t size);
-    void*                   aligned_alloc(uint64_t alignment, uint64_t size);
-    void                    free(void* ptr);
-    char*                   strdup(const char*);
-    virtual bool            owned(const void* p, uint64_t nbytes) const = 0;
-    virtual void            destroy() = 0;
-    virtual MemoryManager*  memoryManager() { return nullptr; }
-    static Allocator&       persistentAllocator(MemoryManager&& memoryManager);
-    static Allocator&       persistentAllocator();
-#if !BUILDING_DYLD
-    // Returns a shared persistent allocator
-    static Allocator&       defaultAllocator();
-#endif
-    static void* align(uint64_t alignment, uint64_t size, void*& ptr, uint64_t& space);
-#pragma mark Primitive methods to be provided by subclasses
-public:
-    virtual uint64_t      allocated_bytes() const = 0;
-    virtual uint64_t      vm_allocated_bytes() const = 0;
-    // For debugging
-    virtual void        validate() const {};
-    virtual void        debugDump() const {};
-protected:
-    template<typename T> friend struct UniquePtr;
-    template<typename T> friend struct Vector;
-    template<typename T, class C, bool M> friend struct BTree;
-    [[nodiscard]] virtual Buffer    allocate_buffer(uint64_t nbytes, uint64_t alignment, uint64_t prefix) = 0;
-    // Deallocates a buffer returned from allocate_bytes
-    virtual void                    deallocate_buffer(Buffer buffer) = 0;
-#pragma mark Common functions for subclasses
-    [[nodiscard]] Buffer            allocate_buffer(uint64_t nbytes, uint64_t alignment);
-    void                            deallocate_buffer(void* p, uint64_t nbytes, uint64_t alignment);
-    [[nodiscard]] static Buffer     vm_allocate_bytes(uint64_t size, int flags);
-    static void                     vm_deallocate_bytes(void* p, uint64_t size);
-    Allocator() = default;
-    static_assert(sizeof(AllocationMetadata) <= kGranuleSize, "Granule must be large enough to hold AllocationMetadata");
-    static_assert(alignof(AllocationMetadata) <= kGranuleSize, "AllocationMetadata must be naturally aligned ona granule");
-};
-
-struct __attribute__((aligned(16))) VIS_HIDDEN EphemeralAllocator : Allocator {
-                        EphemeralAllocator();
-                        EphemeralAllocator(MemoryManager&);
-                        EphemeralAllocator(void* buffer, uint64_t size);
-                        EphemeralAllocator(void* buffer, uint64_t size, MemoryManager&);
-                        EphemeralAllocator(const EphemeralAllocator& other);
-                        EphemeralAllocator(EphemeralAllocator&& other);
-                        ~EphemeralAllocator();
-    EphemeralAllocator& operator=(const EphemeralAllocator& other)          = delete;
-    EphemeralAllocator& operator=(EphemeralAllocator&& other);
-
-    uint64_t              allocated_bytes() const override;
-    uint64_t              vm_allocated_bytes() const override; // Only for testing, should be private but no way to make an ObjC friend
-    bool                owned(const void* p, uint64_t nbytes) const override;
-    void                destroy() override;
-    void                reset();
-    friend              void swap(EphemeralAllocator& x, EphemeralAllocator& y) {
-        x.swap(y);
-    }
-protected:
-    [[nodiscard]] Buffer    allocate_buffer(uint64_t nbytes, uint64_t alignment, uint64_t prefix) override;
-    void                    deallocate_buffer(Buffer buffer) override;
-private:
-    void                    swap(EphemeralAllocator& other);
-    struct RegionListEntry {
-        Buffer              buffer;
-        RegionListEntry     *next   = nullptr;
-        RegionListEntry(Buffer& B, RegionListEntry* N) : buffer(B), next(N) {}
-    };
-    MemoryManager*      _memoryManager  = nullptr;
-    Buffer              _freeBuffer     = { nullptr, 0 };
-    RegionListEntry*    _regionList     = nullptr;
-    uint64_t            _allocatedBytes = 0;
+    Ctrl*    _ctrl = nullptr;
 };
 
 } // namespace lsl
 
+#if DYLD_FEATURE_USE_INTERNAL_ALLOCATOR
+// We do this in a macro without creating a scope so we can have the stack allocated stroage
+// That forces us to do this all in a macro with variables exposed into the scope, so we prefix them
+
+static inline
+lsl::Allocator& __stackAllocatorInternal(void* storage, uint64_t count) {
+    lsl::MemoryManager::Buffer buffer{ storage, count };
+    if (!buffer.align(alignof(lsl::Allocator), sizeof(lsl::Allocator))) {
+        assert(0 && "Count not create aligned buffer");
+    }
+    void *allocatorAddress = buffer.address;
+    buffer.consumeSpace(sizeof(lsl::Allocator));
+
+    if (!buffer.align(alignof(lsl::Allocator::Pool), sizeof(lsl::Allocator::Pool))) {
+        assert(0 && "Count not create aligned buffer");
+    }
+    void *poolAddress = buffer.address;
+    buffer.consumeSpace(sizeof(lsl::Allocator::Pool));
+
+    if (!buffer.align(16, buffer.size-16)) {
+        assert(0 && "Count not create aligned buffer");
+    }
+
+    auto result = new (allocatorAddress) lsl::Allocator(lsl::MemoryManager::memoryManager());
+
+    // Disable TPRO on ephemeral allocators to avoid exhausting virtual address space
+    auto pool = new (poolAddress) lsl::Allocator::Pool(result, nullptr, buffer, buffer, false /* tproEnable */);
+    result->setInitialPool(*pool);
+    return *result;
+}
+
+#define STACK_ALLOCATOR(_name, _count)                                                                                                  \
+    uint64_t        __ ## _name ## _Size =  2 * (sizeof(lsl::Allocator::Pool) + alignof(lsl::Allocator::Pool)) + _count + 16            \
+                                            + alignof(lsl::Allocator) + sizeof(lsl::Allocator)                                          \
+                                            + alignof(lsl::Allocator::AllocationMetadata) + sizeof(lsl::Allocator::AllocationMetadata); \
+    void* __ ## _name ## _Storage = alloca(__ ## _name ## _Size);                                                                       \
+    auto& _name = __stackAllocatorInternal(__ ## _name ## _Storage, __ ## _name ## _Size);                                              \
+    lsl::AllocatorGuard __##_name##_gaurd(_name);
+#else
+#define STACK_ALLOCATOR(_name, _count) \
+    lsl::Allocator& _name = lsl::MemoryManager::defaultAllocator();
+#endif
 
 // These are should never be used. To prevent accidental usage, the prototypes exist, but using will cause a link error
 VIS_HIDDEN void* operator new(std::size_t count, lsl::Allocator* allocator);

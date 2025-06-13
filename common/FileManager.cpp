@@ -47,13 +47,15 @@ using lsl::OrderedMap;
 FileManager::FileManager(Allocator& allocator, const SyscallDelegate* syscall)
 : _syscall(syscall), _allocator(&allocator), _fsUUIDMap(_allocator->makeUnique<OrderedMap<uint64_t,UUID>>(*_allocator)) {}
 
+FileManager::FileManager(Allocator& allocator)
+    : _syscall(nullptr), _allocator(&allocator), _fsUUIDMap(_allocator->makeUnique<OrderedMap<uint64_t,UUID>>(*_allocator)) {}
+
 void FileManager::swap(FileManager& other) {
     using std::swap;
 
     std::swap(_allocator,   other._allocator);
     std::swap(_fsUUIDMap,   other._fsUUIDMap);
 }
-
 
 FileRecord FileManager::fileRecordForPath(Allocator& allocator, const char* filePath) {
     const char* str = nullptr;
@@ -95,6 +97,7 @@ void FileManager::reloadFSInfos() const {
     } __attribute__((aligned(4), packed));
     typedef struct VolAttrBuf VolAttrBuf;
 
+    STACK_ALLOCATOR(ephemeralAllocator, 0);
     while (1) {
         int fsCount = getfsstat(nullptr, 0, MNT_NOWAIT);
         if (fsCount == -1) {
@@ -102,10 +105,10 @@ void FileManager::reloadFSInfos() const {
             break;
         }
         int fsInfoSize = fsCount*sizeof(struct statfs);
-        auto fsInfos = (struct statfs *)_allocator->malloc(fsInfoSize);
+        auto fsInfos = (struct statfs *)ephemeralAllocator.malloc(fsInfoSize);
         if (this->getfsstat(fsInfos, fsInfoSize, MNT_NOWAIT) != fsCount) {
             // Retry
-            _allocator->free((void*)fsInfos);
+            ephemeralAllocator.free((void*)fsInfos);
             continue;
         }
         for (auto i = 0; i < fsCount; ++i) {
@@ -138,7 +141,7 @@ void FileManager::reloadFSInfos() const {
                 _fsUUIDMap->insert({f_fsid, UUID()});
             }
         }
-        _allocator->free((void*)fsInfos);
+        ephemeralAllocator.free((void*)fsInfos);
         break;
     }
 }
@@ -210,6 +213,7 @@ ssize_t FileManager::fsgetpath(char result[], size_t resultBufferSize, uint64_t 
 #if BUILDING_DYLD
     return _syscall->fsgetpath(result, resultBufferSize, fsID, objID);
 #else
+//    fsid_t      fsid  = *reinterpret_cast<fsid_t*>(&fsID);
     return _syscall->fsgetpath(result, resultBufferSize, fsID, objID);
 #endif
 }

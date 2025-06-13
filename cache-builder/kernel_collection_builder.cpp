@@ -34,6 +34,8 @@
 #include <string>
 #include <vector>
 
+using mach_o::Platform;
+
 static const uint64_t kMinBuildVersion = 1; //The minimum version BuildOptions struct we can support
 static const uint64_t kMaxBuildVersion = 1; //The maximum version BuildOptions struct we can support
 
@@ -79,7 +81,7 @@ struct KernelCollectionBuilder {
         va_list list;
         va_start(list, format);
         Diagnostics diag;
-        diag.error(format, list);
+        diag.error(format, va_list_wrap(list));
         va_end(list);
 
         errorStorage.push_back(diag.errorMessage());
@@ -160,7 +162,7 @@ static bool loadFileFromData(struct KernelCollectionBuilder* builder,
     dyld3::closure::FileSystemNull fileSystem;
     const dyld3::GradedArchs& arch = dyld3::GradedArchs::forName(builder->arch);
     auto loaded = dyld3::MachOAnalyzer::loadFromBuffer(diag, fileSystem, fileInfo.path, arch,
-                                                       dyld3::Platform::unknown, fileInfo);
+                                                       Platform(), fileInfo);
     if ( !loaded ) {
         builder->error("in %s: %s", fileInfo.path, diag.errorMessage().c_str());
         return false;
@@ -500,6 +502,43 @@ bool runKernelCollectionBuilder(struct KernelCollectionBuilder* builder) {
             return false;
     }
 
+    // Make sure we have an xnu binary, from this collection or an existing one
+    __block const dyld3::MachOAnalyzer* kernelMA = nullptr;
+    if ( builder->options.collectionKind == baseKC ) {
+        for (const AppCacheBuilder::InputDylib& input : builder->inputFiles) {
+            const dyld3::MachOAnalyzer* ma = (const dyld3::MachOAnalyzer*)input.dylib.loadedFileInfo.fileContent;
+
+            // Skip codeless kexts
+            if ( ma == nullptr )
+                continue;
+
+            if ( ma->isStaticExecutable() ) {
+                kernelMA = ma;
+            }
+        }
+        if ( !kernelMA ) {
+            builder->error("Cannot build bootKC without xnu binary");
+            return false;
+        }
+    } else {
+        // auxKC/pageableKC
+        Diagnostics diag;
+
+        const dyld3::MachOAppCache* kernelCacheMA = (const dyld3::MachOAppCache*)builder->kernelCollectionFileInfo.fileContent;
+        kernelCacheMA->forEachDylib(diag, ^(const dyld3::MachOAnalyzer *ma, const char *name, bool &stop) {
+            if ( ma->isStaticExecutable() ) {
+                kernelMA = ma;
+                stop = true;
+            }
+        });
+
+        if ( !kernelMA ) {
+            builder->error("Cannot build pageableKC/auxKC without xnu binary from bootKC");
+            return false;
+        }
+    }
+
+
     dispatch_apply(builder->inputFiles.size(), DISPATCH_APPLY_AUTO, ^(size_t index) {
         const AppCacheBuilder::InputDylib& input = builder->inputFiles[index];
         auto errorHandler = ^(const char* msg) {
@@ -511,7 +550,9 @@ bool runKernelCollectionBuilder(struct KernelCollectionBuilder* builder) {
             return;
         if (!ma->canBePlacedInKernelCollection(input.dylib.loadedFileInfo.path, errorHandler)) {
             assert(input.errors->hasError());
+            return;
         }
+
     });
     for (const AppCacheBuilder::InputDylib& input : builder->inputFiles) {
         if ( input.errors->hasError() ) {
@@ -526,7 +567,7 @@ bool runKernelCollectionBuilder(struct KernelCollectionBuilder* builder) {
     builderOptions.outputFilePath = runtimePath;
     builderOptions.outputMapFilePath = builderOptions.outputFilePath + ".json";
     builderOptions.archs = &dyld3::GradedArchs::forName(builder->arch);
-    builderOptions.platform = dyld3::Platform::unknown;
+    builderOptions.platform = Platform();
     builderOptions.localSymbolMode = DyldSharedCache::LocalSymbolsMode::keep;
     builderOptions.cacheConfiguration = kDyldSharedCacheTypeProduction;
     builderOptions.optimizeDyldDlopens = false;

@@ -25,7 +25,7 @@
 #ifndef mach_o_ObjC_h
 #define mach_o_ObjC_h
 
-#include "Defines.h"
+#include "MachODefines.h"
 
 namespace mach_o {
 
@@ -224,6 +224,55 @@ struct VIS_HIDDEN ObjCProtocolList
     // };
 };
 
+/*!
+ * @class ObjCProtocol
+ *
+ * @abstract
+ *      Class to encapsulate accessing (and one day building) objc protocols
+ */
+struct VIS_HIDDEN ObjCProtocol
+{
+    // Note a category looks like this to libobjc:
+    // template<typename PtrTy>
+    // struct protocol_t {
+    //     PtrTy       isaVMAddr;
+    //     PtrTy       nameVMAddr;
+    //     PtrTy       protocolsVMAddr;
+    //     PtrTy       instanceMethodsVMAddr;
+    //     PtrTy       classMethodsVMAddr;
+    //     PtrTy       optionalInstanceMethodsVMAddr;
+    //     PtrTy       optionalClassMethodsVMAddr;
+    //     PtrTy       instancePropertiesVMAddr;
+    //     uint32_t    size;
+    //     uint32_t    flags;
+    //     // Fields below this point are not always present on disk.
+    //     PtrTy       extendedMethodTypesVMAddr;
+    //     PtrTy       demangledNameVMAddr;
+    //     PtrTy       classPropertiesVMAddr;
+    // };
+
+    static constexpr uint32_t getOffsetToName(bool is64)
+    {
+        return is64 ? 0x8 : 0x4;
+    }
+    static constexpr uint32_t getOffsetToInstanceMethods(bool is64)
+    {
+        return is64 ? 0x18 : 0xC;
+    }
+    static constexpr uint32_t getOffsetToClassMethods(bool is64)
+    {
+        return is64 ? 0x20 : 0x10;
+    }
+    static constexpr uint32_t getOffsetToOptionalInstanceMethods(bool is64)
+    {
+        return is64 ? 0x28 : 0x14;
+    }
+    static constexpr uint32_t getOffsetToOptionalClassMethods(bool is64)
+    {
+        return is64 ? 0x30 : 0x18;
+    }
+};
+
 struct VIS_HIDDEN ObjCPropertyList
 {
     //
@@ -237,6 +286,24 @@ struct VIS_HIDDEN ObjCPropertyList
     // The list stores the size of each element:
     uint32_t getPropertySize() const;
     uint32_t getPropertyCount() const;
+};
+
+/*!
+ * @class ObjCImageInfo
+ *
+ * @abstract
+ *      Class to encapsulate accessing (and one day building) objc image info
+ */
+struct VIS_HIDDEN ObjCImageInfo
+{
+    // struct objc_image_info  {
+    //     uint32_t    version;
+    //     uint32_t    flags;
+    // };
+
+    // FIXME: Get all the other values and perhaps make these an enum
+    static constexpr uint64_t OBJC_IMAGE_SIGNED_CLASS_RO               = (1<<4);
+    static constexpr uint64_t OBJC_IMAGE_HAS_CATEGORY_CLASS_PROPERTIES = (1<<6);
 };
 
 } // namespace mach_o

@@ -29,6 +29,7 @@
 #include "Chunk.h"
 #include "MachOFile.h"
 #include "Optimizers.h"
+#include "Platform.h"
 #include "Types.h"
 
 #include <uuid/uuid.h>
@@ -48,13 +49,21 @@ struct Region
         // Rosetta expects __DATA_CONST after __TEXT, as we currently sort using this enum
         dataConst,
 
+        // Put TPRO const before data as we want it to be adjacent to the DATA_DIRTY which it at the start of data
+        tproConst,
+
         data,
+
+        // Put TPRO auth const before auth as we want it to be adjacent to the DATA_DIRTY which it at the start of auth
+        tproAuthConst,
+
         auth,
 
         // FIXME: Move this to be after DATA_CONST to reduce page tables
         // Needs rdar://96315050
         authConst,
 
+        readOnly,
         linkedit,
         unmapped,
         dynamicConfig,
@@ -73,16 +82,18 @@ struct Region
 
     bool needsRegionPadding(const Region& next) const;
 
-    Kind                                kind;
+    Kind                                    kind;
 
     // The chunks from dylibs, optimzations, etc, which make up this Region
-    std::vector<Chunk*>                 chunks;
+    std::vector<Chunk*>                     chunks;
 
-    CacheFileOffset                     subCacheFileOffset;
-    CacheFileSize                       subCacheFileSize;
-    CacheVMAddress                      subCacheVMAddress;
-    CacheVMSize                         subCacheVMSize;
-    uint8_t*                            subCacheBuffer = nullptr;
+    std::list<AlignChunk>                   alignmentChunks;
+
+    CacheFileOffset                         subCacheFileOffset;
+    CacheFileSize                           subCacheFileSize;
+    CacheVMAddress                          subCacheVMAddress;
+    CacheVMSize                             subCacheVMSize;
+    uint8_t*                                subCacheBuffer = nullptr;
 };
 
 struct SubCache
@@ -120,35 +131,38 @@ public:
     static SubCache makeSymbolsCache();
 
     // These methods are called by computeSubCaches() to add Chunk's to the subCache
-    void addDylib(CacheDylib& cacheDylib, bool addLinkedit);
+    void addDylib(const BuilderConfig& config, CacheDylib& cacheDylib);
     void addLinkeditFromDylib(CacheDylib& cacheDylib);
-    void addCacheHeaderChunk(const std::span<CacheDylib> cacheDylibs);
+    void addCacheHeaderChunk(const BuilderConfig& config, const std::span<CacheDylib> cacheDylibs);
     void addObjCHeaderInfoReadWriteChunk(const BuilderConfig& config, ObjCOptimizer& objcOptimizer);
     void addCodeSignatureChunk();
-    void addObjCOptsHeaderChunk(ObjCOptimizer& objcOptimizer);
-    void addObjCHeaderInfoReadOnlyChunk(ObjCOptimizer& objcOptimizer);
-    void addObjCImageInfoChunk(ObjCOptimizer& objcOptimizer);
-    void addObjCSelectorStringsChunk(ObjCSelectorOptimizer& objCSelectorOptimizer);
-    void addObjCSelectorHashTableChunk(ObjCSelectorOptimizer& objCSelectorOptimizer);
-    void addObjCClassNameStringsChunk(ObjCClassOptimizer& objcClassOptimizer);
-    void addObjCClassHashTableChunk(ObjCClassOptimizer& objcClassOptimizer);
-    void addObjCProtocolNameStringsChunk(ObjCProtocolOptimizer& objcProtocolOptimizer);
-    void addObjCProtocolHashTableChunk(ObjCProtocolOptimizer& objcProtocolOptimizer);
-    void addObjCProtocolSwiftDemangledNamesChunk(ObjCProtocolOptimizer& objcProtocolOptimizer);
+    void addObjCOptsHeaderChunk(const BuilderConfig& config, ObjCOptimizer& objcOptimizer);
+    void addObjCHeaderInfoReadOnlyChunk(const BuilderConfig& config, ObjCOptimizer& objcOptimizer);
+    void addObjCImageInfoChunk(const BuilderConfig& config, ObjCOptimizer& objcOptimizer);
+    void addObjCSelectorStringsChunk(const BuilderConfig& config, ObjCSelectorOptimizer& objCSelectorOptimizer);
+    void addObjCSelectorHashTableChunk(const BuilderConfig& config, ObjCSelectorOptimizer& objCSelectorOptimizer);
+    void addObjCClassNameStringsChunk(const BuilderConfig& config, ObjCClassOptimizer& objcClassOptimizer);
+    void addObjCClassHashTableChunk(const BuilderConfig& config, ObjCClassOptimizer& objcClassOptimizer);
+    void addObjCProtocolNameStringsChunk(const BuilderConfig& config, ObjCProtocolOptimizer& objcProtocolOptimizer);
+    void addObjCProtocolHashTableChunk(const BuilderConfig& config, ObjCProtocolOptimizer& objcProtocolOptimizer);
+    void addObjCProtocolSwiftDemangledNamesChunk(const BuilderConfig& config, ObjCProtocolOptimizer& objcProtocolOptimizer);
     void addObjCCanonicalProtocolsChunk(const BuilderConfig& config,
                                         ObjCProtocolOptimizer& objcProtocolOptimizer);
     void addObjCCategoriesChunk(const BuilderConfig& config,
                                 ObjCCategoryOptimizer& objcCategoryOptimizer);
-    void addObjCIMPCachesChunk(ObjCIMPCachesOptimizer& objcIMPCachesOptimizer);
+    void addObjCIMPCachesChunk(const BuilderConfig& config, ObjCIMPCachesOptimizer& objcIMPCachesOptimizer);
     void addCacheTrieChunk(DylibTrieOptimizer& dylibTrieOptimizer);
     void addPatchTableChunk(PatchTableOptimizer& patchTableOptimizer);
+    void addFunctionVariantsChunk(FunctionVariantsOptimizer& optimizer);
     void addCacheDylibsLoaderChunk(PrebuiltLoaderBuilder& builder);
     void addExecutableLoaderChunk(PrebuiltLoaderBuilder& builder);
     void addExecutablesTrieChunk(PrebuiltLoaderBuilder& builder);
-    void addSwiftOptsHeaderChunk(SwiftProtocolConformanceOptimizer& opt);
-    void addSwiftTypeHashTableChunk(SwiftProtocolConformanceOptimizer& opt);
-    void addSwiftMetadataHashTableChunk(SwiftProtocolConformanceOptimizer& opt);
-    void addSwiftForeignHashTableChunk(SwiftProtocolConformanceOptimizer& opt);
+    void addSwiftOptsHeaderChunk(const BuilderConfig& config, SwiftOptimizer& opt);
+    void addSwiftTypeHashTableChunk(const BuilderConfig& config, SwiftOptimizer& opt);
+    void addSwiftMetadataHashTableChunk(const BuilderConfig& config, SwiftOptimizer& opt);
+    void addSwiftForeignHashTableChunk(const BuilderConfig& config, SwiftOptimizer& opt);
+    void addSwiftPrespecializedMetadataPointerTableChunks(const BuilderConfig& config, SwiftOptimizer& opt);
+    void addPrewarmingDataChunk(const BuilderConfig& config, PrewarmingOptimizer& opt);
     void addUnmappedSymbols(const BuilderConfig& config, UnmappedSymbolsOptimizer& opt);
     void addDynamicConfigChunk();
     void addSlideInfoChunks();
@@ -156,7 +170,7 @@ public:
 
     // When "kind == sub", sets the suffix on this subCache
     // This has to be done after creating things like stubs sub caches, which might move the indices
-    void setSuffix(dyld3::Platform platform, bool forceDevelopmentSubCacheSuffix,
+    void setSuffix(mach_o::Platform platform, bool forceDevelopmentSubCacheSuffix,
                    size_t subCacheIndex);
 
     void setCodeSignatureSize(const BuilderOptions& options, const BuilderConfig& config,
@@ -177,9 +191,11 @@ public:
                                 CacheVMAddress dyldInCacheEntryUnslidAddr,
                                 const DylibTrieOptimizer& dylibTrieOptimizer,
                                 const ObjCOptimizer& objcOpt,
-                                const SwiftProtocolConformanceOptimizer& swiftProtocolConformanceOpt,
+                                const SwiftOptimizer& swiftOpt,
                                 const PatchTableOptimizer& patchTableOptimizer,
-                                const PrebuiltLoaderBuilder& prebuiltLoaderBuilder);
+                                const FunctionVariantsOptimizer& functionVariantOptimizer,
+                                const PrebuiltLoaderBuilder& prebuiltLoaderBuilder,
+                                const PrewarmingOptimizer& prewarmingOptimizer);
 
     // Adds any additional fields which are set only on the .symbols subCache
     void addSymbolsCacheHeaderInfo(const UnmappedSymbolsOptimizer& unmappedSymbolsOptimizer);
@@ -199,6 +215,10 @@ public:
 
     bool shouldKeepCache(bool keepDevelopmentCaches, bool keepCustomerCaches) const;
 
+    // Note this is for x86_64 only, and works out where the TPRO "regions" are inside the DATA region
+    static void     forEachTPRORegionInData(SubCache* mainSubCache, std::span<SubCache*> subCaches,
+                                            void (^callback)(Region& region, const Chunk* firstChunk, const Chunk* lastChunk));
+
 #if BUILDING_CACHE_BUILDER_UNIT_TESTS
     // We need everything public to write tests
 public:
@@ -209,14 +229,14 @@ private:
     // Adds the given chunk to the given region
     void addTextChunk(Chunk* chunk);
     void addDataChunk(Chunk* chunk);
+    void addTPROConstChunk(const BuilderConfig& config, Chunk* chunk);
     void addDataConstChunk(Chunk* chunk);
     void addAuthChunk(Chunk* chunk);
     void addAuthConstChunk(Chunk* chunk);
+    void addReadOnlyChunk(const BuilderConfig& config, Chunk* chunk);
     void addLinkeditChunk(Chunk* chunk);
     void addUnmappedChunk(Chunk* chunk);
     void addCodeSignatureChunk(Chunk* chunk);
-    void addObjCTextChunk(Chunk* chunk);
-    void addObjCReadOnlyChunk(Chunk* chunk);
     void addObjCReadWriteChunk(const BuilderConfig& config, Chunk* chunk);
 
     // Returns true if the cache header on this subCache needs an image list
@@ -225,6 +245,7 @@ private:
 
     // Add image info to the subCache header, if it needs it
     void addCacheHeaderImageInfo(const BuilderOptions& options,
+                                 const BuilderConfig& config,
                                  const std::span<CacheDylib> cacheDylibs);
 
     static uint64_t getCacheType(const BuilderOptions& options);
@@ -268,8 +289,10 @@ public:
 
     // Some Chunk instances are owned by the SubCache.  Eg, it owns its own header
     std::unique_ptr<CacheHeaderChunk>                           cacheHeader;
+    std::unique_ptr<SlideInfoChunk>                             tproConstSlideInfo;
     std::unique_ptr<SlideInfoChunk>                             dataSlideInfo;
     std::unique_ptr<SlideInfoChunk>                             dataConstSlideInfo;
+    std::unique_ptr<SlideInfoChunk>                             tproAuthConstSlideInfo;
     std::unique_ptr<SlideInfoChunk>                             authSlideInfo;
     std::unique_ptr<SlideInfoChunk>                             authConstSlideInfo;
     std::unique_ptr<CodeSignatureChunk>                         codeSignature;
@@ -293,6 +316,7 @@ public:
     std::unique_ptr<SwiftProtocolConformancesHashTableChunk>    swiftForeignTypeHashTable;
     std::unique_ptr<CacheTrieChunk>                             cacheDylibsTrie;
     std::unique_ptr<PatchTableChunk>                            patchTable;
+    std::unique_ptr<FunctionVariantsPatchTableChunk>            functionVariants;
     std::unique_ptr<DynamicConfigChunk>                         dynamicConfig;
     std::unique_ptr<PrebuiltLoaderChunk>                        cacheDylibsLoaders;
     std::unique_ptr<PrebuiltLoaderChunk>                        executableLoaders;
@@ -300,6 +324,9 @@ public:
     std::unique_ptr<SymbolStringsChunk>                         optimizedSymbolStrings;
     std::unique_ptr<UniquedGOTsChunk>                           uniquedGOTs;
     std::unique_ptr<UniquedGOTsChunk>                           uniquedAuthGOTs;
+    std::unique_ptr<UniquedGOTsChunk>                           uniquedAuthPtrs;
+    std::vector<std::unique_ptr<PointerHashTableChunk>>         pointerHashTables;
+    std::unique_ptr<PrewarmingChunk>                            prewarmingChunk;
 
     // Each subCache has its own Linkedit so needs its own optimizer
     SymbolStringsOptimizer                                      symbolStringsOptimizer;

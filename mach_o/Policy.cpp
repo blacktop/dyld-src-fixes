@@ -21,12 +21,13 @@
  * @APPLE_LICENSE_HEADER_END@
  */
 
-#include "Defines.h"
 #include "Error.h"
 #include "Platform.h"
 #include "Architecture.h"
 #include "Version32.h"
 #include "Policy.h"
+#include <mach-o/fixup-chains.h>
+#include <mach-o/loader.h>
 
 
 namespace mach_o {
@@ -36,17 +37,24 @@ namespace mach_o {
 // MARK: --- Policy methods ---
 //
 
-Policy::Policy(Architecture arch, PlatformAndVersions pvs, uint32_t filetype, bool pathMayBeInSharedCache)
+Policy::Policy(Architecture arch, PlatformAndVersions pvs, uint32_t filetype, bool pathMayBeInSharedCache, bool kernel, bool staticExec)
  : _featureEpoch(pvs.platform.epoch(pvs.minOS)), _enforcementEpoch(pvs.platform.epoch(pvs.sdk)),
-   _arch(arch), _pvs(pvs), _filetype(filetype), _pathMayBeInSharedCache(pathMayBeInSharedCache)
+   _arch(arch), _pvs(pvs), _filetype(filetype), _pathMayBeInSharedCache(pathMayBeInSharedCache), _kernel(kernel), _staticExec(staticExec)
 {
 }
 
 bool Policy::dyldLoadsOutput() const
 {
+    if ( _kernel )
+        return false;
+
+    if ( _staticExec )
+        return false;
+
     switch (_filetype) {
         case MH_EXECUTE:
         case MH_DYLIB:
+        case MH_DYLIB_STUB:
         case MH_BUNDLE:
         case MH_DYLINKER:
             return true;
@@ -54,17 +62,38 @@ bool Policy::dyldLoadsOutput() const
     return false;
 }
 
+bool Policy::kernelOrKext() const
+{
+    if ( _kernel )
+        return true;
+    return _filetype == MH_KEXT_BUNDLE;
+}
 
 // features
 Policy::Usage Policy::useBuildVersionLoadCommand() const
 {
     if ( _pvs.platform == Platform::bridgeOS )
         return Policy::mustUse;
+
+    // all arm64 variants are new and use LC_BUILD_VERSION
+    if ( _arch == Architecture::arm64 ) {
+        // except for pre-12.0 iOS and tvOS devices
+        if ( ((_pvs.platform == Platform::iOS) || (_pvs.platform == Platform::tvOS)) && (_featureEpoch < Platform::Epoch::fall2018) )
+            return Policy::mustNotUse;
+        return Policy::mustUse;
+    }
+
     return (_featureEpoch >= Platform::Epoch::fall2018) ? Policy::preferUse : Policy::mustNotUse;
 }
 
 Policy::Usage Policy::useDataConst() const
 {
+    if ( !dyldLoadsOutput() )
+        return Policy::preferDontUse;
+
+    if ( _pvs.platform == Platform::firmware )
+        return Policy::preferDontUse;
+
     return (_featureEpoch >= Platform::Epoch::fall2019) ? Policy::preferUse : Policy::mustNotUse;
 }
 
@@ -78,10 +107,21 @@ Policy::Usage Policy::useGOTforClassRefs() const
     return (_featureEpoch >= Platform::Epoch::fall2024) ? Policy::preferUse : Policy::mustNotUse;
 }
 
+Policy::Usage Policy::useConstInterpose() const
+{
+    if ( !dyldLoadsOutput() )
+        return Policy::preferDontUse;
+
+    return (_featureEpoch >= Platform::Epoch::fall2024) ? Policy::preferUse : Policy::mustNotUse;
+}
 
 Policy::Usage Policy::useChainedFixups() const
 {
-    // fixups are for userland binaries
+    // arm64e kernel/kext use chained fixups
+    if ( kernelOrKext() && _arch.usesArm64AuthPointers() )
+        return Policy::mustUse;
+
+    // firmware may use chained fixups, but has to opt-in
     if ( !dyldLoadsOutput() )
         return Policy::preferDontUse;
 
@@ -92,6 +132,9 @@ Policy::Usage Policy::useChainedFixups() const
 
     // in general Fall2020 OSs supported chained fixups
     Platform::Epoch chainedFixupsEpoch = Platform::Epoch::fall2020;
+
+    if ( _pvs.platform == Platform::iOS ) // chained fixups on iOS since 13.4
+        chainedFixupsEpoch = Platform::Epoch::spring2020;
 
     // simulators support is later than OS support
     if ( _pvs.platform.isSimulator() )
@@ -105,6 +148,11 @@ Policy::Usage Policy::useChainedFixups() const
         if ( _arch.usesx86_64Instructions() && (_filetype == MH_EXECUTE) ) {
             chainedFixupsEpoch = Platform::Epoch::fall2022;
         }
+
+        // builders run on x86, for arm64e we allow chained fixups on 11.0 for the software update stack
+        // rdar://118859281 (arm64e: Libraries need support for 11.0 deployment targets)
+        if ( _arch.usesArm64AuthPointers() )
+            chainedFixupsEpoch = Platform::Epoch::fall2020;
     }
 
     // use chained fixups for newer OS releases
@@ -112,6 +160,32 @@ Policy::Usage Policy::useChainedFixups() const
         return Policy::preferUse;
 
     return Policy::mustNotUse;
+}
+
+uint16_t Policy::chainedFixupsFormat() const
+{
+    if ( _arch.usesArm64AuthPointers() ) {
+        if ( !dyldLoadsOutput() )
+            return DYLD_CHAINED_PTR_ARM64E_KERNEL;
+
+        // 24-bit binds supported since iOS 15.0 and aligned releases
+        if ( _featureEpoch >= Platform::Epoch::fall2021 )
+            return DYLD_CHAINED_PTR_ARM64E_USERLAND24;
+
+        return DYLD_CHAINED_PTR_ARM64E;
+    } else if ( _arch.is64() ) {
+        if ( !dyldLoadsOutput() )
+            return DYLD_CHAINED_PTR_64_OFFSET;
+
+        if ( _featureEpoch >= Platform::Epoch::fall2021 )
+            return DYLD_CHAINED_PTR_64_OFFSET;
+
+        return DYLD_CHAINED_PTR_64;
+    } else {
+        if ( dyldLoadsOutput() )
+            return DYLD_CHAINED_PTR_32;
+        return DYLD_CHAINED_PTR_32_FIRMWARE;
+    }
 }
 
 Policy::Usage Policy::useOpcodeFixups() const
@@ -150,6 +224,28 @@ Policy::Usage Policy::useRelativeMethodLists() const
     return Policy::mustNotUse;
 }
 
+Policy::Usage Policy::optimizeClassPatching() const
+{
+    if ( _filetype != MH_DYLIB )
+        return Policy::mustNotUse;
+
+    if ( _featureEpoch >= Platform::Epoch::fall2022 )
+        return Policy::preferUse;
+
+    return Policy::mustNotUse;
+}
+
+Policy::Usage Policy::optimizeSingletonPatching() const
+{
+    if ( _filetype != MH_DYLIB )
+        return Policy::mustNotUse;
+
+    if ( _featureEpoch >= Platform::Epoch::fall2022 )
+        return Policy::preferUse;
+
+    return Policy::mustNotUse;
+}
+
 Policy::Usage Policy::useAuthStubsInKexts() const
 {
     if ( _arch.usesArm64AuthPointers() && (_filetype == MH_KEXT_BUNDLE) && (_featureEpoch >= Platform::Epoch::fall2021) )
@@ -172,11 +268,16 @@ Policy::Usage Policy::useDataConstForSelRefs() const
 
 Policy::Usage Policy::useSourceVersionLoadCommand() const
 {
-    // Only userland uses LC_SOURCE_VERSION
-    if ( !dyldLoadsOutput() )
-        return Policy::preferDontUse;
+    // objects/firmware don't use LC_SOURCE_VERSION
+    switch (_filetype) {
+        case MH_OBJECT:
+        case MH_PRELOAD:
+            return Policy::preferDontUse;
+        default:
+            break;
+    }
 
-    if ( _featureEpoch >= Platform::Epoch::fall2015 )
+    if ( _featureEpoch >= Platform::Epoch::fall2012 )
         return Policy::preferUse;
 
     return Policy::preferDontUse;
@@ -197,7 +298,7 @@ Policy::Usage Policy::useLegacyLinkedit() const
 
 bool Policy::use4KBLoadCommandsPadding() const
 {
-    if ( _filetype == MH_DYLIB && _pathMayBeInSharedCache )
+    if ( (_filetype == MH_DYLIB || _filetype == MH_DYLIB_STUB) && _pathMayBeInSharedCache )
         return true;
     return false;
 }
@@ -208,6 +309,10 @@ bool Policy::canUseDelayInit() const
     return ( _featureEpoch >= Platform::Epoch::fall2024 );
 }
 
+bool Policy::useProtectedStack() const
+{
+    return false;
+}
 
 // enforcements
 bool Policy::enforceReadOnlyLinkedit() const
@@ -252,7 +357,7 @@ bool Policy::enforceSectionsInSegment() const
 
 bool Policy::enforceHasLinkedDylibs() const
 {
-    return (_enforcementEpoch >= Platform::Epoch::fall2021);
+    return (_enforcementEpoch >= Platform::Epoch::spring2025);
 }
 
 bool Policy::enforceInstallNamesAreRealPaths() const
@@ -277,15 +382,32 @@ bool Policy::enforceNoDuplicateDylibs() const
 
 bool Policy::enforceNoDuplicateRPaths() const
 {
-    return (_enforcementEpoch >= Platform::Epoch::fall2024);
+    return (_enforcementEpoch >= Platform::Epoch::spring2025);
 }
 
 bool Policy::enforceDataSegmentPermissions() const
 {
+    return (_enforcementEpoch >= Platform::Epoch::fall2025);
+}
+
+bool Policy::enforceDataConstSegmentPermissions() const
+{
     // dylibs in shared region don't set SG_READ_ONLY because of __objc_const
     if ( _pathMayBeInSharedCache )
         return false;
-    return (_enforcementEpoch >= Platform::Epoch::fall2023);
+    return (_enforcementEpoch >= Platform::Epoch::spring2025);
+}
+
+bool Policy::enforceImageListRemoveMainExecutable() const
+{
+    // Old simulators add the main executable to all_image_info in the simulator process, not in the host
+    return (_enforcementEpoch <= Platform::Epoch::fall2022);
+}
+
+bool Policy::enforceSetSimulatorSharedCachePath() const
+{
+    // Old simulators do not correctly fill out the private cache fields in the all_image_info, so do it for them
+    return (_enforcementEpoch <= Platform::Epoch::fall2021);
 }
 
 

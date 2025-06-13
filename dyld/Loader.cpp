@@ -34,20 +34,34 @@
 #include <assert.h>
 #include <mach-o/nlist.h>
 
-#include "Defines.h"
+// mach_o
+#include "FunctionVariants.h"
+#include "Image.h"
+#include "Header.h"
+#include "Platform.h"
+#include "ChainedFixups.h"
+
+// common
+#include "StringUtils.h"
 #include "MachOAnalyzer.h"
+#include "Defines.h"
+#include "Utilities.h"
+
+// dyld
 #include "Loader.h"
 #include "JustInTimeLoader.h"
 #include "PrebuiltLoader.h"
 #include "PremappedLoader.h"
 #include "DyldRuntimeState.h"
 #include "DyldProcessConfig.h"
-#include "StringUtils.h"
+#include "Tracing.h"
 #if BUILDING_DYLD && SUPPORT_ROSETTA
   #include "RosettaSupport.h"
 #endif
-#include "Tracing.h"
-#include "Utils.h"
+
+#if TARGET_OS_EXCLAVEKIT
+  #include <liblibc/plat/dyld/exclaves_dyld.h>
+#endif
 
 #ifndef VM_PROT_TPRO
 #define VM_PROT_TPRO 0x200
@@ -87,17 +101,18 @@
 #endif
 #endif // !TARGET_OS_EXCLAVEKIT
 
-extern struct mach_header __dso_handle;
 
-// If a root is used that overrides a dylib in the dyld cache, dyld patches all uses of the dylib in the cache
-// to point to the new dylib.  But if that dylib is missing some symbol, dyld will patch other clients to point
-// to BAD_ROOT_ADDRESS instead.  That will cause a crash and the crash will be easy to identify in crash logs.
-#define BAD_ROOT_ADDRESS 0xbad4007
+extern struct mach_header __dso_handle;
 
 
 using dyld3::MachOAnalyzer;
 using dyld3::MachOFile;
-using dyld3::Platform;
+using mach_o::FunctionVariants;
+using mach_o::FunctionVariantsRuntimeTable;
+using mach_o::Image;
+using mach_o::Header;
+using mach_o::Platform;
+using mach_o::ChainedFixups;
 
 namespace dyld4 {
 
@@ -110,6 +125,9 @@ Loader::InitialOptions::InitialOptions()
     , leaveMapped(false)
     , roObjC(false)
     , pre2022Binary(false)
+    , hasUUID(false)
+    , hasWeakDefs(false)
+    , belowLibSystem(false)
 {
 }
 
@@ -122,26 +140,47 @@ Loader::InitialOptions::InitialOptions(const Loader& other)
     , leaveMapped(other.leaveMapped)
     , roObjC(other.hasReadOnlyObjC)
     , pre2022Binary(other.pre2022Binary)
+    , hasUUID(other.hasUUIDLoadCommand)
+    , hasWeakDefs(other.hasWeakDefs)
+    , hasTLVs(other.hasTLVs)
+    , belowLibSystem(other.belowLibSystem)
+    , hasFuncVarFixups(other.hasFuncVarFixups)
 {
 }
 
-const char* Loader::path() const
+const char* Loader::path(const RuntimeState& state) const
 {
     assert(this->magic == kMagic);
 #if SUPPORT_CREATING_PREMAPPEDLOADERS
     assert(this->isPremapped);
-    return ((PremappedLoader*)this)->path();
+    return ((PremappedLoader*)this)->path(state);
 #else
 #if SUPPORT_PREBUILTLOADERS
     if ( this->isPrebuilt )
-        return ((PrebuiltLoader*)this)->path();
+        return ((PrebuiltLoader*)this)->path(state);
     else
 #endif // SUPPORT_PREBUILTLOADERS
-        return ((JustInTimeLoader*)this)->path();
+        return ((JustInTimeLoader*)this)->path(state);
 #endif // SUPPORT_CREATING_PREMAPPEDLOADERS
 }
 
-const MachOFile* Loader::mf(RuntimeState& state) const
+const char* Loader::installName(const RuntimeState& state) const
+{
+    assert(this->magic == kMagic);
+#if SUPPORT_CREATING_PREMAPPEDLOADERS
+    assert(this->isPremapped);
+    return ((PremappedLoader*)this)->installName(state);
+#else
+#if SUPPORT_PREBUILTLOADERS
+    if ( this->isPrebuilt )
+        return ((PrebuiltLoader*)this)->installName(state);
+    else
+#endif // SUPPORT_PREBUILTLOADERS
+        return ((JustInTimeLoader*)this)->installName(state);
+#endif // SUPPORT_CREATING_PREMAPPEDLOADERS
+}
+
+const MachOFile* Loader::mf(const RuntimeState& state) const
 {
     assert(this->magic == kMagic);
 #if SUPPORT_CREATING_PREMAPPEDLOADERS
@@ -158,7 +197,7 @@ const MachOFile* Loader::mf(RuntimeState& state) const
 }
 
 #if SUPPORT_VM_LAYOUT
-const MachOLoaded* Loader::loadAddress(RuntimeState& state) const
+const MachOLoaded* Loader::loadAddress(const RuntimeState& state) const
 {
     assert(this->magic == kMagic);
 #if SUPPORT_CREATING_PREMAPPEDLOADERS
@@ -193,19 +232,19 @@ bool Loader::contains(RuntimeState& state, const void* addr, const void** segAdd
 }
 #endif
 
-bool Loader::matchesPath(const char* path) const
+bool Loader::matchesPath(const RuntimeState& state, const char* path) const
 {
     assert(this->magic == kMagic);
 #if SUPPORT_CREATING_PREMAPPEDLOADERS
     assert(this->isPremapped);
-    return ((PremappedLoader*)this)->matchesPath(path);
+    return ((PremappedLoader*)this)->matchesPath(state, path);
 #else
 #if SUPPORT_PREBUILTLOADERS
     if ( this->isPrebuilt )
-        return ((PrebuiltLoader*)this)->matchesPath(path);
+        return ((PrebuiltLoader*)this)->matchesPath(state, path);
     else
 #endif // SUPPORT_PREBUILTLOADERS
-        return ((JustInTimeLoader*)this)->matchesPath(path);
+        return ((JustInTimeLoader*)this)->matchesPath(state, path);
 #endif // SUPPORT_CREATING_PREMAPPEDLOADERS
 }
 
@@ -238,7 +277,7 @@ uint32_t Loader::dependentCount() const
 #endif // SUPPORT_CREATING_PREMAPPEDLOADERS
 }
 
-Loader* Loader::dependent(const RuntimeState& state, uint32_t depIndex, DependentDylibAttributes* depAttr) const
+Loader* Loader::dependent(const RuntimeState& state, uint32_t depIndex, LinkedDylibAttributes* depAttr) const
 {
     assert(this->magic == kMagic);
 #if SUPPORT_CREATING_PREMAPPEDLOADERS
@@ -302,7 +341,6 @@ bool Loader::hiddenFromFlat(bool forceGlobal) const
 #endif // SUPPORT_CREATING_PREMAPPEDLOADERS
 }
 
-#if !SUPPORT_CREATING_PREMAPPEDLOADERS
 bool Loader::representsCachedDylibIndex(uint16_t dylibIndex) const
 {
     assert(this->magic == kMagic);
@@ -325,27 +363,26 @@ bool Loader::overridesDylibInCache(const DylibPatch*& patchTable, uint16_t& cach
         return ((JustInTimeLoader*)this)->overridesDylibInCache(patchTable, cacheDylibOverriddenIndex);
 }
 
-#endif // !SUPPORT_CREATING_PREMAPPEDLOADERS
-
 #if BUILDING_DYLD || BUILDING_UNIT_TESTS
-void Loader::applyFixups(Diagnostics& diag, RuntimeState& state, DyldCacheDataConstLazyScopedWriter& dataConst, bool allowLazyBinds) const
+void Loader::applyFixups(Diagnostics& diag, RuntimeState& state, DyldCacheDataConstLazyScopedWriter& dataConst, bool allowLazyBinds,
+                         lsl::Vector<PseudoDylibSymbolToMaterialize>* materializingSymbols) const
 {
     assert(this->magic == kMagic);
 #if SUPPORT_CREATING_PREMAPPEDLOADERS
     assert(this->isPremapped);
-    ((PremappedLoader*)this)->applyFixups(diag, state, dataConst, allowLazyBinds);
+    ((PremappedLoader*)this)->applyFixups(diag, state, dataConst, allowLazyBinds, materializingSymbols);
 #else
 #if SUPPORT_PREBUILTLOADERS
     if ( this->isPrebuilt )
-        ((PrebuiltLoader*)this)->applyFixups(diag, state, dataConst, allowLazyBinds);
+        ((PrebuiltLoader*)this)->applyFixups(diag, state, dataConst, allowLazyBinds, materializingSymbols);
     else
 #endif // SUPPORT_PREBUILTLOADERS
-        ((JustInTimeLoader*)this)->applyFixups(diag, state, dataConst, allowLazyBinds);
+        ((JustInTimeLoader*)this)->applyFixups(diag, state, dataConst, allowLazyBinds, materializingSymbols);
 #endif // SUPPORT_CREATING_PREMAPPEDLOADERS
 }
 #endif // BUILDING_DYLD || BUILDING_UNIT_TESTS
 
-void Loader::withLayout(Diagnostics &diag, RuntimeState& state, void (^callback)(const mach_o::Layout &layout)) const
+void Loader::withLayout(Diagnostics &diag, const RuntimeState& state, void (^callback)(const mach_o::Layout &layout)) const
 {
     assert(this->magic == kMagic);
 #if SUPPORT_CREATING_PREMAPPEDLOADERS
@@ -504,15 +541,20 @@ const char* Loader::leafName(const char* path)
         return path;
 }
 
-const char* Loader::leafName() const
+const char* Loader::leafName(const RuntimeState& state) const
 {
-    return leafName(path());
+    return leafName(path(state));
 }
 
 #if SUPPORT_VM_LAYOUT
-const MachOAnalyzer* Loader::analyzer(RuntimeState& state) const
+const MachOAnalyzer* Loader::analyzer(const RuntimeState& state) const
 {
     return (MachOAnalyzer*)loadAddress(state);
+}
+
+const mach_o::Header* Loader::header(const RuntimeState& state) const
+{
+    return (mach_o::Header*)loadAddress(state);
 }
 #endif
 
@@ -536,7 +578,7 @@ void Loader::appendHexByte(uint8_t value, char*& p)
     appendHexNibble(value & 0x0F, p);
 }
 
-void Loader::uuidToStr(uuid_t uuid, char  uuidStr[64])
+void Loader::uuidToStr(const uuid_t uuid, char  uuidStr[64])
 {
     char* p = uuidStr;
     appendHexByte(uuid[0], p);
@@ -562,10 +604,9 @@ void Loader::uuidToStr(uuid_t uuid, char  uuidStr[64])
     *p = '\0';
 }
 
-void Loader::getUuidStr(RuntimeState& state, char uuidStr[64]) const
+void Loader::getUuidStr(char uuidStr[64]) const
 {
-    uuid_t uuid;
-    if ( this->mf(state)->getUuid(uuid) ) {
+    if ( this->hasUUIDLoadCommand) {
         uuidToStr(uuid, uuidStr);
     }
     else {
@@ -576,14 +617,14 @@ void Loader::getUuidStr(RuntimeState& state, char uuidStr[64]) const
 void Loader::logLoad(RuntimeState& state, const char* path) const
 {
     char  uuidStr[64];
-    this->getUuidStr(state, uuidStr);
+    this->getUuidStr(uuidStr);
     state.log("<%s> %s\n", uuidStr, path);
 }
 
 #if TARGET_OS_EXCLAVEKIT
-const Loader* Loader::makePremappedLoader(Diagnostics& diag, RuntimeState& state, const char* path, const LoadOptions& options, const mach_o::Layout* layout)
+const Loader* Loader::makePremappedLoader(Diagnostics& diag, RuntimeState& state, const char* path, bool isInDyldCache, uint32_t dylibIndex, const LoadOptions& options, const mach_o::Layout* layout)
 {
-    return PremappedLoader::makePremappedLoader(diag, state, path, options, layout);
+    return PremappedLoader::makePremappedLoader(diag, state, path, isInDyldCache, dylibIndex, options, layout);
 }
 #endif // !TARGET_OS_EXCLAVEKIT
 
@@ -629,13 +670,17 @@ const Loader* Loader::makeDyldCacheLoader(Diagnostics& diag, RuntimeState& state
     // rdar://76406035 (simulator cache paths need prefix)
     const PrebuiltLoader* result = state.findPrebuiltLoader(path);
     if ( result != nullptr ) {
-        if ( result->mf(state)->loadableIntoProcess(state.config.process.platform, path, state.config.security.isInternalOS) ) {
+        if ( ((const Header *)result->mf(state))->loadableIntoProcess(state.config.process.platform, path, state.config.security.isInternalOS) ) {
+            if ( state.config.log.searching )
+                state.log("  found: prebuilt-dylib-from-cache: (0x%04X) \"%s\"\n", dylibIndex, path);
             return result;
         }
     }
 #endif // SUPPORT_PREBUILTLOADERS
 
     // try building a JustInTime Loader
+    if ( state.config.log.searching )
+        state.log("  found: dylib-from-cache: (0x%04X) \"%s\"\n", dylibIndex, path);
     return JustInTimeLoader::makeJustInTimeLoaderDyldCache(diag, state, path, options, dylibIndex, layout);
 }
 
@@ -721,15 +766,18 @@ const Loader* Loader::getLoader(Diagnostics& diag, RuntimeState& state, const ch
     __block const Loader*  result  = nullptr;
     // check if this path already in use by a Loader
     for ( const Loader* ldr : state.loaded ) {
-        if ( !ldr->matchesPath(loadPath) )
+        if ( !ldr->matchesPath(state, loadPath) )
             continue;
         result = ldr;
         if ( state.config.log.searching )
             state.log("  found: already-loaded-by-path: \"%s\"\n", loadPath);
     }
 
-    if ( result == nullptr )
-        result = makePremappedLoader(diag, state, loadPath, options, nullptr);
+    if ( result == nullptr ) {
+        uint32_t dylibInCacheIndex = 0;
+        bool pathIsInCache = state.config.dyldCache.indexOfPath(loadPath, dylibInCacheIndex);
+        result = makePremappedLoader(diag, state, loadPath, pathIsInCache, dylibInCacheIndex, options, nullptr);
+    }
 
     if ( (result == nullptr) && options.canBeMissing ) {
         diag.clearError();
@@ -750,9 +798,9 @@ const Loader* Loader::getLoader(Diagnostics& diag, RuntimeState& state, const ch
     if ( loadPathIsRPath ) {
         for (const Vector<ConstAuthLoader>* list : { &state.loaded, &state.delayLoaded } ) {
             for ( const Loader* ldr : *list ) {
-                if ( ldr->matchesPath(loadPath) ) {
+                if ( ldr->matchesPath(state, loadPath) ) {
                     if ( state.config.log.searching )
-                        state.log("  found: already-loaded-by-rpath: %s\n", ldr->path());
+                        state.log("  found: already-loaded-by-rpath: %s\n", ldr->path(state));
                     return ldr;
                 }
             }
@@ -765,9 +813,9 @@ const Loader* Loader::getLoader(Diagnostics& diag, RuntimeState& state, const ch
         strlcat(implicitRPath, loadPath, sizeof(implicitRPath));
         for (const Vector<ConstAuthLoader>* list : { &state.loaded, &state.delayLoaded } ) {
             for ( const Loader* ldr : *list ) {
-                if ( ldr->matchesPath(implicitRPath) ) {
+                if ( ldr->matchesPath(state, implicitRPath) ) {
                     if ( state.config.log.searching )
-                        state.log("  found: already-loaded-by-rpath: %s\n", ldr->path());
+                        state.log("  found: already-loaded-by-rpath: %s\n", ldr->path(state));
                     return ldr;
                 }
             }
@@ -806,8 +854,10 @@ const Loader* Loader::getLoader(Diagnostics& diag, RuntimeState& state, const ch
 
                             // check if this path already in use by a Loader
                             for (const Vector<ConstAuthLoader>* list : { &state.loaded, &state.delayLoaded } ) {
+                                if ( options.rtldNoLoad && (list == &state.delayLoaded) )
+                                    continue;
                                 for ( const Loader* ldr : *list ) {
-                                    if ( ldr->matchesPath(possiblePath) ) {
+                                    if ( ldr->matchesPath(state, possiblePath) ) {
                                         result = ldr;
                                         stop   = true;
                                         diag.clearError(); // found dylib, so clear any errors from previous paths tried
@@ -832,13 +882,15 @@ const Loader* Loader::getLoader(Diagnostics& diag, RuntimeState& state, const ch
                             uint32_t possibleCacheIndex;
                             if ( state.config.dyldCache.indexOfPath(possiblePath, possibleCacheIndex) ) {
                                 for (const Vector<ConstAuthLoader>* list : { &state.loaded, &state.delayLoaded } ) {
+                                    if ( options.rtldNoLoad && (list == &state.delayLoaded) )
+                                        continue;
                                     for ( const Loader* ldr : *list ) {
                                         if ( ldr->representsCachedDylibIndex(possibleCacheIndex) ) {
                                             result = ldr;
                                             stop   = true;
                                             diag.clearError(); // found dylib, so clear any errors from previous paths tried
                                             if ( state.config.log.searching )
-                                                state.log("  found: already-loaded-by-dylib-index: \"%s\" -> %s\n", possiblePath, ldr->path());
+                                                state.log("  found: already-loaded-by-dylib-index: \"%s\" -> %s\n", possiblePath, ldr->path(state));
                                             return;
                                         }
                                     }
@@ -861,6 +913,8 @@ const Loader* Loader::getLoader(Diagnostics& diag, RuntimeState& state, const ch
                                             state.log("  found: pseduo-dylib: \"%s\"\n", possiblePath);
                                         Diagnostics possiblePathDiag;
                                         result = makePseudoDylibLoader(possiblePathDiag, state, canonicalPath, options, &*pd);
+                                        // Dispose of canonicalPath if it is different from possiblePath
+                                        // (loadableAtPath is allowed to return its argument, which should not be freed).
                                         if (canonicalPath != possiblePath)
                                           pd->disposeString(canonicalPath);
                                         if ( possiblePathDiag.hasError() ) {
@@ -908,15 +962,23 @@ const Loader* Loader::getLoader(Diagnostics& diag, RuntimeState& state, const ch
                             }
                             else {
                                 // for dev caches, always stat() and check cache
-                                possiblePathHasFileOnDisk  = state.config.fileExists(possiblePath, &possiblePathFileID, &possiblePathOnDiskErrNo);
-                                if ( !ProcessConfig::PathOverrides::isOnDiskOnlyType(type) )
-                                    possiblePathIsInDyldCache  = state.config.dyldCache.indexOfPath(possiblePath, dylibInCacheIndex);
+                                possiblePathHasFileOnDisk = state.config.fileExists(possiblePath, &possiblePathFileID, &possiblePathOnDiskErrNo);
+                                if ( possiblePathHasFileOnDisk || !ProcessConfig::PathOverrides::isOnDiskOnlyType(type) )
+                                    possiblePathIsInDyldCache = state.config.dyldCache.indexOfPath(possiblePath, dylibInCacheIndex);
                                 possiblePathOverridesCache = possiblePathHasFileOnDisk && (originalPathIsInDyldCache || possiblePathIsInDyldCache);
+                                // rdar://121937452 (hardened apps cannot have libSystem overridden)
+                                if ( possiblePathOverridesCache && !state.config.security.allowLibSystemOverrides && ProcessConfig::DyldCache::isProtectedLibSystemPath(loadPath) ) {
+                                    possiblePathOverridesCache = false;
+                                    possiblePathHasFileOnDisk = false;
+                                    possiblePathOnDiskErrNo = ENOSYS;  // dummy value to get DYLD_PRINT_SEARCHING to print something informative
+                                }
                             }
 
                             // see if this possible path was already loaded via a symlink or hardlink by checking inode
                             if ( possiblePathHasFileOnDisk && possiblePathFileID.valid() ) {
                                 for (const Vector<ConstAuthLoader>* list : { &state.loaded, &state.delayLoaded } ) {
+                                    if ( options.rtldNoLoad && (list == &state.delayLoaded) )
+                                        continue;
                                     for ( const Loader* ldr : *list ) {
                                         FileID ldrFileID = ldr->fileID(state);
                                         if ( ldrFileID.valid() && (possiblePathFileID == ldrFileID) ) {
@@ -924,7 +986,7 @@ const Loader* Loader::getLoader(Diagnostics& diag, RuntimeState& state, const ch
                                             stop   = true;
                                             diag.clearError(); // found dylib, so clear any errors from previous paths tried
                                             if ( state.config.log.searching )
-                                                state.log("  found: already-loaded-by-inode-mtime: \"%s\"\n", ldr->path());
+                                                state.log("  found: already-loaded-by-inode-mtime: \"%s\"\n", ldr->path(state));
                                             return;
                                         }
                                     }
@@ -974,12 +1036,29 @@ const Loader* Loader::getLoader(Diagnostics& diag, RuntimeState& state, const ch
                                 const char* sharedCacheMsg = "";
                                 if ( !ProcessConfig::PathOverrides::isOnDiskOnlyType(type) && mightBeInSharedCache(possiblePath) )
                                     sharedCacheMsg = (state.config.dyldCache.addr != nullptr) ? ", not in dyld cache" : ", no dyld cache";
-                                if ( possiblePathOnDiskErrNo == ENOENT )
+                                if ( possiblePathOnDiskErrNo == ENOENT ) {
                                     diag.appendError("'%s' (no such file%s)", possiblePath, sharedCacheMsg);
-                                else if ( possiblePathOnDiskErrNo == ENOTAFILE_NP )
+                                }
+                                else if ( (possiblePathOnDiskErrNo == EPERM) && state.config.syscall.sandboxBlockedStat(possiblePath) ) {
+                                    diag.appendError("'%s' (blocked by sandbox)%s", possiblePath, sharedCacheMsg);
+                                    if ( state.config.log.searching )
+                                      state.log("    stat(\"%s\") blocked by file system sandbox\n", possiblePath);
+                                }
+                                else if ( possiblePathOnDiskErrNo == ENOTAFILE_NP ) {
                                     diag.appendError("'%s' (not a file%s)", possiblePath, sharedCacheMsg);
-                                else
+                                    if ( state.config.log.searching )
+                                      state.log("    stat(\"%s\") returned path is not a regular file\n", possiblePath);
+                                }
+                                else if ( possiblePathOnDiskErrNo == ENOSYS ) {
+                                    diag.appendError("'%s' (cannot override a protected system dylib)%s", possiblePath, sharedCacheMsg);
+                                    if ( state.config.log.searching )
+                                      state.log("    \"%s\" cannot override a protected system dylib\n", possiblePath);
+                                }
+                                else {
                                     diag.appendError("'%s' (errno=%d%s)", possiblePath, possiblePathOnDiskErrNo, sharedCacheMsg);
+                                    if ( state.config.log.searching )
+                                      state.log("    stat(\"%s\") returned: errno=%d\n", possiblePath, possiblePathOnDiskErrNo);
+                                }
                                 return;
                             }
 
@@ -1005,8 +1084,6 @@ const Loader* Loader::getLoader(Diagnostics& diag, RuntimeState& state, const ch
                             }
                             else if ( possiblePathIsInDyldCache ) {
                                 // can use dylib in dyld cache
-                                if ( state.config.log.searching )
-                                    state.log("  found: dylib-from-cache: (0x%04X) \"%s\"\n", dylibInCacheIndex, possiblePath);
                                 result = makeDyldCacheLoader(possiblePathDiag, state, possiblePath, options, dylibInCacheIndex, nullptr);
                                 if ( state.config.log.searching && possiblePathDiag.hasError() )
                                     state.log("  found: dylib-from-cache-error: \"%s\" => \"%s\"\n", possiblePath, possiblePathDiag.errorMessageCStr());
@@ -1034,9 +1111,9 @@ const Loader* Loader::getLoader(Diagnostics& diag, RuntimeState& state, const ch
             // but do check if path matches install name of something already loaded
             for (const Vector<ConstAuthLoader>* list : { &state.loaded, &state.delayLoaded } ) {
                 for ( const Loader* ldr : *list ) {
-                    if ( ldr->matchesPath(loadPath) ) {
+                    if ( ldr->matchesPath(state, loadPath) ) {
                         if ( state.config.log.searching )
-                            state.log("  found existing image by install name: \"%s\"\n", ldr->path());
+                            state.log("  found existing image by install name: \"%s\"\n", ldr->path(state));
                         result = ldr;
                         diag.clearError();
                         break;
@@ -1078,8 +1155,8 @@ const Loader* Loader::getLoader(Diagnostics& diag, RuntimeState& state, const ch
             if ( isRPath ) {
                 __block bool hasRPath = false;
                 for ( const LoadChain* link = options.rpathStack; (link != nullptr) && !hasRPath; link = link->previous ) {
-                    const MachOFile* mf = link->image->mf(state);
-                    mf->forEachRPath(^(const char* rPath, bool& innerStop) {
+                    const Header* hdr = (const Header*)link->image->mf(state);
+                    hdr->forEachRPath(^(const char* rPath, bool& innerStop) {
                         hasRPath = true;
                         innerStop = true;
                     });
@@ -1087,7 +1164,11 @@ const Loader* Loader::getLoader(Diagnostics& diag, RuntimeState& state, const ch
                 if ( !hasRPath ) {
                     diag.error("no LC_RPATH's found");
                 } else  {
-                    // FIXME: Is there an error we can give if we can even get here?
+                    // To get here its very likely we failed to use any LC_RPATH's, even though we have them.
+                    // For example if the LC_RPATH doesn't start with @loader_path or @executable_path then we might
+                    // silently skip it and never get in to the main getLoader block where we'd normally issue a diagnostic
+                    // if a path can't be found
+                    diag.error("no LC_RPATH's used.  They may be invalid, eg, not start with '@loader_path' or '@executable_path'");
                 }
             } else {
                 // FIXME: Is there an error we can give if we can even get here?
@@ -1122,10 +1203,12 @@ bool Loader::expandAtLoaderPath(RuntimeState& state, const char* loadPath, const
         return false;
     }
 
-    strlcpy(fixedPath, ldr->path(), PATH_MAX);
+    size_t size = PATH_MAX;
+    strlcpy(fixedPath, ldr->path(state), size);
     char* lastSlash = strrchr(fixedPath, '/');
     if ( lastSlash != nullptr ) {
-        strlcpy(lastSlash, &loadPath[12], PATH_MAX);
+        size -= (lastSlash - fixedPath);
+        strlcpy(lastSlash, &loadPath[12], size);
         return true;
     }
     return false;
@@ -1139,7 +1222,8 @@ bool Loader::expandAndNormalizeAtExecutablePath(const char* mainPath, const char
     if ( (pathWithAtExecutable[16] != '/') && (pathWithAtExecutable[16] != '\0') )
         return false;
 
-    strlcpy(fixedPath, mainPath, PATH_MAX);
+    size_t size = PATH_MAX;
+    strlcpy(fixedPath, mainPath, size);
     char* mainPathDirStart = strrchr(fixedPath, '/');
     if ( mainPathDirStart == nullptr )
         return false; // no slash in mainPath ??
@@ -1164,7 +1248,8 @@ bool Loader::expandAndNormalizeAtExecutablePath(const char* mainPath, const char
     else {
         ++mainPathDirStart;
     }
-    strlcpy(mainPathDirStart, trailingLoadPath, PATH_MAX);
+    size -= (mainPathDirStart - fixedPath);
+    strlcpy(mainPathDirStart, trailingLoadPath, size);
     return true;
 }
 
@@ -1207,8 +1292,8 @@ void Loader::forEachResolvedAtPathVar(RuntimeState& state, const char* loadPath,
             const Loader*         orgLoader   = options.rpathStack->image;
             const MachOAnalyzer*  orgMA       = orgLoader->analyzer(state);
             if ( orgMA->isDylib() && !orgMA->enforceFormat(MachOAnalyzer::Malformed::loaderPathsAreReal) ) {
-                const char*           fullPath    = orgLoader->path();
-                const char*           installPath = orgMA->installName();
+                const char*           fullPath    = orgLoader->path(state);
+                const char*           installPath = ((const Header*)orgMA)->installName();
                 if ( const char* installLeaf = strrchr(installPath, '/') ) {
                     size_t leafLen = strlen(installLeaf);
                     size_t fullLen = strlen(fullPath);
@@ -1246,10 +1331,10 @@ void Loader::forEachResolvedAtPathVar(RuntimeState& state, const char* loadPath,
         // rpath is expansion is a stack of rpath dirs built starting with main executable and pushing
         // LC_RPATHS from each dylib as they are recursively loaded.  options.rpathStack is a linnked list of that stack.
         for ( const LoadChain* link = options.rpathStack; (link != nullptr) && !stop; link = link->previous ) {
-            const MachOFile* mf = link->image->mf(state);
-            mf->forEachRPath(^(const char* rPath, bool& innerStop) {
+            const Header* hdr = (const Header*)link->image->mf(state);
+            hdr->forEachRPath(^(const char* rPath, bool& innerStop) {
                 if ( state.config.log.searching )
-                    state.log("  LC_RPATH '%s' from '%s'\n", rPath, link->image->path());
+                    state.log("  LC_RPATH '%s' from '%s'\n", rPath, link->image->path(state));
                 if ( expandAtLoaderPath(state, rPath, options, link->image, true, tempPath) || expandAtExecutablePath(state, rPath, options, true, tempPath) ) {
                     Utils::concatenatePaths(tempPath, rpathTail, PATH_MAX);
                     handler(tempPath, expandType, innerStop);
@@ -1257,7 +1342,7 @@ void Loader::forEachResolvedAtPathVar(RuntimeState& state, const char* loadPath,
                 else if ( rPath[0] == '/' ) {
 #if BUILDING_DYLD && TARGET_OS_OSX && __arm64__ // FIXME: this should be a runtime check to enable unit testing
                     // if LC_RPATH is to absolute path like /usr/lib/swift, but this iOS app running on macOS, we really need /System/iOSSupport/usr/lib/swift
-                    if ( state.config.process.platform == dyld3::Platform::iOS ) {
+                    if ( state.config.process.platform == Platform::iOS ) {
                         strlcpy(tempPath, "/System/iOSSupport", PATH_MAX);
                         strlcat(tempPath, rPath, PATH_MAX);
                         Utils::concatenatePaths(tempPath, rpathTail, PATH_MAX);
@@ -1358,11 +1443,11 @@ uint64_t Loader::validateFile(Diagnostics& diag, const RuntimeState& state, int 
     // if inode/mtime was recorded, check that
     if ( fileValidation.checkInodeMtime ) {
         if ( statBuf.st_ino != fileValidation.inode ) {
-            diag.error("file inode changed from 0x%llX to 0x%llX since PrebuiltLoader was built for '%s'", fileValidation.inode, statBuf.st_ino, path);
+            diag.error("file inode changed from 0x%llX to 0x%llX since Loader was built for '%s'", fileValidation.inode, statBuf.st_ino, path);
             return -1;
         }
         if ( (uint64_t)statBuf.st_mtime != fileValidation.mtime ) {
-            diag.error("file mtime changed from 0x%llX to 0x%lX since PrebuiltLoader was built for '%s'", fileValidation.mtime, statBuf.st_mtime, path);
+            diag.error("file mtime changed from 0x%llX to 0x%lX since Loader was built for '%s'", fileValidation.mtime, statBuf.st_mtime, path);
             return -1;
         }
         // sanity check slice offset
@@ -1380,9 +1465,10 @@ uint64_t Loader::validateFile(Diagnostics& diag, const RuntimeState& state, int 
             diag.error("could not mmap() '%s'", path);
             return -1;
         }
-        uint64_t sliceOffset = -1;
+        uint64_t sliceOffset = 0;
+        uint64_t sliceSize   = 0;
         bool     isOSBinary  = false; // FIXME
-        if ( const MachOFile* mf = MachOFile::compatibleSlice(diag, mappedFile, (size_t)statBuf.st_size, path, state.config.process.platform, isOSBinary, *state.config.process.archs, state.config.security.internalInstall) ) {
+        if ( const MachOFile* mf = MachOFile::compatibleSlice(diag, sliceOffset, sliceSize, mappedFile, (size_t)statBuf.st_size, path, state.config.process.platform, isOSBinary, *state.config.process.archs, state.config.security.internalInstall) ) {
             const MachOLoaded* ml            = (MachOLoaded*)mf;
             __block bool       cdHashMatches = false;
             // Note, file is not mapped with zero fill so cannot use forEachCdHash()
@@ -1391,10 +1477,14 @@ uint64_t Loader::validateFile(Diagnostics& diag, const RuntimeState& state, int 
                 if ( ::memcmp((void*)cdHash, (void*)fileValidation.cdHash, 20) == 0 )
                     cdHashMatches = true;
             });
-            if ( cdHashMatches )
+            if ( cdHashMatches ) {
                 sliceOffset = (uint8_t*)mf - (uint8_t*)mappedFile;
-            else
+            } else {
+                sliceOffset = -1;
                 diag.error("file cdHash not as expected '%s'", path);
+            }
+        } else {
+            sliceOffset = -1;
         }
         state.config.syscall.munmap(mappedFile, (size_t)fileValidation.sliceOffset);
         return sliceOffset;
@@ -1409,12 +1499,12 @@ static bool getUuidFromFd(RuntimeState& state, int fd, uint64_t sliceOffset, cha
     strlcpy(uuidStr, "no uuid", 64);
     mach_header mh;
     if ( state.config.syscall.pread(fd, &mh, sizeof(mh), (size_t)sliceOffset) == sizeof(mh) ) {
-        if ( ((MachOFile*)&mh)->hasMachOMagic() ) {
+        if ( ((Header*)&mh)->hasMachOMagic() ) {
             size_t headerAndLoadCommandsSize = mh.sizeofcmds+sizeof(mach_header_64);
             uint8_t buffer[headerAndLoadCommandsSize];
             if ( state.config.syscall.pread(fd, buffer, sizeof(buffer), (size_t)sliceOffset) == headerAndLoadCommandsSize ) {
                 uuid_t uuid;
-                if ( ((MachOFile*)buffer)->getUuid(uuid) ) {
+                if ( ((Header*)buffer)->getUuid(uuid) ) {
                     Loader::uuidToStr(uuid, uuidStr);
                     return true;
                 }
@@ -1425,75 +1515,32 @@ static bool getUuidFromFd(RuntimeState& state, int fd, uint64_t sliceOffset, cha
 }
 #endif
 
-const MachOAnalyzer* Loader::mapSegments(Diagnostics& diag, RuntimeState& state, const char* path, uint64_t vmSpace,
+const MachOAnalyzer* Loader::mapSegments(Diagnostics& diag, RuntimeState& state, const char* path, int fd, uint64_t vmSpace,
                                          const CodeSignatureInFile& codeSignature, bool hasCodeSignature,
                                          const Array<Region>& regions, bool neverUnloads, bool prebuilt, const FileValidationInfo& fileValidation)
 {
 #if BUILDING_DYLD
     dyld3::ScopedTimer timer(DBG_DYLD_TIMING_MAP_IMAGE, path, 0, 0);
 #endif
-    // open file
-    int fd = state.config.syscall.open(path, O_RDONLY, 0);
-    if ( fd == -1 ) {
-        int openErr = errno;
-        if ( (openErr == EPERM) && state.config.syscall.sandboxBlockedOpen(path) )
-            diag.error("file system sandbox blocked open(\"%s\", O_RDONLY)", path);
-        else if ( openErr == ENOENT )
-            diag.error("no such file");
-        else
-            diag.error("open(\"%s\", O_RDONLY) failed with errno=%d", path, openErr);
-        return nullptr;
-    }
 
-    // validated this file has not changed (since PrebuiltLoader was made)
-    uint64_t sliceOffset = fileValidation.sliceOffset;
-    if ( prebuilt ) {
-        sliceOffset = validateFile(diag, state, fd, path, codeSignature, fileValidation);
-        if ( diag.hasError() ) {
-            state.config.syscall.close(fd);
-            return nullptr;
-        }
+    // Validate this file has not changed since FileValidationInfo was retrieved
+    uint64_t sliceOffset = validateFile(diag, state, fd, path, codeSignature, fileValidation);
+    if ( diag.hasError() ) {
+        return nullptr;
     }
 
 #if BUILDING_DYLD
     // register code signature
-    uint64_t coveredCodeLength = UINT64_MAX;
     if ( hasCodeSignature && codeSignature.size != 0 ) {
-        dyld3::ScopedTimer codeSigTimer(DBG_DYLD_TIMING_ATTACH_CODESIGNATURE, 0, 0, 0);
-        fsignatures_t siginfo;
-        siginfo.fs_file_start = sliceOffset;                             // start of mach-o slice in fat file
-        siginfo.fs_blob_start = (void*)(long)(codeSignature.fileOffset); // start of CD in mach-o file
-        siginfo.fs_blob_size  = codeSignature.size;                      // size of CD
-        int result            = state.config.syscall.fcntl(fd, F_ADDFILESIGS_RETURN, &siginfo);
-        if ( result == -1 ) {
-            char uuidStr[64];
-            getUuidFromFd(state, fd, sliceOffset, uuidStr);
-            int errnoCopy = errno;
-            if ( (errnoCopy == EPERM) || (errnoCopy == EBADEXEC) ) {
-                diag.error("code signature invalid in <%s> '%s' (errno=%d) sliceOffset=0x%08llX, codeBlobOffset=0x%08X, codeBlobSize=0x%08X",
-                           uuidStr, path, errnoCopy, sliceOffset, codeSignature.fileOffset, codeSignature.size);
-            }
-            else {
-                diag.error("fcntl(fd, F_ADDFILESIGS_RETURN) failed with errno=%d in <%s> '%s', sliceOffset=0x%08llX, codeBlobOffset=0x%08X, codeBlobSize=0x%08X",
-                           errnoCopy, uuidStr, path, sliceOffset, codeSignature.fileOffset, codeSignature.size);
-            }
-            state.config.syscall.close(fd);
+        char uuidStr[64];
+        getUuidFromFd(state, fd, sliceOffset, uuidStr);
+        if ( !state.config.syscall.registerSignature(diag, path, uuidStr, fd, sliceOffset, codeSignature.fileOffset, codeSignature.size) )
             return nullptr;
-        }
-        coveredCodeLength = siginfo.fs_file_start;
-        if ( coveredCodeLength < codeSignature.fileOffset ) {
-            char uuidStr[64];
-            getUuidFromFd(state, fd, sliceOffset, uuidStr);
-            diag.error("code signature does not cover entire file up to signature in <%s> '%s' (signed 0x%08llX, expected 0x%08X) for '%s'",
-                       uuidStr, path, coveredCodeLength, codeSignature.fileOffset, path);
-            state.config.syscall.close(fd);
-            return nullptr;
-        }
     }
 
     // <rdar://problem/41015217> dyld should use F_CHECK_LV even on unsigned binaries
+    // <rdar://problem/32684903> always call F_CHECK_LV to preflight
     {
-        // <rdar://problem/32684903> always call F_CHECK_LV to preflight
         fchecklv checkInfo;
         char     messageBuffer[512];
         messageBuffer[0]                = '\0';
@@ -1506,7 +1553,6 @@ const MachOAnalyzer* Loader::mapSegments(Diagnostics& diag, RuntimeState& state,
             char uuidStr[64];
             getUuidFromFd(state, fd, sliceOffset, uuidStr);
             diag.error("code signature in <%s> '%s' not valid for use in process: %s", uuidStr, path, messageBuffer);
-            state.config.syscall.close(fd);
             return nullptr;
         }
     }
@@ -1533,7 +1579,6 @@ const MachOAnalyzer* Loader::mapSegments(Diagnostics& diag, RuntimeState& state,
     kern_return_t r           = ::vm_allocate(mach_task_self(), &loadAddress, (vm_size_t)vmSpace, VM_FLAGS_ANYWHERE);
     if ( r != KERN_SUCCESS ) {
         diag.error("vm_allocate(size=0x%0llX) failed with result=%d", vmSpace, r);
-        state.config.syscall.close(fd);
         return nullptr;
     }
 
@@ -1598,7 +1643,8 @@ const MachOAnalyzer* Loader::mapSegments(Diagnostics& diag, RuntimeState& state,
             uintptr_t mappedEnd   = mappedStart + mappedSize;
             if ( state.config.log.segments ) {
                 const MachOLoaded* lmo = (MachOLoaded*)loadAddress;
-                state.log("%14s (%c%c%c) 0x%012lX->0x%012lX\n", lmo->segmentName(segIndex),
+                state.log("%14.*s (%c%c%c) 0x%012lX->0x%012lX\n",
+                          (int)lmo->segmentName(segIndex).size(), lmo->segmentName(segIndex).data(),
                           (region.perms & PROT_READ) ? 'r' : '.', (region.perms & PROT_WRITE) ? 'w' : '.', (region.perms & PROT_EXEC) ? 'x' : '.',
                           mappedStart, mappedEnd);
             }
@@ -1607,15 +1653,15 @@ const MachOAnalyzer* Loader::mapSegments(Diagnostics& diag, RuntimeState& state,
         ++segIndex;
     }
 
-#if BUILDING_DYLD && !TARGET_OS_SIMULATOR && (__arm64__ || __arm__)
+#if BUILDING_DYLD && !TARGET_OS_SIMULATOR && __arm64__
     if ( !mmapFailure ) {
         // tell kernel about fairplay encrypted regions
         uint32_t fpTextOffset;
         uint32_t fpSize;
-        const MachOAnalyzer* ma = (const MachOAnalyzer*)loadAddress;
+        const Header* hdr = (const Header*)loadAddress;
         // FIXME: record if FP info in PrebuiltLoader
-        if ( ma->isFairPlayEncrypted(fpTextOffset, fpSize) ) {
-            int result = state.config.syscall.mremap_encrypted((void*)(loadAddress + fpTextOffset), fpSize, 1, ma->cputype, ma->cpusubtype);
+        if ( hdr->isFairPlayEncrypted(fpTextOffset, fpSize) ) {
+            int result = state.config.syscall.mremap_encrypted((void*)(loadAddress + fpTextOffset), fpSize, 1, hdr->arch().cpuType(), hdr->arch().cpuSubtype());
             if ( result != 0 ) {
                 diag.error("could not register fairplay decryption, mremap_encrypted() => %d", result);
                 mmapFailure = true;
@@ -1626,7 +1672,6 @@ const MachOAnalyzer* Loader::mapSegments(Diagnostics& diag, RuntimeState& state,
 
     if ( mmapFailure ) {
         ::vm_deallocate(mach_task_self(), loadAddress, (vm_size_t)vmSpace);
-        state.config.syscall.close(fd);
         return nullptr;
     }
 
@@ -1644,7 +1689,7 @@ const MachOAnalyzer* Loader::mapSegments(Diagnostics& diag, RuntimeState& state,
             // dyld automatically adds an entry to the image list when loading the dylib.
             // Add an entry for the aot info but pass an empty std::span for the dyld image info
             std::span<const dyld_image_info> infos;
-            state.externallyViewable.addRosettaImages(aots, infos);
+            state.externallyViewable->addRosettaImages(aots, infos);
     #endif
             if ( state.config.log.segments ) {
                 state.log("%14s (r.x) 0x%012llX->0x%012llX\n", "ROSETTA", extraSpaceAddr, extraSpaceAddr + extraAllocSize);
@@ -1652,8 +1697,6 @@ const MachOAnalyzer* Loader::mapSegments(Diagnostics& diag, RuntimeState& state,
         }
     }
 #endif
-    // close file
-    state.config.syscall.close(fd);
     return (MachOAnalyzer*)loadAddress;
 }
 #endif // BUILDING_DYLD || BUILDING_CLOSURE_UTIL || BUILDING_UNIT_TESTS
@@ -1670,11 +1713,16 @@ static void fixupPage64(void* pageContent, const mwl_info_hdr* blob, const dyld_
     // check marker for no fixups on the page
     if ( firstStartOffset == DYLD_CHAINED_PTR_START_NONE )
         return;
-    uint64_t* chain  = (uint64_t*)((uint8_t*)pageContent + firstStartOffset);
+    uint64_t* chain   = (uint64_t*)((uint8_t*)pageContent + firstStartOffset);
+    uint64_t* pageEnd = (uint64_t*)((uint8_t*)pageContent + blob->mwli_page_size);
     // walk chain
     const uint64_t targetAdjust = (offsetBased ? blob->mwli_image_address : blob->mwli_slide);
     uint64_t delta = 0;
     do {
+        if ( chain >= pageEnd) {
+            fprintf(stderr, "fixup chain entry (%p) off end of page starting at %p\n", chain, pageContent);
+            break;
+        }
         uint64_t value  = *chain;
         bool     isBind = (value & 0x8000000000000000ULL);
         delta = (value >> 51) & 0xFFF;
@@ -1702,11 +1750,15 @@ static void fixupPage64(void* pageContent, const mwl_info_hdr* blob, const dyld_
 }
 
 
-static void fixupChain32(uint32_t* chain, const mwl_info_hdr* blob, const dyld_chained_starts_in_segment* segInfo, const uint32_t bindsArray[])
+static void fixupChain32(uint32_t* chain, const mwl_info_hdr* blob, const dyld_chained_starts_in_segment* segInfo, const uint32_t bindsArray[], uint32_t* pageEnd)
 {
     //fprintf(stderr, "fixupChain32(%p)\n", chain);
     uint32_t delta = 0;
     do {
+        if ( chain >= pageEnd) {
+            fprintf(stderr, "fixup chain entry (%p) off end of page ending at %p\n", chain, pageEnd);
+            break;
+        }
         uint32_t value = *chain;
         delta = (value >> 26) & 0x1F;
         //fprintf(stderr, "   chain=%p, value=0x%08X, delta=%u\n", chain, value, delta);
@@ -1741,8 +1793,9 @@ static void fixupChain32(uint32_t* chain, const mwl_info_hdr* blob, const dyld_c
 
 static void fixupPage32(void* pageContent, const mwl_info_hdr* blob, const dyld_chained_starts_in_segment* segInfo, uint32_t pageIndex)
 {
-    const uint32_t* bindsArray       = (uint32_t*)((uint8_t*)blob + blob->mwli_binds_offset);
+    const uint32_t* bindsArray  = (uint32_t*)((uint8_t*)blob + blob->mwli_binds_offset);
     uint16_t        startOffset = segInfo->page_start[pageIndex];
+    uint32_t*       pageEnd     = (uint32_t*)((uint8_t*)pageContent + blob->mwli_page_size);
     if ( startOffset == DYLD_CHAINED_PTR_START_NONE )
         return;
     if ( startOffset & DYLD_CHAINED_PTR_START_MULTI ) {
@@ -1753,40 +1806,18 @@ static void fixupPage32(void* pageContent, const mwl_info_hdr* blob, const dyld_
             chainEnd    = (segInfo->page_start[overflowIndex] & DYLD_CHAINED_PTR_START_LAST);
             startOffset = (segInfo->page_start[overflowIndex] & ~DYLD_CHAINED_PTR_START_LAST);
             uint32_t* chain = (uint32_t*)((uint8_t*)pageContent + startOffset);
-            fixupChain32(chain, blob, segInfo, bindsArray);
+            fixupChain32(chain, blob, segInfo, bindsArray, pageEnd);
             ++overflowIndex;
         }
     }
     else {
         uint32_t* chain = (uint32_t*)((uint8_t*)pageContent + startOffset);
-        fixupChain32(chain, blob, segInfo, bindsArray);
+        fixupChain32(chain, blob, segInfo, bindsArray, pageEnd);
     }
  }
 
+
 #if __has_feature(ptrauth_calls)
-static uint64_t signPointer(uint64_t unsignedAddr, void* loc, bool addrDiv, uint16_t diversity, ptrauth_key key)
-{
-    // don't sign NULL
-    if ( unsignedAddr == 0 )
-        return 0;
-
-    uint64_t extendedDiscriminator = diversity;
-    if ( addrDiv )
-        extendedDiscriminator = __builtin_ptrauth_blend_discriminator(loc, extendedDiscriminator);
-    switch ( key ) {
-        case ptrauth_key_asia:
-            return (uint64_t)__builtin_ptrauth_sign_unauthenticated((void*)unsignedAddr, 0, extendedDiscriminator);
-        case ptrauth_key_asib:
-            return (uint64_t)__builtin_ptrauth_sign_unauthenticated((void*)unsignedAddr, 1, extendedDiscriminator);
-        case ptrauth_key_asda:
-            return (uint64_t)__builtin_ptrauth_sign_unauthenticated((void*)unsignedAddr, 2, extendedDiscriminator);
-        case ptrauth_key_asdb:
-            return (uint64_t)__builtin_ptrauth_sign_unauthenticated((void*)unsignedAddr, 3, extendedDiscriminator);
-        default:
-            assert(0 && "invalid signing key");
-    }
-}
-
 static void fixupPageAuth64(void* pageContent, const mwl_info_hdr* blob, const dyld_chained_starts_in_segment* segInfo, uint32_t pageIndex, bool offsetBased)
 {
     //fprintf(stderr, "fixupPageAuth64(): pageContent=%p, blob=%p, segInfo=%p, pageIndex=%u\n", pageContent, blob, segInfo, pageIndex);
@@ -1795,11 +1826,16 @@ static void fixupPageAuth64(void* pageContent, const mwl_info_hdr* blob, const d
     // check marker for no fixups on the page
     if ( firstStartOffset == DYLD_CHAINED_PTR_START_NONE )
         return;
-    uint64_t* chain  = (uint64_t*)((uint8_t*)pageContent + firstStartOffset);
+    uint64_t* chain   = (uint64_t*)((uint8_t*)pageContent + firstStartOffset);
+    uint64_t* pageEnd = (uint64_t*)((uint8_t*)pageContent + blob->mwli_page_size);
     // walk chain
     const uint64_t targetAdjust = (offsetBased ? blob->mwli_image_address : blob->mwli_slide);
     uint64_t delta = 0;
     do {
+        if ( chain >= pageEnd) {
+            fprintf(stderr, "fixup chain entry (%p) off end of page starting at %p\n", chain, pageContent);
+            break;
+        }
         uint64_t value = *chain;
         delta = (value >> 51) & 0x7FF;
         //fprintf(stderr, "   chain=%p, value=0x%08llX, delta=%llu\n", chain, value, delta);
@@ -1923,7 +1959,7 @@ static int dyld_map_with_linking_np(const mwl_region regions[], uint32_t regionC
     return 0;
 }
 
-struct PageInLinkingRange { mwl_region region; const char* segName; const dyld_chained_starts_in_segment* chainInfo; };
+struct PageInLinkingRange { mwl_region region; std::string_view segName; const dyld_chained_starts_in_segment* chainInfo; };
 
 // Note: disable tail call optimization, otherwise tailcall may remove stack allocated blob
 [[clang::disable_tail_calls]] static
@@ -1951,7 +1987,7 @@ int setUpPageInLinkingRegions(RuntimeState& state, const Loader* ldr, uintptr_t 
     blob->mwli_chains_size      = chainInfoSize;
     blob->mwli_slide            = slide;
     blob->mwli_image_address    = (uintptr_t)ldr->loadAddress(state);
-    ::memcpy(&buffer[blob->mwli_binds_offset], bindTargets.begin(), pointerSize * blob->mwli_binds_count);
+    ::memcpy(&buffer[blob->mwli_binds_offset], bindTargets.data(), pointerSize * blob->mwli_binds_count);
     uint32_t                        offsetInChainInfo = (uint32_t)offsetof(dyld_chained_starts_in_image, seg_info_offset[ranges.count()]);
     uint32_t                        rangeIndex        = 0;
     dyld_chained_starts_in_image*   starts            = (dyld_chained_starts_in_image*)((uint8_t*)blob + blob->mwli_chains_offset);
@@ -1969,24 +2005,25 @@ int setUpPageInLinkingRegions(RuntimeState& state, const Loader* ldr, uintptr_t 
 
     int result = 0;
     if ( forceDyldBinding ) {
-        result = dyld_map_with_linking_np(regions.begin(), (uint32_t)regions.count(), blob, (uint32_t)blobAllocationSize);
+        result = dyld_map_with_linking_np(regions.data(), (uint32_t)regions.count(), blob, (uint32_t)blobAllocationSize);
     }
     else {
         if ( state.config.log.fixups || state.config.log.segments ) {
-            state.log("Setting up kernel page-in linking for %s\n", ldr->path());
+            state.log("Setting up kernel page-in linking for %s\n", ldr->path(state));
             for (const PageInLinkingRange& range : ranges) {
-                state.log("%14s (%c%c%c) 0x%012llX->0x%012llX (fileOffset=0x%0llX, size=%lluKB)\n", range.segName,
-                      ((range.region.mwlr_protections & 1) ? 'r' : '.'), ((range.region.mwlr_protections & 2) ? 'w' : '.'), ((range.region.mwlr_protections & 4) ? 'x' : '.'),
-                      range.region.mwlr_address, range.region.mwlr_address + range.region.mwlr_size, range.region.mwlr_file_offset, range.region.mwlr_size/1024);
+                state.log("%14.*s (%c%c%c) 0x%012llX->0x%012llX (fileOffset=0x%0llX, size=%lluKB)\n",
+                          (int)range.segName.size(), range.segName.data(),
+                          ((range.region.mwlr_protections & 1) ? 'r' : '.'), ((range.region.mwlr_protections & 2) ? 'w' : '.'), ((range.region.mwlr_protections & 4) ? 'x' : '.'),
+                          range.region.mwlr_address, range.region.mwlr_address + range.region.mwlr_size, range.region.mwlr_file_offset, range.region.mwlr_size/1024);
             }
         }
 #if BUILDING_DYLD
-        result = __map_with_linking_np(regions.begin(), (uint32_t)regions.count(), blob, (uint32_t)blobAllocationSize);
+        result = __map_with_linking_np(regions.data(), (uint32_t)regions.count(), blob, (uint32_t)blobAllocationSize);
         if ( result != 0 ) {
             // kernel backed page-in linking failed, manually do fixups in-process
             if ( state.config.log.fixups || state.config.log.segments )
-                state.log("__map_with_linking_np(%s) failed, falling back to linking in-process\n", ldr->path());
-            result = dyld_map_with_linking_np(regions.begin(), (uint32_t)regions.count(), blob, (uint32_t)blobAllocationSize);
+                state.log("__map_with_linking_np(%s) failed, falling back to linking in-process\n", ldr->path(state));
+            result = dyld_map_with_linking_np(regions.data(), (uint32_t)regions.count(), blob, (uint32_t)blobAllocationSize);
         }
 #endif
     }
@@ -1996,14 +2033,14 @@ int setUpPageInLinkingRegions(RuntimeState& state, const Loader* ldr, uintptr_t 
 
 void Loader::setUpPageInLinking(Diagnostics& diag, RuntimeState& state, uintptr_t slide, uint64_t sliceOffset, const Array<const void*>& bindTargets) const
 {
-    int fd = state.config.syscall.open(this->path(), O_RDONLY, 0);
+    int fd = state.config.syscall.open(this->path(state), O_RDONLY, 0);
     if ( fd == -1 ) {
-        diag.error("open(\"%s\", O_RDONLY) failed with errno=%d", this->path(), errno);
+        diag.error("open(\"%s\", O_RDONLY) failed with errno=%d", this->path(state), errno);
         return;
     }
     // don't use page-in linking after libSystem is initialized
     // don't use page-in linking if process has a sandbox that disables syscall
-    bool canUsePageInLinkingSyscall = (state.config.process.pageInLinkingMode >= 2) && (state.libSystemHelpers == nullptr) && !state.config.syscall.sandboxBlockedPageInLinking();
+    bool canUsePageInLinkingSyscall = (state.config.process.pageInLinkingMode >= 2) && !state.libSystemInitialized() && !state.config.syscall.sandboxBlockedPageInLinking();
     const MachOAnalyzer* ma       = (MachOAnalyzer*)this->loadAddress(state);
     const bool enableTpro         = state.config.process.enableTproDataConst;
     __block uint16_t     format   = 0;
@@ -2012,13 +2049,14 @@ void Loader::setUpPageInLinking(Diagnostics& diag, RuntimeState& state, uintptr_
     STACK_ALLOC_OVERFLOW_SAFE_ARRAY(PageInLinkingRange, dyldPageInRegionInfo, 8);
     ma->withChainStarts(diag, ma->chainStartsOffset(), ^(const dyld_chained_starts_in_image* startsInfo) {
         // build mwl_region array and compute page starts size
+        const Header* mh = (const Header*)ma;
         __block const dyld_chained_starts_in_segment* lastSegChainInfo = nullptr;
-        ma->forEachSegment(^(const MachOAnalyzer::SegmentInfo& segInfo, bool& stop) {
-            if ( segInfo.segIndex < startsInfo->seg_count ) {
-                if ( startsInfo->seg_info_offset[segInfo.segIndex] == 0 ) {
+        mh->forEachSegment(^(const Header::SegmentInfo& segInfo, bool& stop) {
+            if ( segInfo.segmentIndex < startsInfo->seg_count ) {
+                if ( startsInfo->seg_info_offset[segInfo.segmentIndex] == 0 ) {
                     return;
                 }
-                const dyld_chained_starts_in_segment* segChainInfo = (dyld_chained_starts_in_segment*)((uint8_t*)startsInfo + startsInfo->seg_info_offset[segInfo.segIndex]);
+                const dyld_chained_starts_in_segment* segChainInfo = (dyld_chained_starts_in_segment*)((uint8_t*)startsInfo + startsInfo->seg_info_offset[segInfo.segmentIndex]);
                 if ( format == 0 ) {
                     format = segChainInfo->pointer_format;
                 }
@@ -2035,18 +2073,18 @@ void Loader::setUpPageInLinking(Diagnostics& diag, RuntimeState& state, uintptr_
                 }
                 PageInLinkingRange rangeInfo;
                 rangeInfo.region.mwlr_fd          = fd;
-                rangeInfo.region.mwlr_protections = segInfo.protections; // Note: DATA_CONST is r/w at this point, so objc can do its fixups
+                rangeInfo.region.mwlr_protections = segInfo.initProt; // Note: DATA_CONST is r/w at this point, so objc can do its fixups
                 rangeInfo.region.mwlr_file_offset = segInfo.fileOffset + sliceOffset;
-                rangeInfo.region.mwlr_address     = segInfo.vmAddr + slide;
+                rangeInfo.region.mwlr_address     = segInfo.vmaddr + slide;
                 rangeInfo.region.mwlr_size        = pageSize * segChainInfo->page_count; // in case some pages don't have fixups, don't use segment size
-                rangeInfo.segName                 = segInfo.segName;
+                rangeInfo.segName                 = segInfo.segmentName;
                 rangeInfo.chainInfo               = segChainInfo;
                 if ( canUsePageInLinkingSyscall ) {
                     // this is where we tune which fixups are done by the kernel
                     // currently only single page DATA segments are done by dyld
                     // the kernel only supports 5 regions per syscall, so any segments past that are fixed up by dyld
-                    if ( (segInfo.readOnlyData || (segChainInfo->page_count > 1)) && (kernelPageInRegionInfo.count() < MWL_MAX_REGION_COUNT) ) {
-                        if (enableTpro && segInfo.readOnlyData) {
+                    if ( (segInfo.readOnlyData() || (segChainInfo->page_count > 1)) && (kernelPageInRegionInfo.count() < MWL_MAX_REGION_COUNT) ) {
+                        if (enableTpro && segInfo.readOnlyData()) {
                             rangeInfo.region.mwlr_protections |= VM_PROT_TPRO;
                         }
                         kernelPageInRegionInfo.push_back(rangeInfo);
@@ -2078,6 +2116,195 @@ void Loader::setUpPageInLinking(Diagnostics& diag, RuntimeState& state, uintptr_
 }
 #endif // !TARGET_OS_SIMULATOR && !TARGET_OS_EXCLAVEKIT
 
+
+static uintptr_t targetValue(Diagnostics& diag, const Header* hdr, const mach_o::Fixup& fixupInfo, const Array<const void*>& bindTargets)
+{
+    uintptr_t newValue = 0;
+    if ( fixupInfo.isBind ) {
+        if ( fixupInfo.bind.bindOrdinal >= bindTargets.count() ) {
+            diag.error("out of range bind ordinal %d (max %llu)", fixupInfo.bind.bindOrdinal, bindTargets.count());
+            return 0;
+        }
+        else {
+            newValue = (uintptr_t)bindTargets[fixupInfo.bind.bindOrdinal] + fixupInfo.bind.embeddedAddend;
+        }
+    }
+    else {
+        newValue = (uintptr_t)hdr + (uintptr_t)fixupInfo.rebase.targetVmOffset;
+    }
+    if ( fixupInfo.authenticated ) {
+#if __has_feature(ptrauth_calls)
+        newValue = dyld3::MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::signPointer(newValue, (void*)fixupInfo.location, fixupInfo.auth.usesAddrDiversity, fixupInfo.auth.diversity, fixupInfo.auth.key);
+#else
+        diag.error("architecture does not support PAC");
+#endif
+    }
+    return newValue;
+}
+
+#if TARGET_OS_EXCLAVEKIT
+// We allocate this blob in the dyld heap for each segment that needs page-in linking.
+// We previously registered Loader::exclaveKitPageInFixups() to be called when a page needs fixups applied.
+// The blob for each segment is passed to exclaveKitPageInFixups() when the page handler calls it.
+struct EKCallbackInfo
+{
+    bool                                            sharedCachePages;   // which union variant
+    union {
+        struct {
+            std::span<const void*>                  bindTargets;            // found address of all bindOrdinals
+            const dyld_chained_starts_in_segment*   segInfo;                // chain fixup info from LINKEDIT of image
+            uintptr_t                               prefLoadAddr;           // preferred address of image (usually zero), needed for vmAddr based chains
+            uintptr_t                               loadAddress;            // mach_header of image with DATA pages being page-in linked
+            intptr_t                                slide;                  // slid of image with DATA pages being page-in linked
+        } standAloneImage;
+        struct {
+            const dyld_cache_slide_info5*           slideInfoHeader;        // slide info for region in read-only dyld cache
+            uintptr_t                               rebaseBaseAddress;      // address each rebase is relative (value_add + cache_slide)
+            uintptr_t                               regionStartAddress;     // start of DATA region for this slide info (for page index computation)
+        } sharedCacheImage;
+    };
+};
+
+void Loader::setUpExclaveKitPageInLinking(Diagnostics& diag, RuntimeState& state, uintptr_t slide, uint64_t sliceOffset, const Array<const void*>& bindTargets) const
+{
+    Image  image(this->loadAddress(state));
+    if ( !image.hasChainedFixups() ) {
+        diag.error("no chained fixups");
+        return;
+    }
+
+    if ( state.config.log.fixups || state.config.log.segments )
+        state.log("Setting up exclave page-in linking for %s\n", this->path(state));
+    std::span<const void*> bindTargetsPermanent;
+    const uint32_t         segCount = image.header()->segmentCount();
+    for (uint32_t segIndex=0; segIndex < segCount; ++segIndex) {
+        if ( const dyld_chained_starts_in_segment* segInfo = image.chainedFixups().startsForSegment(segIndex) ) {
+            // lazily build copy bindTargets as separate allocation so it can be shared by multiple segments
+            if ( !bindTargets.empty() && bindTargetsPermanent.empty() ) {
+                size_t allocationSize = bindTargets.count()*sizeof(void*);
+                void* allocation = state.persistentAllocator.malloc(allocationSize);
+                memcpy(allocation, &bindTargets[0], allocationSize);
+                bindTargetsPermanent = std::span<const void*>((const void**)allocation, bindTargets.count());
+            }
+            EKCallbackInfo* cbInfo = (EKCallbackInfo*)state.persistentAllocator.malloc(sizeof(EKCallbackInfo));
+            cbInfo->sharedCachePages             = false;
+            cbInfo->standAloneImage.bindTargets  = bindTargetsPermanent;
+            cbInfo->standAloneImage.segInfo      = segInfo;
+            cbInfo->standAloneImage.loadAddress  = (uintptr_t)image.header();
+            cbInfo->standAloneImage.prefLoadAddr = cbInfo->standAloneImage.loadAddress - slide;
+            cbInfo->standAloneImage.slide        = slide;
+
+            uintptr_t   segmentAddress    = (uintptr_t)image.header() + segInfo->segment_offset;
+            size_t      sizeNeedingFixups = segInfo->page_count * segInfo->page_size;
+            size_t      segmentSize       = image.header()->segmentVmSize(segIndex);
+            if ( state.config.log.segments ) {
+                std::string_view segName = image.header()->segmentName(segIndex);
+                state.log("page-in link setup: %14.*s 0x%012lX->0x%012lX\n",
+                          (int)segName.size(), segName.data(),
+                          segmentAddress, segmentAddress+sizeNeedingFixups);
+            }
+            xrt_dyld_register_dynamic_fixups(segmentAddress, sizeNeedingFixups, segmentSize, cbInfo);
+        }
+    }
+}
+
+static uintptr_t targetValue(const mach_o::Fixup& fixupInfo, const EKCallbackInfo* cbInfo, uintptr_t offsetToFinalAddress)
+{
+    uintptr_t newValue = 0;
+    if ( fixupInfo.isBind ) {
+        assert(!cbInfo->sharedCachePages);
+        assert(fixupInfo.bind.bindOrdinal < cbInfo->standAloneImage.bindTargets.size());
+        newValue = (uintptr_t)cbInfo->standAloneImage.bindTargets[fixupInfo.bind.bindOrdinal] + fixupInfo.bind.embeddedAddend;
+    }
+    else {
+        if ( cbInfo->sharedCachePages )
+            newValue = cbInfo->sharedCacheImage.rebaseBaseAddress + (uintptr_t)fixupInfo.rebase.targetVmOffset;
+        else
+            newValue = cbInfo->standAloneImage.loadAddress + (uintptr_t)fixupInfo.rebase.targetVmOffset;
+    }
+    if ( fixupInfo.authenticated ) {
+        newValue = dyld3::MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::signPointer(newValue, (void*)((uintptr_t)fixupInfo.location + offsetToFinalAddress), fixupInfo.auth.usesAddrDiversity, fixupInfo.auth.diversity, fixupInfo.auth.key);
+    }
+    return newValue;
+}
+
+// called during a page fault to apply fixups to a single page
+void Loader::exclaveKitPageInFixups(void* cbarg, uintptr_t pageAddress, void* __sized_by(size) buffer, size_t size)
+{
+    assert(size == 0x4000);
+    const EKCallbackInfo* cbInfo = (EKCallbackInfo*)cbarg;
+    uint16_t  pointerFormat = 0;
+    uint32_t  chainStartOffset = 0;
+    uint64_t  baseAddressForRebases = 0;
+    if ( cbInfo->sharedCachePages ) {
+        uintptr_t pageOffsetInRegion = pageAddress - cbInfo->sharedCacheImage.regionStartAddress;
+        uint32_t  pageIndex          = (uint32_t)(pageOffsetInRegion / 0x4000);
+        assert(pageAddress >= cbInfo->sharedCacheImage.regionStartAddress);
+        assert(pageIndex < cbInfo->sharedCacheImage.slideInfoHeader->page_starts_count);
+        chainStartOffset      = cbInfo->sharedCacheImage.slideInfoHeader->page_starts[pageIndex];
+        pointerFormat         = DYLD_CHAINED_PTR_ARM64E_SHARED_CACHE;   // would be nice if this was in dyld_cache_slide_info5
+        baseAddressForRebases = cbInfo->sharedCacheImage.rebaseBaseAddress;
+    }
+    else {
+        const dyld_chained_starts_in_segment* segInfo = cbInfo->standAloneImage.segInfo;
+        uintptr_t segmentStartAddress = cbInfo->standAloneImage.loadAddress + segInfo->segment_offset;
+        uintptr_t pageOffsetInSegment = pageAddress - segmentStartAddress;
+        uint32_t  pageIndex           = (uint32_t)(pageOffsetInSegment / 0x4000);
+        assert(pageAddress >= segmentStartAddress);
+        assert(pageIndex < segInfo->page_count);
+        chainStartOffset      = segInfo->page_start[pageIndex];
+        pointerFormat         = segInfo->pointer_format;
+        baseAddressForRebases = cbInfo->standAloneImage.prefLoadAddr;
+    }
+    if ( chainStartOffset == DYLD_CHAINED_PTR_START_NONE )
+        return; // page has no fixups
+    const ChainedFixups::PointerFormat& pf = ChainedFixups::PointerFormat::make(pointerFormat);
+    const void* chainStartLoc = (void*)((uint8_t*)buffer + chainStartOffset);
+    const void* nextLoc       = nullptr;
+    const void* endPage       = (void*)((uint8_t*)buffer + 0x4000);
+    const uintptr_t offsetToFinalAddress = pageAddress - (uintptr_t)buffer;
+    for ( const void* fixupLoc = chainStartLoc; (fixupLoc != nullptr); fixupLoc = nextLoc) {
+        // get next before applying fixups, since that will overwrite fields
+        nextLoc = pf.nextLocation(fixupLoc);
+        // parse fixup and evaluate to pointer value
+        mach_o::Fixup fixup    = pf.parseChainEntry(fixupLoc, nullptr, baseAddressForRebases);
+        uintptr_t     newValue = targetValue(fixup, cbInfo, offsetToFinalAddress);
+        // set pointer
+        *((uintptr_t*)fixupLoc) = (uintptr_t)newValue;
+        
+        if ( (nextLoc != nullptr) && (endPage != nullptr) ) {
+            assert(nextLoc < endPage && "chain went off of end of page");
+        }
+    }
+}
+
+// now that we can allocate memory and the dyld cache is mapped, we can register
+// page-fault handlers to do page-in linking for shared cache pages
+void Loader::setUpExclaveKitSharedCachePageInLinking(RuntimeState& state)
+{
+    assert(state.config.process.sharedCachePageInLinking);
+    assert(state.config.dyldCache.addr != nullptr);
+    const DyldSharedCache* dyldCache = state.config.dyldCache.addr;
+    dyldCache->forEachCache(^(const DyldSharedCache *cache, bool& stopCache) {
+        cache->forEachSlideInfo(^(uint64_t mappingStartAddress, uint64_t mappingSize, const uint8_t* mappingPagesStart,
+                                  uint64_t slideInfoOffset, uint64_t slideInfoSize, const dyld_cache_slide_info* slideInfoHeader) {
+            assert(slideInfoHeader->version == 5);
+            const dyld_cache_slide_info5* slinfo = (dyld_cache_slide_info5*)slideInfoHeader;
+            EKCallbackInfo*               cbInfo = (EKCallbackInfo*)state.persistentAllocator.malloc(sizeof(EKCallbackInfo));
+            cbInfo->sharedCachePages                    = true;
+            cbInfo->sharedCacheImage.slideInfoHeader    = slinfo;
+            cbInfo->sharedCacheImage.rebaseBaseAddress  = slinfo->value_add + state.config.dyldCache.slide;
+            cbInfo->sharedCacheImage.regionStartAddress = (uintptr_t)mappingPagesStart;
+            if ( state.config.log.segments ) {
+                state.log("page-in link setup dyld cache: 0x%012lX->0x%012llX\n", (long)mappingPagesStart, (long)mappingPagesStart+mappingSize);
+            }
+            size_t  sizeNeedingFixups = mappingSize; // FIXME: in theory there might be pages at end that don't need page-in linking
+            xrt_dyld_register_dynamic_fixups((uint64_t)mappingPagesStart, sizeNeedingFixups, mappingSize, (void*)cbInfo);
+        });
+    });
+}
+#endif
+
 void Loader::applyFixupsGeneric(Diagnostics& diag, RuntimeState& state, uint64_t sliceOffset, const Array<const void*>& bindTargets,
                                 const Array<const void*>& overrideBindTargets, bool laziesMustBind,
                                 const Array<MissingFlatLazySymbol>& missingFlatLazySymbols) const
@@ -2086,25 +2313,62 @@ void Loader::applyFixupsGeneric(Diagnostics& diag, RuntimeState& state, uint64_t
     const uintptr_t      slide = ma->getSlide();
     if ( ma->hasChainedFixups() ) {
         bool applyFixupsNow = true;
-#if !TARGET_OS_SIMULATOR && !TARGET_OS_EXCLAVEKIT
+#if TARGET_OS_EXCLAVEKIT
+        if ( state.config.process.pageInLinkingMode == 2 ) {
+            this->setUpExclaveKitPageInLinking(diag, state, slide, sliceOffset, bindTargets);
+            // if we cannot do page-in-linking, then do fixups now
+            applyFixupsNow = diag.hasError();
+            diag.clearError();
+        }
+#else
+  #if !TARGET_OS_SIMULATOR
         // only do page in linking, if binary has standard chained fixups, config allows, and not so many targets that is wastes wired memory
-        if ( (state.config.process.pageInLinkingMode != 0) && ma->hasChainedFixupsLoadCommand() && (bindTargets.count() < 10000) ) {
+        if ( (state.config.process.pageInLinkingMode != 0) && ma->hasChainedFixupsLoadCommand() && (bindTargets.count() < 10000) && !this->hasFuncVarFixups ) {
             this->setUpPageInLinking(diag, state, slide, sliceOffset, bindTargets);
             // if we cannot do page-in-linking, then do fixups now
             applyFixupsNow = diag.hasError();
             diag.clearError();
         }
-#endif // !TARGET_OS_SIMULATOR && !TARGET_OS_EXCLAVEKIT
+  #endif // !TARGET_OS_SIMULATOR
+#endif // TARGET_OS_EXCLAVEKIT
         if ( applyFixupsNow ) {
-            // walk all chains
-            ma->withChainStarts(diag, ma->chainStartsOffset(), ^(const dyld_chained_starts_in_image* startsInfo) {
-                ma->fixupAllChainedFixups(diag, startsInfo, slide, bindTargets, ^(void* loc, void* newValue) {
-                    if ( state.config.log.fixups )
-                        state.log("fixup: *0x%012lX = 0x%012lX\n", (uintptr_t)loc, (uintptr_t)newValue);
-                    *((uintptr_t*)loc) = (uintptr_t)newValue;
+            // walk all chains in all segments and apply fixups non-lazily
+            if ( ma->hasChainedFixupsLoadCommand() ) {
+                mach_o::Image image((mach_header*)ma);
+                uint64_t      baseAddress = image.header()->preferredLoadAddress();
+                image.withSegments(^(std::span<const mach_o::MappedSegment> segments) {
+                    image.chainedFixups().forEachFixupChainStartLocation(segments, ^(const void* chainStart, uint32_t segIndex, uint32_t pageIndex, uint32_t pageSize, const mach_o::ChainedFixups::PointerFormat& pf, bool& stop) {
+                        pf.forEachFixupLocationInChain(chainStart, baseAddress, &segments[segIndex], {}, pageIndex, pageSize, ^(const mach_o::Fixup& fixupInfo, bool& stop2) {
+                            const void* loc      = fixupInfo.location;
+                            uintptr_t   newValue = targetValue(diag, image.header(), fixupInfo, bindTargets);
+                            if ( diag.hasError() ) {
+                                stop  = true;
+                                stop2 = true;
+                                return;
+                            }
+                            if ( state.config.log.fixups )
+                                state.log("fixup: *0x%012lX = 0x%012lX\n", (uintptr_t)loc, (uintptr_t)newValue);
+                            *((uintptr_t*)loc) = (uintptr_t)newValue;
+                        });
+                    });
                 });
-            });
+            }
+            else {
+                // this is a very old arm64e binary that use opcodes to describe the chains
+                ma->withChainStarts(diag, ma->chainStartsOffset(), ^(const dyld_chained_starts_in_image* startsInfo) {
+                    ma->fixupAllChainedFixups(diag, startsInfo, slide, bindTargets, ^(void* loc, void* newValue) {
+                        if ( state.config.log.fixups )
+                            state.log("fixup: *0x%012lX = 0x%012lX\n", (uintptr_t)loc, (uintptr_t)newValue);
+                        *((uintptr_t*)loc) = (uintptr_t)newValue;
+                    });
+                });
+            }
         }
+#if TARGET_OS_EXCLAVEKIT && XRT_DYLD_FIXUP_INTERFACE_VERSION >= 1
+        // At this point, it is safe for the ExclaveKit runtime to touch the
+        // runtime sections; let them know.
+        xrt_platform_premapped_macho_finalize_memory_state((mach_header *)this->loadAddress(state));
+#endif
     }
     else if ( ma->hasOpcodeFixups() ) {
         // process all rebase opcodes
@@ -2124,21 +2388,22 @@ void Loader::applyFixupsGeneric(Diagnostics& diag, RuntimeState& state, uint64_t
             uintptr_t* loc      = (uintptr_t*)((uint8_t*)ma + runtimeOffset);
             uintptr_t  newValue = (uintptr_t)(bindTargets[targetIndex]);
 
-            if ( state.config.log.fixups )
-                state.log("fixup: *0x%012lX = 0x%012lX <%s/bind#%u>\n", (uintptr_t)loc, (uintptr_t)newValue, this->leafName(), targetIndex);
-            *loc = newValue;
-
-#if !TARGET_OS_EXCLAVEKIT
+#if !TARGET_OS_EXCLAVEKIT && BUILDING_DYLD
             // Record missing lazy symbols
-            if ( newValue == (uintptr_t)state.libdyldMissingSymbol ) {
+            if ( newValue == (uintptr_t)&missing_symbol_abort ) {
                 for (const MissingFlatLazySymbol& missingSymbol : missingFlatLazySymbols) {
                     if ( missingSymbol.bindTargetIndex == targetIndex ) {
                         state.addMissingFlatLazySymbol(this, missingSymbol.symbolName, loc);
                         break;
                     }
                 }
+                newValue = 0;
             }
-#endif // !TARGET_OS_EXCLAVEKIT
+#endif
+            if ( state.config.log.fixups )
+                state.log("fixup: *0x%012lX = 0x%012lX <%s/bind#%u>\n", (uintptr_t)loc, (uintptr_t)newValue, this->leafName(state), targetIndex);
+            *loc = newValue;
+
         }, ^(uint64_t runtimeOffset, unsigned overrideBindTargetIndex, bool& stop) {
             uintptr_t* loc      = (uintptr_t*)((uint8_t*)ma + runtimeOffset);
             uintptr_t  newValue = (uintptr_t)(overrideBindTargets[overrideBindTargetIndex]);
@@ -2146,12 +2411,12 @@ void Loader::applyFixupsGeneric(Diagnostics& diag, RuntimeState& state, uint64_t
             // Skip missing weak binds
             if ( newValue == UINTPTR_MAX ) {
                 if ( state.config.log.fixups )
-                    state.log("fixup: *0x%012lX (skipping missing weak bind) <%s/weak-bind#%u>\n", (uintptr_t)loc, this->leafName(), overrideBindTargetIndex);
+                    state.log("fixup: *0x%012lX (skipping missing weak bind) <%s/weak-bind#%u>\n", (uintptr_t)loc, this->leafName(state), overrideBindTargetIndex);
                 return;
             }
 
             if ( state.config.log.fixups )
-                state.log("fixup: *0x%012lX = 0x%012lX <%s/weak-bind#%u>\n", (uintptr_t)loc, (uintptr_t)newValue, this->leafName(), overrideBindTargetIndex);
+                state.log("fixup: *0x%012lX = 0x%012lX <%s/weak-bind#%u>\n", (uintptr_t)loc, (uintptr_t)newValue, this->leafName(state), overrideBindTargetIndex);
             *loc = newValue;
         });
     }
@@ -2174,11 +2439,37 @@ void Loader::applyFixupsGeneric(Diagnostics& diag, RuntimeState& state, uint64_t
             uintptr_t* loc      = (uintptr_t*)((uint8_t*)ma + runtimeOffset);
             uintptr_t  newValue = (uintptr_t)(bindTargets[targetIndex]);
             if ( state.config.log.fixups )
-                state.log("fixup: *0x%012lX = 0x%012lX <%s/bind#%u>\n", (uintptr_t)loc, (uintptr_t)newValue, this->leafName(), targetIndex);
+                state.log("fixup: *0x%012lX = 0x%012lX <%s/bind#%u>\n", (uintptr_t)loc, (uintptr_t)newValue, this->leafName(state), targetIndex);
             *loc = newValue;
         });
     }
 #endif // SUPPORT_CLASSIC_RELOCS
+}
+
+void Loader::applyFunctionVariantFixups(Diagnostics& diag, const RuntimeState& state) const
+{
+    // check if image use function-variants and needs some internal pointers adjusted
+    // dylibs in cache have adjustments done in adjustFunctionVariantsInDyldCache()
+    if ( this->dylibInDyldCache || !this->hasFuncVarFixups )
+        return;
+    const Header* hdr = this->header(state);
+    Image         image((mach_header*)hdr);
+    if ( !image.hasFunctionVariantFixups() )
+        return;
+    uint64_t slide = hdr->getSlide();
+    image.functionVariantFixups().forEachFixup(^(mach_o::FunctionVariantFixups::InternalFixup fixupInfo) {
+        uint64_t   bestImplOffset = this->selectFromFunctionVariants(diag, state, "<internal>", fixupInfo.variantIndex);
+        uintptr_t  bestImplAddr   = (uintptr_t)hdr + (uintptr_t)bestImplOffset;
+        uint64_t   address        = hdr->segmentVmAddr(fixupInfo.segIndex) + fixupInfo.segOffset + slide;
+        uintptr_t* loc            = (uintptr_t*)address;
+#if __has_feature(ptrauth_calls)
+        if ( fixupInfo.pacAuth )
+            bestImplAddr = signPointer(bestImplAddr, loc, fixupInfo.pacAddress, fixupInfo.pacDiversity, (ptrauth_key)fixupInfo.pacKey);
+#endif
+        if ( state.config.log.fixups )
+            state.log("fixup: *0x%012lX = 0x%012lX <function-variant-table#%u>\n", (uintptr_t)loc, (uintptr_t)bestImplAddr, fixupInfo.variantIndex);
+        *loc = bestImplAddr;
+    });
 }
 
 void Loader::findAndRunAllInitializers(RuntimeState& state) const
@@ -2186,16 +2477,16 @@ void Loader::findAndRunAllInitializers(RuntimeState& state) const
     Diagnostics                           diag;
     const MachOAnalyzer*                  ma              = this->analyzer(state);
     dyld3::MachOAnalyzer::VMAddrConverter vmAddrConverter = ma->makeVMAddrConverter(true);
-    state.memoryManager.withReadOnlyMemory([&]{
-        ma->forEachInitializer(diag, vmAddrConverter, ^(uint32_t offset) {
-            void *func = (void *)((uint8_t*)ma + offset);
-            if ( state.config.log.initializers )
-                state.log("running initializer %p in %s\n", func, this->path());
+    ma->forEachInitializer(diag, vmAddrConverter, ^(uint32_t offset) {
+        void *func = (void *)((uint8_t*)ma + offset);
+        if ( state.config.log.initializers )
+            state.log("running initializer %p in %s\n", func, this->path(state));
 #if __has_feature(ptrauth_calls)
-            func = __builtin_ptrauth_sign_unauthenticated(func, ptrauth_key_asia, 0);
+        func = __builtin_ptrauth_sign_unauthenticated(func, ptrauth_key_asia, 0);
 #endif
-            dyld3::ScopedTimer timer(DBG_DYLD_TIMING_STATIC_INITIALIZER, (uint64_t)ma, (uint64_t)func, 0);
-            ((Initializer)func)(state.config.process.argc, state.config.process.argv, state.config.process.envp, state.config.process.apple, state.vars);
+        dyld3::ScopedTimer timer(DBG_DYLD_TIMING_STATIC_INITIALIZER, (uint64_t)ma, (uint64_t)func, 0);
+        MemoryManager::withReadOnlyMemory([&]{
+            ((Initializer)func)(state.config.process.argc, state.config.process.argv, state.config.process.envp, state.config.process.apple, &state.vars);
         });
     });
 
@@ -2207,79 +2498,87 @@ void Loader::findAndRunAllInitializers(RuntimeState& state) const
     typedef void (*Terminator)(void*);
     ma->forEachTerminator(diag, vmAddrConverter, ^(uint32_t offset) {
         Terminator func = (Terminator)((uint8_t*)ma + offset);
-        state.libSystemHelpers->__cxa_atexit(func, nullptr, (void*)ma);
+        state.libSystemHelpers.__cxa_atexit(func, nullptr, (void*)ma);
         if ( state.config.log.initializers )
-            state.log("registering old style destructor %p for %s\n", func, this->path());
+            state.log("registering old style destructor %p for %s\n", func, this->path(state));
     });
 #endif // !TARGET_OS_EXCLAVEKIT
 }
 
-void Loader::runInitializersBottomUp(RuntimeState& state, Array<const Loader*>& danglingUpwards) const
+
+// This recusively walks the image graph.  There is the potential for cycles.  To break cycles, if the image is delayed, we
+// use the visitedDelayed set to track if the image was already visited.  If the image is not delayed, we use
+// beginInitializers() to mark the image visited.
+// We have to recurse into delayed dylibs because they may need to be initialized because they have weak-defs or interposing tuples.
+void Loader::runInitializersBottomUp(RuntimeState& state, Array<const Loader*>& danglingUpwards, Array<const Loader*>& visitedDelayed) const
 {
-    // do nothing if already initializers already run
-    if ( (const_cast<Loader*>(this))->beginInitializers(state) )
-        return;
+    // don't run initializers in images that are in delayInit state
+    // but continue down graph and run initializers in children if needed
+    const bool delayed = this->isDelayInit(state) ;
+
+    // do nothing if already visited
+    if ( delayed ) {
+        if ( visitedDelayed.contains(this) )
+            return;
+        // use 'visitedDelayed' to mark we have already handled his image
+        visitedDelayed.push_back(this);
+    }
+    else {
+        // marks visited
+        if ( (const_cast<Loader*>(this))->beginInitializers(state) )
+            return;
+    }
 
     //state.log("runInitializersBottomUp(%s)\n", this->path());
 
     // make sure everything below this image is initialized before running my initializers
     const uint32_t depCount = this->dependentCount();
     for ( uint32_t i = 0; i < depCount; ++i ) {
-        DependentDylibAttributes childAttrs;
+        LinkedDylibAttributes childAttrs;
         if ( Loader* child = this->dependent(state, i, &childAttrs) ) {
-            if ( childAttrs.delayInit ) {
-                // Delayed-init images are loaded and bound (which is free for dyld shared cache dylibs).
-                // They are exposed to lldb and crash reporter, but are placed in the state.delayLoaded list.
-                // ObjC runtime is not told about them (because they are not in state.loaded) and initializers
-                // in them are not run, because of this code here.
-                // The way clients "activate" a delayed-init dylib on first-use, is to call dlopen()
-                // on the image.  That will cause this method to be called on the image and its
-                // initialzers will be run (since only dependencies are potentially skipped, the
-                // top level dlopen()ed dylib is not skipped).
-                // Note: A dylib is only delay-inited if all paths to it are delay-init.
-                // If there are any regular links against the dylib, those links will traverse the graph
-                // and keep the image in state.loaded and cause initializers to run here.
-            }
-            else if ( childAttrs.upward ) {
+            if ( childAttrs.upward ) {
                 // add upwards to list to process later
                 if ( !danglingUpwards.contains(child) )
                     danglingUpwards.push_back(child);
             }
             else {
-                child->runInitializersBottomUp(state, danglingUpwards);
+                child->runInitializersBottomUp(state, danglingUpwards, visitedDelayed);
             }
         }
     }
 
-    // tell objc to run any +load methods in this image (done before C++ initializers)
-    state.notifyObjCInit(this);
+    if ( !delayed ) {
+        // tell objc to run any +load methods in this image (done before C++ initializers)
+        state.notifyObjCInit(this);
 
-    // run initializers for this image
-    this->runInitializers(state);
+        // run initializers for this image
+        this->runInitializers(state);
+    }
 }
 
 void Loader::runInitializersBottomUpPlusUpwardLinks(RuntimeState& state) const
 {
     //state.log("runInitializersBottomUpPlusUpwardLinks() %s\n", this->path());
-    state.memoryManager.withWritableMemory([&]{
+    MemoryManager::withWritableMemory([&]{
         // recursively run all initializers
-        STACK_ALLOC_ARRAY(const Loader*, danglingUpwards, state.loaded.size());
-        this->runInitializersBottomUp(state, danglingUpwards);
+        STACK_ALLOC_ARRAY(const Loader*, danglingUpwards, state.loaded.size()+state.delayLoaded.size());
+        STACK_ALLOC_ARRAY(const Loader*, visitedDelayed, state.delayLoaded.size());
+        this->runInitializersBottomUp(state, danglingUpwards, visitedDelayed);
 
         //state.log("runInitializersBottomUpPlusUpwardLinks(%s), found %d dangling upwards\n", this->path(), danglingUpwards.count());
 
         // go back over all images that were upward linked, and recheck they were initialized (might be danglers)
-        STACK_ALLOC_ARRAY(const Loader*, extraDanglingUpwards, state.loaded.size());
+        STACK_ALLOC_ARRAY(const Loader*, extraDanglingUpwards, state.loaded.size()+state.delayLoaded.size());
         for ( const Loader* ldr : danglingUpwards ) {
             //state.log("running initializers for dangling upward link %s\n", ldr->path());
-            ldr->runInitializersBottomUp(state, extraDanglingUpwards);
+            ldr->runInitializersBottomUp(state, extraDanglingUpwards, visitedDelayed);
         }
         if ( !extraDanglingUpwards.empty() ) {
             // in case of double upward dangling images, check initializers again
             danglingUpwards.resize(0);
             for ( const Loader* ldr : extraDanglingUpwards ) {
                 //state.log("running initializers for dangling upward link %s\n", ldr->path());
-                ldr->runInitializersBottomUp(state, danglingUpwards);
+                ldr->runInitializersBottomUp(state, danglingUpwards, visitedDelayed);
             }
         }
     });
@@ -2324,6 +2623,7 @@ void Loader::forEachBindTarget(Diagnostics& diag, RuntimeState& state, CacheWeak
                 targetInfo.isCode              = false;
                 targetInfo.isWeakDef           = false;
                 targetInfo.isMissingFlatLazy   = false;
+                targetInfo.isMaterializing     = false;
             } else {
                 targetInfo.targetRuntimeOffset += info.addend;
             }
@@ -2331,6 +2631,16 @@ void Loader::forEachBindTarget(Diagnostics& diag, RuntimeState& state, CacheWeak
             ++overrideBindTargetIndex;
         });
     });
+}
+
+uint64_t Loader::functionVariantTableVMOffset(const RuntimeState& state) const
+{
+    uint64_t      result = 0;
+    const Header* hdr    = (Header*)(this->mf(state));
+    if ( hdr->hasFunctionsVariantTable(result) )
+        return result;
+
+    return 0; // assert?
 }
 
 bool Loader::hasConstantSegmentsToProtect() const
@@ -2343,17 +2653,17 @@ void Loader::makeSegmentsReadOnly(RuntimeState& state) const
 {
     const MachOAnalyzer* ma    = this->analyzer(state);
     uintptr_t            slide = ma->getSlide();
-    ma->forEachSegment(^(const MachOAnalyzer::SegmentInfo& segInfo, bool& stop) {
-        if ( segInfo.readOnlyData ) {
+    ((const Header *)ma)->forEachSegment(^(const Header::SegmentInfo& segInfo, bool& stop) {
+        if ( segInfo.readOnlyData() ) {
     #if TARGET_OS_EXCLAVEKIT
             //TODO: EXCLAVES
             (void)slide;
     #else
-            const uint8_t* start = (uint8_t*)(segInfo.vmAddr + slide);
-            size_t         size  = (size_t)segInfo.vmSize;
+            const uint8_t* start = (uint8_t*)(segInfo.vmaddr + slide);
+            size_t         size  = (size_t)segInfo.vmsize;
             state.config.syscall.mprotect((void*)start, size, PROT_READ);
             if ( state.config.log.segments )
-                state.log("mprotect 0x%012lX->0x%012lX to read-only (%s)\n", (long)start, (long)start + size, this->leafName());
+                state.log("mprotect 0x%012lX->0x%012lX to read-only (%s)\n", (long)start, (long)start + size, this->leafName(state));
     #endif
         }
     });
@@ -2363,17 +2673,17 @@ void Loader::makeSegmentsReadWrite(RuntimeState& state) const
 {
     const MachOAnalyzer* ma    = this->analyzer(state);
     uintptr_t            slide = ma->getSlide();
-    ma->forEachSegment(^(const MachOAnalyzer::SegmentInfo& segInfo, bool& stop) {
-        if ( segInfo.readOnlyData ) {
+    ((const Header *)ma)->forEachSegment(^(const Header::SegmentInfo& segInfo, bool& stop) {
+        if ( segInfo.readOnlyData() ) {
     #if TARGET_OS_EXCLAVEKIT
             //TODO: EXCLAVES
             (void)slide;
     #else
-            const uint8_t* start = (uint8_t*)(segInfo.vmAddr + slide);
-            size_t         size  = (size_t)segInfo.vmSize;
+            const uint8_t* start = (uint8_t*)(segInfo.vmaddr + slide);
+            size_t         size  = (size_t)segInfo.vmsize;
             state.config.syscall.mprotect((void*)start, size, PROT_READ | PROT_WRITE);
             if ( state.config.log.segments )
-                state.log("mprotect 0x%012lX->0x%012lX to read-write (%s)\n", (long)start, (long)start + size, this->leafName());
+                state.log("mprotect 0x%012lX->0x%012lX to read-write (%s)\n", (long)start, (long)start + size, this->leafName(state));
     #endif
         }
     });
@@ -2381,12 +2691,13 @@ void Loader::makeSegmentsReadWrite(RuntimeState& state) const
 
 void Loader::logSegmentsFromSharedCache(RuntimeState& state) const
 {
-    state.log("Using mapping in dyld cache for %s\n", this->path());
+    state.log("Using mapping in dyld cache for %s\n", this->path(state));
     uint64_t cacheSlide = state.config.dyldCache.slide;
-    this->loadAddress(state)->forEachSegment(^(const MachOLoaded::SegmentInfo& info, bool& stop) {
-        state.log("%14s (%c%c%c) 0x%012llX->0x%012llX \n", info.segName,
+    ((const Header *)this->loadAddress(state))->forEachSegment(^(const Header::SegmentInfo& info, bool& stop) {
+        state.log("%14.*s (%c%c%c) 0x%012llX->0x%012llX \n",
+                  (int)info.segmentName.size(), info.segmentName.data(),
                   (info.readable() ? 'r' : '.'), (info.writable() ? 'w' : '.'), (info.executable() ? 'x' : '.'),
-                  info.vmAddr + cacheSlide, info.vmAddr + cacheSlide + info.vmSize);
+                  info.vmaddr + cacheSlide, info.vmaddr + cacheSlide + info.vmsize);
     });
 }
 
@@ -2402,7 +2713,7 @@ void Loader::addWeakDefsToMap(RuntimeState& state, const std::span<const Loader*
 
         // NOTE: using the nlist is faster to scan for weak-def exports, than iterating the exports trie
         Diagnostics diag;
-        uint64_t    baseAddress = ma->preferredLoadAddress();
+        uint64_t    baseAddress = ((const Header*)ma)->preferredLoadAddress();
         ma->forEachGlobalSymbol(diag, ^(const char* symbolName, uint64_t n_value, uint8_t n_type, uint8_t n_sect, uint16_t n_desc, bool& stop) {
             if ( (n_desc & N_WEAK_DEF) != 0 ) {
                 // only add if not already in map
@@ -2424,7 +2735,7 @@ void Loader::addWeakDefsToMap(RuntimeState& state, const std::span<const Loader*
 Loader::ResolvedSymbol Loader::resolveSymbol(Diagnostics& diag, RuntimeState& state, int libOrdinal, const char* symbolName,
                                              bool weakImport, bool lazyBind, CacheWeakDefOverride patcher, bool buildingCache) const
 {
-    __block ResolvedSymbol result = { nullptr, symbolName, 0, ResolvedSymbol::Kind::bindAbsolute, false, false };
+    __block ResolvedSymbol result = { nullptr, symbolName, 0, 0, ResolvedSymbol::Kind::bindAbsolute, false, false };
     if ( (libOrdinal > 0) && ((unsigned)libOrdinal <= this->dependentCount()) ) {
         result.targetLoader = dependent(state, libOrdinal - 1);
     }
@@ -2437,20 +2748,23 @@ Loader::ResolvedSymbol Loader::resolveSymbol(Diagnostics& diag, RuntimeState& st
     else if ( libOrdinal == BIND_SPECIAL_DYLIB_FLAT_LOOKUP ) {
         __block bool found = false;
         state.locks.withLoadersReadLock(^{
-            for ( const Loader* ldr : state.loaded ) {
-                // flat lookup can look in self, even if hidden
-                if ( ldr->hiddenFromFlat() && (ldr != this) )
-                    continue;
-                if ( ldr->hasExportedSymbol(diag, state, symbolName, Loader::shallow, Loader::skipResolver, &result) ) {
-                    found = true;
-                    return;
+            for (const Vector<ConstAuthLoader>* list : { &state.loaded, &state.delayLoaded } ) {
+                for ( const Loader* ldr : *list ) {
+                    // flat lookup can look in self, even if hidden
+                    if ( ldr->hiddenFromFlat() && (ldr != this) )
+                        continue;
+                    if ( ldr->hasExportedSymbol(diag, state, symbolName, Loader::shallow, Loader::skipResolver, &result) ) {
+                        found = true;
+                        return;
+                    }
                 }
             }
         });
         if ( found ) {
             // record the dynamic dependency so the symbol we found does not get unloaded from under us
-            if ( result.targetLoader != this )
+            if ( result.targetLoader != this ) {
                 state.addDynamicReference(this, result.targetLoader);
+            }
         }
         else {
             if ( weakImport ) {
@@ -2458,16 +2772,20 @@ Loader::ResolvedSymbol Loader::resolveSymbol(Diagnostics& diag, RuntimeState& st
                 result.kind                = ResolvedSymbol::Kind::bindAbsolute;
                 result.targetRuntimeOffset = 0;
             }
-            else if ( lazyBind && (state.libdyldMissingSymbolRuntimeOffset != 0) ) {
+#if BUILDING_DYLD
+            else if ( lazyBind ) {
                 // lazy bound symbols can be bound to __dyld_missing_symbol_abort
-                result.targetLoader        = state.libdyldLoader;
+                result.targetLoader        = nullptr;
                 result.targetSymbolName    = symbolName;
-                result.targetRuntimeOffset = (uintptr_t)state.libdyldMissingSymbolRuntimeOffset;
-                result.kind                = ResolvedSymbol::Kind::bindToImage;
+                result.targetRuntimeOffset = (uintptr_t)&missing_symbol_abort;
+                result.targetAddressForDlsym = 0;
+                result.kind                = ResolvedSymbol::Kind::bindAbsolute;
                 result.isCode              = false; // only used for arm64e which uses trie not nlist
                 result.isWeakDef           = false;
                 result.isMissingFlatLazy   = true;
+                result.isMaterializing     = false;
             }
+#endif
             else {
                 // missing symbol, but not weak-import or lazy-bound, so error
                 diag.error("symbol not found in flat namespace '%s'", symbolName);
@@ -2476,7 +2794,7 @@ Loader::ResolvedSymbol Loader::resolveSymbol(Diagnostics& diag, RuntimeState& st
         return result;
     }
     else if ( libOrdinal == BIND_SPECIAL_DYLIB_WEAK_LOOKUP ) {
-        const bool             verboseWeak        = false;
+        const bool             verboseWeak        = state.config.log.fixups;
         __block bool           foundFirst         = false;
 #if BUILDING_CACHE_BUILDER
         if ( buildingCache ) {
@@ -2487,7 +2805,7 @@ Loader::ResolvedSymbol Loader::resolveSymbol(Diagnostics& diag, RuntimeState& st
             // look first in /usr/lib/libc++, most will be here
             for ( const Loader* ldr : state.loaded ) {
                 ResolvedSymbol libcppResult;
-                if ( ldr->mf(state)->hasWeakDefs() && (strncmp(ldr->path(), "/usr/lib/libc++.", 16) == 0) ) {
+                if ( ldr->hasWeakDefs && (strncmp(ldr->path(state), "/usr/lib/libc++.", 16) == 0) ) {
                     if ( ldr->hasExportedSymbol(diag, state, symbolName, Loader::shallow, Loader::skipResolver, &libcppResult) ) {
                         if ( verboseWeak )
                             state.log("  using %s from libc++.dylib\n", symbolName);
@@ -2500,20 +2818,20 @@ Loader::ResolvedSymbol Loader::resolveSymbol(Diagnostics& diag, RuntimeState& st
             ResolvedSymbol selfResult;
             if ( this->hasExportedSymbol(diag, state, symbolName, Loader::shallow, Loader::skipResolver, &selfResult) ) {
                 if ( verboseWeak )
-                    state.log("  using %s from self %s\n", symbolName, this->path());
+                    state.log("  using %s from self %s\n", symbolName, this->path(state));
                 return selfResult;
             }
 
             // if this image directly links with something that also defines this weak-def, use that because we know it will be loaded
             const uint32_t depCount = this->dependentCount();
             for ( uint32_t i = 0; i < depCount; ++i ) {
-                Loader::DependentDylibAttributes depAttrs;
+                Loader::LinkedDylibAttributes depAttrs;
                 if ( Loader* depLoader = this->dependent(state, i, &depAttrs) ) {
                     if ( !depAttrs.upward ) {
                         ResolvedSymbol depResult;
                         if ( depLoader->hasExportedSymbol(diag, state, symbolName, Loader::staticLink, Loader::skipResolver, &depResult) ) {
                             if ( verboseWeak )
-                                state.log("  using %s from dependent %s\n", symbolName, depLoader->path());
+                                state.log("  using %s from dependent %s\n", symbolName, depLoader->path(state));
                             return depResult;
                         }
                     }
@@ -2528,7 +2846,7 @@ Loader::ResolvedSymbol Loader::resolveSymbol(Diagnostics& diag, RuntimeState& st
 #endif
         state.locks.withLoadersReadLock(^{
             if ( verboseWeak )
-                state.log("looking for weak-def symbol %s\n", symbolName);
+                state.log("looking for weak-def symbol '%s':\n", symbolName);
             state.weakDefResolveSymbolCount++;
             // 5000 is a guess that "this is a large C++ app" and could use a map to speed up coalescing
             if ( (state.weakDefResolveSymbolCount > 5000) && (state.weakDefMap == nullptr) ) {
@@ -2541,12 +2859,14 @@ Loader::ResolvedSymbol Loader::resolveSymbol(Diagnostics& diag, RuntimeState& st
                     result.targetLoader        = pos->second.targetLoader;
                     result.targetSymbolName    = symbolName;
                     result.targetRuntimeOffset = pos->second.targetRuntimeOffset;
+                    result.targetAddressForDlsym = 0;
                     result.kind                = ResolvedSymbol::Kind::bindToImage;
                     result.isCode              = pos->second.isCode;
                     result.isWeakDef           = pos->second.isWeakDef;
                     result.isMissingFlatLazy   = false;
+                    result.isMaterializing     = false;
                     if ( verboseWeak )
-                        state.log("  found %s in map, using impl from %s\n", symbolName, result.targetLoader->path());
+                        state.log("  found %s in map, using impl from %s\n", symbolName, result.targetLoader->path(state));
                     foundFirst = true;
                     return;
                 }
@@ -2561,46 +2881,52 @@ Loader::ResolvedSymbol Loader::resolveSymbol(Diagnostics& diag, RuntimeState& st
             STACK_ALLOC_ARRAY(CacheLookupResult, cacheResults, state.loaded.size());
 
             bool weakBindOpcodeClient = !this->dylibInDyldCache && this->mf(state)->hasOpcodeFixups();
-            for ( const Loader* ldr : state.loaded ) {
-                if ( ldr->mf(state)->hasWeakDefs() ) {
-                    ResolvedSymbol thisResult;
-                    // weak coalescing ignores hidden images
-                    if ( ldr->hiddenFromFlat() )
-                        continue;
-                    if ( ldr->hasExportedSymbol(diag, state, symbolName, Loader::shallow, Loader::skipResolver, &thisResult) ) {
-                        if ( weakBindOpcodeClient && !thisResult.isWeakDef && ldr->dylibInDyldCache ) {
-                            // rdar://75956202 ignore non-weak symbols in shared cache when opcode based binary is looking for symbols to coalesce
+            for (const Vector<ConstAuthLoader>* list : { &state.loaded, &state.delayLoaded } ) {
+                for ( const Loader* ldr : *list ) {
+                    if (  ldr->hasWeakDefs  ) {
+                        ResolvedSymbol thisResult;
+                        // weak coalescing ignores hidden images
+                        if ( ldr->hiddenFromFlat() )
                             continue;
-                        }
-                        if ( thisResult.targetLoader->dylibInDyldCache && !ldr->hasBeenFixedUp(state) )
-                            cacheResults.push_back({ thisResult.targetLoader, thisResult.targetRuntimeOffset });
+                        if ( ldr->hasExportedSymbol(diag, state, symbolName, Loader::shallow, Loader::skipResolver, &thisResult) ) {
+                            if ( weakBindOpcodeClient && !thisResult.isWeakDef && ldr->dylibInDyldCache ) {
+                                // rdar://75956202 ignore non-weak symbols in shared cache when opcode based binary is looking for symbols to coalesce
+                                continue;
+                            }
+                            if ( thisResult.targetLoader->dylibInDyldCache && !ldr->hasBeenFixedUp(state) )
+                                cacheResults.push_back({ thisResult.targetLoader, thisResult.targetRuntimeOffset });
 
-                        // record first implementation found, but keep searching
-                        if ( !foundFirst ) {
-                            foundFirst        = true;
-                            result            = thisResult;
-                            if ( verboseWeak )
-                                state.log("  using %s in %s\n", symbolName, thisResult.targetLoader->path());
-                        }
-                        if ( !thisResult.isWeakDef && result.isWeakDef ) {
-                            // non-weak wins over previous weak-def
-                            // we don't stop search because we need to see if this overrides anything in the dyld cache
-                            result = thisResult;
-                            if ( verboseWeak )
-                                state.log("  using non-weak %s in %s\n", symbolName, thisResult.targetLoader->path());
+                            // record first implementation found, but keep searching
+                            if ( !foundFirst ) {
+                                foundFirst        = true;
+                                result            = thisResult;
+                                if ( verboseWeak )
+                                    state.log("  using '%s' in %s\n", symbolName, thisResult.targetLoader->path(state));
+                            }
+                            if ( !thisResult.isWeakDef && result.isWeakDef ) {
+                                // non-weak wins over previous weak-def
+                                // we don't stop search because we need to see if this overrides anything in the dyld cache
+                                result = thisResult;
+                                if ( verboseWeak )
+                                    state.log("  using non-weak '%s' in %s\n", symbolName, thisResult.targetLoader->path(state));
+                            }
                         }
                     }
                 }
-            }
-            // if not found anywhere else and this image is hidden, try looking in itself
-            if ( !foundFirst && this->hiddenFromFlat() ) {
-                if ( verboseWeak )
-                        state.log("  did not find unhidden %s, trying self (%s)\n", symbolName, this->leafName());
-                ResolvedSymbol thisResult;
-                if ( this->hasExportedSymbol(diag, state, symbolName, Loader::shallow, Loader::skipResolver, &thisResult) ) {
-                    foundFirst = true;
-                    result     = thisResult;
+                // if not found anywhere else and this image is hidden, try looking in itself
+                if ( !foundFirst && this->hiddenFromFlat() ) {
+                    if ( verboseWeak )
+                        state.log("  did not find unhidden '%s', trying self (%s)\n", symbolName, this->leafName(state));
+                    ResolvedSymbol thisResult;
+                    if ( this->hasExportedSymbol(diag, state, symbolName, Loader::shallow, Loader::skipResolver, &thisResult) ) {
+                        foundFirst = true;
+                        result     = thisResult;
+                    }
                 }
+
+                // If we find an image in the regular image list, break out so we don't look in the delay init list
+                if ( foundFirst )
+                    break;
             }
 
             // Patch the cache if we chose a definition which overrides it
@@ -2610,16 +2936,16 @@ Loader::ResolvedSymbol Loader::resolveSymbol(Diagnostics& diag, RuntimeState& st
                     // We have already found the impl which we want all clients to use.
                     // But, later in load order we see something in the dyld cache that also implements
                     // this symbol, so we need to change all caches uses of that to use the found one instead.
-                    const MachOFile* cacheMF = cacheResult.targetLoader->mf(state);
+                    const Header* cacheHdr = (const Header*)cacheResult.targetLoader->mf(state);
                     uint32_t         cachedOverriddenDylibIndex;
-                    if ( state.config.dyldCache.findMachHeaderImageIndex(cacheMF, cachedOverriddenDylibIndex) ) {
+                    if ( state.config.dyldCache.findMachHeaderImageIndex((const mach_header*)cacheHdr, cachedOverriddenDylibIndex) ) {
                         // Use VMAddr's as the cache may not exist if we are in the builder
-                        uint64_t cacheOverriddenExportVMAddr = cacheMF->preferredLoadAddress() + cacheResult.targetRuntimeOffset;
+                        uint64_t cacheOverriddenExportVMAddr = cacheHdr->preferredLoadAddress() + cacheResult.targetRuntimeOffset;
                         uint64_t cacheOverriddenExportOffset = cacheOverriddenExportVMAddr - state.config.dyldCache.unslidLoadAddress;
                         if ( cacheOverriddenExportOffset != patchedCacheOffset ) {
                             // because of re-exports, same cacheOffset shows up in multiple dylibs.  Only call patcher once per
                             if ( verboseWeak )
-                                state.log("  found use of %s in cache, need to override: %s\n", symbolName, cacheResult.targetLoader->path());
+                                state.log("  found use of '%s' in cache, need to override: %s\n", symbolName, cacheResult.targetLoader->path(state));
                             patcher(cachedOverriddenDylibIndex, (uint32_t)cacheResult.targetRuntimeOffset, result);
                             patchedCacheOffset = cacheOverriddenExportOffset;
                         }
@@ -2629,8 +2955,9 @@ Loader::ResolvedSymbol Loader::resolveSymbol(Diagnostics& diag, RuntimeState& st
         });
         if ( foundFirst ) {
             // if a c++ dylib weak-def binds to another dylibs, record the dynamic dependency
-            if ( result.targetLoader != this )
+            if ( result.targetLoader != this ) {
                 state.addDynamicReference(this, result.targetLoader);
+            }
             // if we are using a map to cache weak-def resolution, add to map
             if ( (state.weakDefMap != nullptr) && !result.targetLoader->hiddenFromFlat() ) {
                 WeakDefMapValue mapEntry;
@@ -2648,13 +2975,17 @@ Loader::ResolvedSymbol Loader::resolveSymbol(Diagnostics& diag, RuntimeState& st
                 result.targetRuntimeOffset = 0;
             }
             else {
-                diag.error("weak-def symbol not found '%s'", symbolName);
+                // symbol not found in any dylib! even the dylib requesting the weak-def symbol
+                char  fromUuidStr[64];
+                this->getUuidStr(fromUuidStr);
+                diag.error("Symbol not found: %s\n  Referenced from: <%s> %s\n  Expected as weak-def export from some loaded dylib",
+                            symbolName, fromUuidStr, this->path(state));
             }
         }
         return result;
     }
     else {
-        diag.error("unknown library ordinal %d in %s when binding '%s'", libOrdinal, path(), symbolName);
+        diag.error("unknown library ordinal %d in %s when binding '%s'", libOrdinal, this->path(state), symbolName);
         return result;
     }
     if ( result.targetLoader != nullptr ) {
@@ -2663,37 +2994,51 @@ Loader::ResolvedSymbol Loader::resolveSymbol(Diagnostics& diag, RuntimeState& st
             return result;
         }
     }
+#if !SUPPORT_CREATING_PREMAPPEDLOADERS
+    const DylibPatch*  ignorePatchTable;
+    uint16_t           ignoreCacheDylibOverriddenIndex;
+#endif
     if ( weakImport ) {
         // ok to be missing, bind to NULL
         result.kind                = ResolvedSymbol::Kind::bindAbsolute;
         result.targetRuntimeOffset = 0;
     }
-    else if ( lazyBind && (state.libdyldMissingSymbolRuntimeOffset != 0) ) {
+#if BUILDING_DYLD
+    else if ( lazyBind ) {
         // missing lazy binds are bound to abort
-        result.targetLoader        = state.libdyldLoader;
+        result.targetLoader        = nullptr;
         result.targetSymbolName    = symbolName;
-        result.targetRuntimeOffset = (uintptr_t)state.libdyldMissingSymbolRuntimeOffset;
-        result.kind                = ResolvedSymbol::Kind::bindToImage;
-        result.isCode              = false; // only used for arm64e which uses trie not nlist
+        result.targetRuntimeOffset = (uintptr_t)&missing_symbol_abort;
+        result.kind                = ResolvedSymbol::Kind::bindAbsolute;
+        result.isCode              = false; // isCode only used for arm64e which does not have lazy symbols, so value is moot
         result.isWeakDef           = false;
         result.isMissingFlatLazy   = false;
+        result.isMaterializing     = false;
     }
+#endif
+#if !SUPPORT_CREATING_PREMAPPEDLOADERS
+    else if ( this->overridesDylibInCache(ignorePatchTable, ignoreCacheDylibOverriddenIndex) ) {
+        // rdar://126412250 (When processing binds in a dylib that overrides the dyld cache, dyld should set missing symbol values to 0xbad4007 instead of erroring)
+        result.kind                = ResolvedSymbol::Kind::bindAbsolute;
+        result.targetRuntimeOffset = DYLD_BADROOT_MARKER;
+    }
+#endif
     else {
         // if libSystem.dylib has not been initialized yet, then the missing symbol is during launch and need to save that info
         const char* expectedInDylib = "unknown";
         if ( result.targetLoader != nullptr )
-            expectedInDylib = result.targetLoader->path();
+            expectedInDylib = result.targetLoader->path(state);
 #if BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
         if ( !state.libSystemInitialized() ) {
-            state.setLaunchMissingSymbol(symbolName, expectedInDylib, this->path());
+            state.setLaunchMissingSymbol(symbolName, expectedInDylib, this->path(state));
         }
 #endif
         // rdar://79796526 add UUID to error message
         char  fromUuidStr[64];
-        this->getUuidStr(state, fromUuidStr);
+        this->getUuidStr(fromUuidStr);
         char  expectedUuidStr[64];
         if ( result.targetLoader != nullptr )
-            result.targetLoader->getUuidStr(state, expectedUuidStr);
+            result.targetLoader->getUuidStr(expectedUuidStr);
         else
             strlcpy(expectedUuidStr, "no uuid", sizeof(expectedUuidStr));
 
@@ -2701,8 +3046,17 @@ Loader::ResolvedSymbol Loader::resolveSymbol(Diagnostics& diag, RuntimeState& st
         Diagnostics tooNewBinaryDiag;
         this->tooNewErrorAddendum(tooNewBinaryDiag, state);
 
-        diag.error("Symbol not found: %s\n  Referenced from: <%s> %s%s\n  Expected in:     <%s> %s",
-                    symbolName, fromUuidStr, this->path(), tooNewBinaryDiag.errorMessageCStr(), expectedUuidStr, expectedInDylib);
+        if ( diag.hasError() ) {
+            char symbolErrMsg[1024];
+            strlcpy(symbolErrMsg, diag.errorMessageCStr(), sizeof(symbolErrMsg));
+            diag.clearError();
+            diag.error("%s\n  Referenced from: <%s> %s%s\n  Expected in:     <%s> %s",
+                       symbolErrMsg, fromUuidStr, this->path(state), tooNewBinaryDiag.errorMessageCStr(), expectedUuidStr, expectedInDylib);
+        }
+        else {
+            diag.error("Symbol not found: %s\n  Referenced from: <%s> %s%s\n  Expected in:     <%s> %s",
+                       symbolName, fromUuidStr, this->path(state), tooNewBinaryDiag.errorMessageCStr(), expectedUuidStr, expectedInDylib);
+        }
     }
     return result;
 }
@@ -2710,18 +3064,13 @@ Loader::ResolvedSymbol Loader::resolveSymbol(Diagnostics& diag, RuntimeState& st
 // if the binary for this Loader is newer than dyld, then we are trying to run a too new binary
 void Loader::tooNewErrorAddendum(Diagnostics& diag, RuntimeState& state) const
 {
-    __block Platform  dyldPlatform = Platform::unknown;
-    __block uint32_t  dyldMinOS    = 0;
-    ((MachOFile*)(&__dso_handle))->forEachSupportedPlatform(^(Platform plat, uint32_t minOS, uint32_t sdk) {
-        dyldPlatform = plat;
-        dyldMinOS    = minOS;
-    });
-    this->mf(state)->forEachSupportedPlatform(^(Platform plat, uint32_t minOS, uint32_t sdk) {
-        if ( (plat == dyldPlatform) && (minOS > dyldMinOS) ) {
+    mach_o::PlatformAndVersions dyldpvs = ((mach_o::Header*)(&__dso_handle))->platformAndVersions();
+
+    ((mach_o::Header*)this->mf(state))->platformAndVersions().unzip(^(mach_o::PlatformAndVersions pvs) {
+        if ( (pvs.platform == dyldpvs.platform) && (pvs.minOS > dyldpvs.minOS) ) {
             char versionString[32];
-            MachOFile::packedVersionToString(minOS, versionString);
             diag.error(" (built for %s %s which is newer than running OS)",
-                        MachOFile::platformName(dyldPlatform), versionString);
+                       dyldpvs.platform.name().c_str(), pvs.minOS.toString(versionString));
         }
     });
 }
@@ -2810,11 +3159,11 @@ bool Loader::hasExportedSymbol(Diagnostics& diag, RuntimeState& state, const cha
                     nameChanged = true;
                 }
                 if ( (ordinal == 0) || (ordinal > this->dependentCount()) ) {
-                    diag.error("re-export ordinal %lld in %s out of range for %s", ordinal, this->path(), symbolName);
+                    diag.error("re-export ordinal %lld in %s out of range for %s", ordinal, this->path(state), symbolName);
                     return false;
                 }
                 uint32_t                 depIndex = (uint32_t)(ordinal - 1);
-                DependentDylibAttributes depAttrs;
+                LinkedDylibAttributes depAttrs;
                 if ( Loader* depLoader = this->dependent(state, depIndex, &depAttrs) ) {
                     // <rdar://91326465> Explicitly promote to a ::staticLink
                     // resolution when looking for a reexported symbol in ::shallow mode.
@@ -2834,6 +3183,26 @@ bool Loader::hasExportedSymbol(Diagnostics& diag, RuntimeState& state, const cha
                     return depLoader->hasExportedSymbol(diag, state, importedName, mode, resolverMode, result, alreadySearched);
                 }
                 return false; // re-exported symbol from weak-linked dependent which is missing
+            }
+            else if ( flags & EXPORT_SYMBOL_FLAGS_FUNCTION_VARIANT ) {
+                if ( diag.hasError() )
+                    return false;
+                // symbol has a variant table as second entry, skip first value (default impl addr)
+                (void)MachOLoaded::read_uleb128(diag, p, trieEnd);
+                uint32_t  fvTableIndex         = (uint32_t)MachOLoaded::read_uleb128(diag, p, trieEnd);
+                uint64_t  betterFunctionOffset = this->selectFromFunctionVariants(diag, state, symbolName, fvTableIndex);
+                if ( diag.hasError() )
+                    return false;
+                result->targetLoader        = this;
+                result->targetSymbolName    = symbolName;
+                result->targetRuntimeOffset = betterFunctionOffset;
+                result->kind                = ResolvedSymbol::Kind::bindToImage;
+                result->isCode              = true;
+                result->isWeakDef           = false;
+                result->isMissingFlatLazy   = false;
+                result->isFunctionVariant   = true;
+                result->variantIndex        = fvTableIndex;
+                return true;
             }
             else {
                 if ( diag.hasError() )
@@ -2856,13 +3225,22 @@ bool Loader::hasExportedSymbol(Diagnostics& diag, RuntimeState& state, const cha
                 }
 #endif
 
-                result->targetLoader        = this;
-                result->targetSymbolName    = symbolName;
-                result->targetRuntimeOffset = targetRuntimeOffset;
-                result->kind                = isAbsoluteSymbol ? ResolvedSymbol::Kind::bindAbsolute : ResolvedSymbol::Kind::bindToImage;
-                result->isCode              = this->mf(state)->inCodeSection((uint32_t)(result->targetRuntimeOffset));
-                result->isWeakDef           = (flags & EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION);
-                result->isMissingFlatLazy   = false;
+                result->targetLoader            = this;
+                result->targetSymbolName        = symbolName;
+                result->targetRuntimeOffset     = targetRuntimeOffset;
+                result->kind                    = isAbsoluteSymbol ? ResolvedSymbol::Kind::bindAbsolute : ResolvedSymbol::Kind::bindToImage;
+                result->isCode                  = this->mf(state)->inCodeSection((uint32_t)(result->targetRuntimeOffset));
+#if BUILDING_DYLD
+                result->targetAddressForDlsym   = resolvedAddress(state, *result);
+                result->targetAddressForDlsym   = interpose(state, result->targetAddressForDlsym);
+#if __has_feature(ptrauth_calls)
+                if ( result->isCode )
+                    result->targetAddressForDlsym = (uintptr_t)__builtin_ptrauth_sign_unauthenticated((void*)result->targetAddressForDlsym, ptrauth_key_asia, 0);
+#endif
+#endif
+                result->isWeakDef               = (flags & EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION);
+                result->isMissingFlatLazy       = false;
+                result->isMaterializing         = false;
                 return true;
             }
         }
@@ -2878,15 +3256,23 @@ bool Loader::hasExportedSymbol(Diagnostics& diag, RuntimeState& state, const cha
                                                     uint8_t n_sect, uint16_t n_desc, bool& stop) {
                 if ( ((n_type & N_TYPE) == N_SECT) && ((n_type & N_EXT) != 0) ) {
                     if ( strcmp(n_name, symbolName) == 0 ) {
-                        result->targetLoader        = this;
-                        result->targetSymbolName    = symbolName;
-                        result->targetRuntimeOffset = (uintptr_t)(n_value - fileRef->preferredLoadAddress());
-                        result->kind                = ResolvedSymbol::Kind::bindToImage;
-                        result->isCode              = false; // only used for arm64e which uses trie not nlist
-                        result->isWeakDef           = (n_desc & N_WEAK_DEF);
-                        result->isMissingFlatLazy   = false;
-                        stop                        = true;
-                        found                       = true;
+                        result->targetLoader            = this;
+                        result->targetSymbolName        = symbolName;
+                        result->targetRuntimeOffset     = (uintptr_t)(n_value - ((const Header*)fileRef)->preferredLoadAddress());
+                        result->kind                    = ResolvedSymbol::Kind::bindToImage;
+                        result->isCode                  = false; // only used for arm64e which uses trie not nlist
+                        result->isWeakDef               = (n_desc & N_WEAK_DEF);
+                        result->isMissingFlatLazy       = false;
+                        result->isMaterializing         = false;
+#if BUILDING_DYLD
+                        result->targetAddressForDlsym   = resolvedAddress(state, *result);
+                        result->targetAddressForDlsym   = interpose(state, result->targetAddressForDlsym);
+                        // arm64e will always have exports trie and we are in nlist case, so does not need to be PAC signed
+#else
+                        result->targetAddressForDlsym   = 0;
+#endif
+                        stop                            = true;
+                        found                           = true;
                     }
                 }
             });
@@ -2907,12 +3293,21 @@ bool Loader::hasExportedSymbol(Diagnostics& diag, RuntimeState& state, const cha
             }
             if ( flags[0] & DYLD_PSEUDODYLIB_SYMBOL_FLAGS_FOUND ) {
                 result->targetLoader = this;
-                result->targetSymbolName    = symbolName;
-                result->targetRuntimeOffset = (uintptr_t)addrs[0] - (uintptr_t)this->mf(state);
-                result->kind                = ResolvedSymbol::Kind::bindToImage;
-                result->isCode              = flags[0] & DYLD_PSEUDODYLIB_SYMBOL_FLAGS_CALLABLE;
-                result->isWeakDef           = flags[0] & DYLD_PSEUDODYLIB_SYMBOL_FLAGS_WEAK_DEF;
-                result->isMissingFlatLazy   = false;
+                result->targetSymbolName        = symbolName;
+                result->targetRuntimeOffset     = (uintptr_t)addrs[0] - (uintptr_t)this->mf(state);
+                result->kind                    = ResolvedSymbol::Kind::bindToImage;
+                result->isCode                  = flags[0] & DYLD_PSEUDODYLIB_SYMBOL_FLAGS_CALLABLE;
+#if BUILDING_DYLD
+                result->targetAddressForDlsym   = resolvedAddress(state, *result);
+                result->targetAddressForDlsym   = interpose(state, result->targetAddressForDlsym);
+#if __has_feature(ptrauth_calls)
+                if ( result->isCode )
+                    result->targetAddressForDlsym = (uintptr_t)__builtin_ptrauth_sign_unauthenticated((void*)result->targetAddressForDlsym, ptrauth_key_asia, 0);
+#endif
+#endif
+                result->isWeakDef               = flags[0] & DYLD_PSEUDODYLIB_SYMBOL_FLAGS_WEAK_DEF;
+                result->isMissingFlatLazy       = false;
+                result->isMaterializing         = flags[0] & DYLD_PSEUDODYLIB_SYMBOL_FLAGS_MATERIALIZING;
                 return true;
             }
         }
@@ -2922,10 +3317,11 @@ bool Loader::hasExportedSymbol(Diagnostics& diag, RuntimeState& state, const cha
         // Search re-exported dylibs
         const uint32_t depCount = this->dependentCount();
         for ( uint32_t i = 0; i < depCount; ++i ) {
-            Loader::DependentDylibAttributes depAttrs;
+            Loader::LinkedDylibAttributes depAttrs;
             if ( Loader* depLoader = this->dependent(state, i, &depAttrs) ) {
                 //state.log("dep #%d of %p is %d %p (%s %s)\n", i, this, (int)depKind, depLoader, this->path(), depLoader->path());
-                if ( depAttrs.reExport || (searchNonReExports && !depAttrs.upward) ) {
+                // when dlsym() continues to search (searchNonReExports), don't follow upward or delay linkages
+                if ( depAttrs.reExport || (searchNonReExports && !depAttrs.upward && !depAttrs.delayInit)  ) {
                     if ( depLoader->hasExportedSymbol(diag, state, symbolName, depsMode, resolverMode, result, alreadySearched) )
                         return true;
                 }
@@ -2933,6 +3329,34 @@ bool Loader::hasExportedSymbol(Diagnostics& diag, RuntimeState& state, const cha
         }
     }
     return false;
+}
+
+// FIXME: use of Image here is expensive, especially for PrebuiltLoaders.  Getting the function variants linkedit blob
+// should be different for JustInTimeLoaders and PrebuiltLoaders
+uint64_t Loader::selectFromFunctionVariants(Diagnostics& diag, const RuntimeState& state, const char* symbolName, uint32_t fvTableIndex) const
+{
+    Image image(this->mf(state));
+    if ( !image.hasFunctionVariants() ) {
+        diag.error("function variant table missing for '%s'", symbolName);
+        return 0;
+    }
+#if SUPPORT_VM_LAYOUT
+    const FunctionVariants& fvs = image.functionVariants();
+#else
+    __block std::span<const uint8_t> linkeditBytes;
+    this->withLayout(diag, state, ^(const mach_o::Layout &layout) {
+        if ( layout.linkedit.functionVariants.hasValue() ) {
+            linkeditBytes = std::span<const uint8_t>(layout.linkedit.functionVariants.buffer, layout.linkedit.functionVariants.bufferSize);
+        }
+    });
+    const FunctionVariants fvs(linkeditBytes);
+#endif
+    if ( fvTableIndex >= fvs.count() ) {
+        diag.error("function variant index %u too large for '%s'", fvTableIndex, symbolName);
+        return 0;
+    }
+
+    return state.config.process.selectFromFunctionVariants(fvs, fvTableIndex);
 }
 
 #if BUILDING_DYLD || BUILDING_UNIT_TESTS
@@ -2960,7 +3384,7 @@ uintptr_t Loader::interpose(RuntimeState& state, uintptr_t value, const Loader* 
     for ( const InterposeTupleAll& tuple : state.patchedObjCClasses ) {
         if ( tuple.replacee == value ) {
             if ( state.config.log.interposing )
-                state.log("  interpose replaced 0x%08lX with 0x%08lX in %s\n", value, tuple.replacement, forLoader ? forLoader->path() : "dlsym");
+                state.log("  interpose replaced 0x%08lX with 0x%08lX in %s\n", value, tuple.replacement, forLoader ? forLoader->path(state) : "dlsym");
             return tuple.replacement;
         }
     }
@@ -2969,7 +3393,7 @@ uintptr_t Loader::interpose(RuntimeState& state, uintptr_t value, const Loader* 
     for ( const InterposeTupleAll& tuple : state.patchedSingletons ) {
         if ( tuple.replacee == value ) {
             if ( state.config.log.interposing )
-                state.log("  interpose replaced 0x%08lX with 0x%08lX in %s\n", value, tuple.replacement, forLoader ? forLoader->path() : "dlsym");
+                state.log("  interpose replaced 0x%08lX with 0x%08lX in %s\n", value, tuple.replacement, forLoader ? forLoader->path(state) : "dlsym");
             return tuple.replacement;
         }
     }
@@ -2985,7 +3409,7 @@ uintptr_t Loader::interpose(RuntimeState& state, uintptr_t value, const Loader* 
     for ( const InterposeTupleSpecific& tuple : state.interposingTuplesSpecific ) {
         if ( (tuple.replacee == value) && (tuple.onlyImage == forLoader) ) {
             if ( state.config.log.interposing )
-                state.log("  interpose replaced 0x%08lX with 0x%08lX in %s\n", value, tuple.replacement, forLoader->path());
+                state.log("  interpose replaced 0x%08lX with 0x%08lX in %s\n", value, tuple.replacement, forLoader ? forLoader->path(state) : "");
             return tuple.replacement;
         }
     }
@@ -2994,14 +3418,49 @@ uintptr_t Loader::interpose(RuntimeState& state, uintptr_t value, const Loader* 
     for ( const InterposeTupleAll& tuple : state.interposingTuplesAll ) {
         if ( tuple.replacee == value ) {
             if ( state.config.log.interposing )
-                state.log("  interpose replaced 0x%08lX with 0x%08lX in %s\n", value, tuple.replacement, forLoader ? forLoader->path() : "dlsym");
+                state.log("  interpose replaced 0x%08lX with 0x%08lX in %s\n", value, tuple.replacement, forLoader ? forLoader->path(state) : "dlsym");
             return tuple.replacement;
         }
     }
     return value;
 }
 
-#if (BUILDING_DYLD || BUILDING_UNIT_TESTS) && !TARGET_OS_EXCLAVEKIT
+#if BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
+void Loader::adjustFunctionVariantsInDyldCache(RuntimeState& state)
+{
+    const DyldSharedCache* dyldCache = state.config.dyldCache.addr;
+    if ( dyldCache == nullptr )
+        return; // no dyld cache
+
+    // make the cache writable for this block
+    DyldCacheDataConstLazyScopedWriter dataConstWriter(state);
+    DyldCacheDataConstLazyScopedWriter* dataConstWriterPtr = &dataConstWriter; // work around to make accessible in cacheWeakDefFixup
+
+    // If dylibs in dyld cache have any function-variants, select which variant to use.
+    // Requires DATA_CONST to be writable, and function-variant flags to be setup.
+    if ( dyldCache != nullptr ) {
+        dyldCache->forEachFunctionVariantPatchLocation(^(const void* loc, PointerMetaData pmd, const mach_o::FunctionVariants& fvs, const mach_o::Header* dylibHdr, int variantIndex, bool& stop) {
+            uintptr_t  bestImplOffset = (uintptr_t)state.config.process.selectFromFunctionVariants(fvs, variantIndex);
+            uintptr_t  bestImplAddr   = (uintptr_t)dylibHdr + (uintptr_t)bestImplOffset;
+            uintptr_t* fixupLoc       = (uintptr_t*)loc;
+#if __has_feature(ptrauth_calls)
+            if ( pmd.authenticated )
+                bestImplAddr = signPointer(bestImplAddr, (void*)loc, pmd.usesAddrDiversity, pmd.diversity, (ptrauth_key)pmd.key);
+#endif
+            if ( *fixupLoc != bestImplAddr ) {
+                dataConstWriterPtr->makeWriteable();
+                if ( state.config.log.fixups )
+                    state.log("dyld cache function variant patch: *%p = %p\n", fixupLoc, (void*)bestImplAddr);
+                *fixupLoc = bestImplAddr;
+            }
+        });
+    }
+}
+#endif
+
+
+#if (BUILDING_DYLD || BUILDING_UNIT_TESTS)
+#if !TARGET_OS_EXCLAVEKIT
 void Loader::applyInterposingToDyldCache(RuntimeState& state)
 {
     const DyldSharedCache* dyldCache = state.config.dyldCache.addr;
@@ -3023,11 +3482,11 @@ void Loader::applyInterposingToDyldCache(RuntimeState& state)
         // Convert from a cache offset to an image offset
         uint64_t mTime;
         uint64_t inode;
-        const dyld3::MachOAnalyzer* imageMA = (dyld3::MachOAnalyzer*)(dyldCache->getIndexedImageEntry(imageIndex, mTime, inode));
-        if ( imageMA == nullptr )
+        const Header* imageHdr = (const Header*)(dyldCache->getIndexedImageEntry(imageIndex, mTime, inode));
+        if ( imageHdr == nullptr )
             continue;
 
-        uint32_t dylibOffsetOfReplacee = (uint32_t)((dyldCache->unslidLoadAddress() + cacheOffsetOfReplacee) - imageMA->preferredLoadAddress());
+        uint32_t dylibOffsetOfReplacee = (uint32_t)((dyldCache->unslidLoadAddress() + cacheOffsetOfReplacee) - imageHdr->preferredLoadAddress());
 
         dyldCache->forEachPatchableExport(imageIndex, ^(uint32_t dylibVMOffsetOfImpl, const char* exportName,
                                                         PatchKind patchKind) {
@@ -3058,7 +3517,7 @@ void Loader::applyInterposingToDyldCache(RuntimeState& state)
     }
     state.setVMAccountingSuspending(false);
 }
-
+#endif // !TARGET_OS_EXCLAVEKIT
 
 void Loader::applyCachePatchesToOverride(RuntimeState& state, const Loader* dylibToPatch,
                                          uint16_t overriddenDylibIndex, const DylibPatch* patches,
@@ -3095,7 +3554,7 @@ void Loader::applyCachePatchesToOverride(RuntimeState& state, const Loader* dyli
                 break;
         }
 
-        uintptr_t targetRuntimeAddress = BAD_ROOT_ADDRESS;   // magic value to cause a unique crash is missing symbol in root is used
+        uintptr_t targetRuntimeAddress = DYLD_BADROOT_MARKER;   // magic value to cause a unique crash if missing symbol in root is used
         if ( patch->overrideOffsetOfImpl != DylibPatch::missingSymbol )
             targetRuntimeAddress = (uintptr_t)(this->loadAddress(state)) + ((intptr_t)patch->overrideOffsetOfImpl);
         
@@ -3108,15 +3567,17 @@ void Loader::applyCachePatchesToOverride(RuntimeState& state, const Loader* dyli
 
             // overridden dylib may not effect this dylib, so only suspend when we find it does effect it
             if ( !suspended ) {
+#if !TARGET_OS_EXCLAVEKIT
                 state.setVMAccountingSuspending(true);
                 suspended = true;
+#endif // !TARGET_OS_EXCLAVEKIT
             }
 
             uintptr_t* loc                  = (uintptr_t*)((uint8_t*)dylibToPatchMA + userVMOffset);
             uintptr_t  newValue             = targetRuntimeAddress + (uintptr_t)addend;
 
             // if client in dyld cache is ok with symbol being missing, set its use to NULL instead of bad-missing-value
-            if ( isWeakImport && (targetRuntimeAddress == BAD_ROOT_ADDRESS) )
+            if ( isWeakImport && (targetRuntimeAddress == DYLD_BADROOT_MARKER) )
                 newValue = 0;
 
             // if overridden dylib is also interposed, use interposing
@@ -3124,6 +3585,11 @@ void Loader::applyCachePatchesToOverride(RuntimeState& state, const Loader* dyli
                 if ( tuple.replacee == newValue ) {
                     newValue = tuple.replacement;
                 }
+            }
+            // rdar://125168527 (help debug issues with roots missing symbols)
+            if ( !isWeakImport && (targetRuntimeAddress == DYLD_BADROOT_MARKER) ) {
+                const char* overriddenPath = dyldCache->getIndexedImagePath(overriddenDylibIndex);
+                state.log("symbol '%s' missing from root that overrides %s. Use of that symbol in %s is being set to 0xBAD4007.\n", exportName, overriddenPath, dylibToPatch->path(state));
             }
 #if __has_feature(ptrauth_calls)
             if ( pmd.authenticated && (newValue != 0) ) {
@@ -3133,8 +3599,8 @@ void Loader::applyCachePatchesToOverride(RuntimeState& state, const Loader* dyli
                     if ( state.config.log.fixups ) {
                         state.log("cache fixup: *0x%012lX = 0x%012lX (*%s+0x%012lX = %s+0x%012lX) (JOP: diversity=0x%04X, addr-div=%d, key=%s)\n",
                                   (long)loc, newValue,
-                                  dylibToPatch->leafName(), (long)userVMOffset,
-                                  this->leafName(), (long)patch->overrideOffsetOfImpl,
+                                  dylibToPatch->leafName(state), (long)userVMOffset,
+                                  this->leafName(state), (long)patch->overrideOffsetOfImpl,
                                   pmd.diversity, pmd.usesAddrDiversity, MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::keyName(pmd.key));
                     }
                 }
@@ -3146,18 +3612,39 @@ void Loader::applyCachePatchesToOverride(RuntimeState& state, const Loader* dyli
                 if ( state.config.log.fixups )
                     state.log("cache fixup: *0x%012lX = 0x%012lX (*%s+0x%012lX = %s+0x%012lX)\n",
                               (long)loc, (long)newValue,
-                              dylibToPatch->leafName(), (long)userVMOffset,
-                              this->leafName(), (long)patch->overrideOffsetOfImpl);
+                              dylibToPatch->leafName(state), (long)userVMOffset,
+                              this->leafName(state), (long)patch->overrideOffsetOfImpl);
             }
         });
     });
     // Ensure the end marker is as expected
     assert(cachePatch->overrideOffsetOfImpl == DylibPatch::endOfPatchTable);
 
-    if ( suspended )
+
+    if ( suspended ) {
+#if !TARGET_OS_EXCLAVEKIT
         state.setVMAccountingSuspending(false);
+#endif // !TARGET_OS_EXCLAVEKIT
+    }
 }
 
+void Loader::applyFixupsCheckCachePatching(RuntimeState& state, DyldCacheDataConstLazyScopedWriter& cacheDataConst) const
+{
+    // if this is in the dyld cache, there is normally no fixups need
+    if ( this->dylibInDyldCache ) {
+        // But if some lower level cached dylib has a root, we
+        // need to patch this image's uses of that rooted dylib.
+        // We also need to patch if there are unzippered twins.
+        // In that case, we need to make sure that if this binary is in the cache and linked to
+        // the macOS side of the unzippered twins, then the iOSMac unzippered twin can now patch this dylib
+        if ( state.hasOverriddenCachedDylib() || state.hasOverriddenUnzipperedTwin() ) {
+            // have each other image apply to me any cache patching it has
+            for ( const Loader* ldr : state.loaded ) {
+                ldr->applyCachePatchesTo(state, this, cacheDataConst);
+            }
+        }
+    }
+}
 
 void Loader::applyCachePatchesTo(RuntimeState& state, const Loader* dylibToPatch, DyldCacheDataConstLazyScopedWriter& cacheDataConst) const
 {
@@ -3215,7 +3702,7 @@ void Loader::applyCachePatches(RuntimeState& state, DyldCacheDataConstLazyScoped
                 break;
         }
 
-        uintptr_t targetRuntimeAddress = BAD_ROOT_ADDRESS;   // magic value to cause a unique crash is missing symbol in root is used
+        uintptr_t targetRuntimeAddress = DYLD_BADROOT_MARKER;   // magic value to cause a unique crash if missing symbol in root is used
         if ( patch->overrideOffsetOfImpl != DylibPatch::missingSymbol )
             targetRuntimeAddress = (uintptr_t)(this->loadAddress(state)) + ((intptr_t)patch->overrideOffsetOfImpl);
 
@@ -3225,18 +3712,28 @@ void Loader::applyCachePatches(RuntimeState& state, DyldCacheDataConstLazyScoped
             // ensure dyld cache __DATA_CONST is writeable
             cacheDataConst.makeWriteable();
 
+
             // overridden dylib may not effect this dylib, so only suspend when we find it does effect it
             if ( !suspended ) {
+#if !TARGET_OS_EXCLAVEKIT
                 state.setVMAccountingSuspending(true);
                 suspended = true;
+#endif // !TARGET_OS_EXCLAVEKIT
             }
+
             uintptr_t* loc      = (uintptr_t*)((uint8_t*)dyldCache + cacheVMOffset);
             uintptr_t  newValue = targetRuntimeAddress + (uintptr_t)addend;
 
             // if client in dyld cache is ok with symbol being missing, set its use to NULL instead of bad-missing-value
-            if ( isWeakImport && (targetRuntimeAddress == BAD_ROOT_ADDRESS) )
+            if ( isWeakImport && (targetRuntimeAddress == DYLD_BADROOT_MARKER) )
                 newValue = 0;
 
+            // rdar://125168527 (help debug issues with roots missing symbols)
+            if ( !isWeakImport && (targetRuntimeAddress == DYLD_BADROOT_MARKER) ) {
+                // FIXME: re-enable when we can check all the dylibs using this shared GOT slot have not been rooted
+                //const char* overriddenPath = dyldCache->getIndexedImagePath(overriddenDylibIndex);
+                //state.log("symbol '%s' missing from root that overrides %s. The shared GOT use of that symbol is being set to 0xBAD4007.\n", exportName, overriddenPath);
+            }
 #if __has_feature(ptrauth_calls)
             if ( pmd.authenticated && (newValue != 0) ) {
                 newValue = dyld3::MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::signPointer(newValue, loc, pmd.usesAddrDiversity, pmd.diversity, pmd.key);
@@ -3245,7 +3742,7 @@ void Loader::applyCachePatches(RuntimeState& state, DyldCacheDataConstLazyScoped
                     if ( state.config.log.fixups ) {
                         state.log("cache GOT fixup: *0x%012lX = 0x%012lX (*cache+0x%012lX = %s+0x%012lX) (JOP: diversity=0x%04X, addr-div=%d, key=%s)\n",
                                   (long)loc, newValue, (long)cacheVMOffset,
-                                  this->leafName(), (long)patch->overrideOffsetOfImpl,
+                                  this->leafName(state), (long)patch->overrideOffsetOfImpl,
                                   pmd.diversity, pmd.usesAddrDiversity,
                                   MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::keyName(pmd.key));
                     }
@@ -3259,15 +3756,19 @@ void Loader::applyCachePatches(RuntimeState& state, DyldCacheDataConstLazyScoped
                     state.log("cache GOT fixup: *0x%012lX = 0x%012lX (*cache+0x%012lX = %s+0x%012lX)\n",
                               (long)loc, (long)newValue,
                               (long)cacheVMOffset,
-                              this->leafName(), (long)patch->overrideOffsetOfImpl);
+                              this->leafName(state), (long)patch->overrideOffsetOfImpl);
             }
         });
     });
     // Ensure the end marker is as expected
     assert(cachePatch->overrideOffsetOfImpl == DylibPatch::endOfPatchTable);
 
-    if ( suspended )
+
+    if ( suspended ) {
+#if !TARGET_OS_EXCLAVEKIT
         state.setVMAccountingSuspending(false);
+#endif // !TARGET_OS_EXCLAVEKIT
+    }
 }
 
 #endif // BUILDING_DYLD || BUILDING_UNIT_TESTS
@@ -3308,7 +3809,7 @@ uint64_t Loader::getOnDiskBinarySliceOffset(RuntimeState& state, const MachOAnal
 #endif
     __block Diagnostics diag;
     __block uint64_t    sliceOffset = 0;
-    state.config.syscall.withReadOnlyMappedFile(diag, path, false, ^(const void* mapping, size_t mappedSize, bool isOSBinary, const FileID& fileID, const char* realPath) {
+    state.config.syscall.withReadOnlyMappedFile(diag, path, false, ^(const void* mapping, size_t mappedSize, bool isOSBinary, const FileID& fileID, const char* realPath, int fileDescriptor) {
         if ( const dyld3::FatFile* ff = dyld3::FatFile::isFatFile(mapping) ) {
             ff->forEachSlice(diag, mappedSize, ^(uint32_t sliceCpuType, uint32_t sliceCpuSubType, const void* sliceStart, uint64_t sliceSize, bool& stop) {
                 if ( memcmp(ma, sliceStart, 64) == 0 ) {
@@ -3325,5 +3826,59 @@ uint64_t Loader::getOnDiskBinarySliceOffset(RuntimeState& state, const MachOAnal
 #endif
 }
 #endif // !TARGET_OS_EXCLAVEKIT
+
+void Loader::recursivelyLogChainToLinksWith(RuntimeState& state, const char* msgPrefix, const Loader* targetLoader, LinksWithChain* start, LinksWithChain* prev, Array<const Loader*>& visited) const
+{
+    // print if chain starts from main executable or from a dlopen with linkage chain all the way to target of DYLD_PRINT_LINKS_WITH
+    //   main: prog.exe -> libfoo -> libbar
+    // dlopen: libbaz -> libbar
+    if ( this == targetLoader ) {
+        state.printLinkageChain(start, msgPrefix);
+        return;
+    }
+
+    // break cycles
+    if ( visited.contains(this) )
+        return;
+    visited.push_back(this);
+
+    // recursive on each child Loader
+    const uint32_t depCount = this->dependentCount();
+    for ( uint32_t i = 0; i < depCount; ++i ) {
+        LinkedDylibAttributes childAttrs;
+        if ( Loader* child = this->dependent(state, i, &childAttrs) ) {
+            LinksWithChain chain{nullptr, child, childAttrs};
+            prev->next = &chain;
+            child->recursivelyLogChainToLinksWith(state, msgPrefix, targetLoader, start, &chain, visited);
+            prev->next = nullptr;
+        }
+    }
+
+}
+
+// rdar://124157900 (add DYLD_PRINT_LINKS_WITH env var to help debug why a particular dylib is being loaded)
+void Loader::logChainToLinksWith(RuntimeState& state, const char* msgPrefix) const
+{
+    const Loader* targetLoader = nullptr;
+    for (const Loader* ldr : state.loaded) {
+        if ( state.config.log.linksWith == ldr->leafName(state) ) {
+            targetLoader = ldr;
+            break;
+        }
+    }
+    if ( targetLoader == nullptr ) {
+        for (const Loader* ldr : state.delayLoaded) {
+            if ( state.config.log.linksWith == ldr->leafName(state) ) {
+                targetLoader = ldr;
+                break;
+            }
+        }
+    }
+    if ( targetLoader != nullptr ) {
+        STACK_ALLOC_ARRAY(const Loader*, visited, state.loaded.size()+state.delayLoaded.size());
+        LinksWithChain start{nullptr, this};
+        this->recursivelyLogChainToLinksWith(state, msgPrefix, targetLoader, &start, &start, visited);
+    }
+}
 
 } // namespace

@@ -71,11 +71,14 @@ extern "C" int amfi_check_dyld_policy_self(uint64_t input_flags, uint64_t* outpu
 #endif
 
 #include "Defines.h"
+#include "Header.h"
 #include "MachOLoaded.h"
 #include "DyldSharedCache.h"
 #include "SharedCacheRuntime.h"
 #include "Tracing.h"
 #include "Loader.h"
+#include "Header.h"
+#include "Error.h"
 #include "PrebuiltLoader.h"
 #include "DyldRuntimeState.h"
 #include "DyldProcessConfig.h"
@@ -90,16 +93,18 @@ extern "C" int amfi_check_dyld_policy_self(uint64_t input_flags, uint64_t* outpu
     #include "dyldSyscallInterface.h"
 #endif
 
+#define STAGED_APPS_DIR   "/private/var/staged_system_apps/"
+#define INSTALL_APPS_DIR  "/private/var/containers/Bundle/Application/"
+
 #if !TARGET_OS_EXCLAVEKIT
 using lsl::Lock;
 #endif // !TARGET_OS_EXCLAVEKIT
 using dyld3::MachOAnalyzer;
 using dyld3::MachOFile;
-using dyld3::Platform;
-using dyld4::Atlas::ProcessSnapshot;
-
-// implemented in assembly
-extern "C" void* tlv_get_addr(MachOAnalyzer::TLV_Thunk*);
+using mach_o::Error;
+using mach_o::Header;
+using mach_o::Platform;
+using mach_o::Error;
 
 extern "C" {
 // historically crash reporter look for this symbol named "error_string" in dyld, but that may not be needed anymore
@@ -165,7 +170,7 @@ PseudoDylib* PseudoDylib::create(Allocator &A, const char* identifier, void* add
     return pd;
 }
 
-char* PseudoDylib::loadableAtPath(const char *possible_path) {
+char* PseudoDylib::loadableAtPath(const char *possible_path) const {
     if (callbacks->loadableAtPath)
         return callbacks->loadableAtPath(context, base, possible_path);
 
@@ -195,6 +200,13 @@ char *PseudoDylib::lookupSymbols(std::span<const char*> names,
     return callbacks->lookupSymbols(context, base, names.data(), names.size(), addrs.data(), flags.data());
 }
 
+char *PseudoDylib::finalizeRequestedSymbols(std::span<const char *> names) const {
+  // Note: The names array is permitted to be empty.
+  if (callbacks->finalizeRequestedSymbols)
+    return callbacks->finalizeRequestedSymbols(context, base, names.data(), names.size());
+  return nullptr;
+}
+
 int PseudoDylib::lookupAddress(const void* addr, Dl_info *info) const {
     return callbacks->lookupAddress(context, base, addr, info);
 }
@@ -211,7 +223,6 @@ RuntimeLocks::RuntimeLocks()
   #if !TARGET_OS_EXCLAVEKIT
     _loadersLock    = OS_UNFAIR_RECURSIVE_LOCK_INIT;
     _notifiersLock  = OS_UNFAIR_RECURSIVE_LOCK_INIT;
-    _tlvInfosLock   = OS_UNFAIR_RECURSIVE_LOCK_INIT;
     _apiLock        = OS_UNFAIR_RECURSIVE_LOCK_INIT;
 
     allocatorLock   = OS_LOCK_UNFAIR_INIT;
@@ -221,7 +232,6 @@ RuntimeLocks::RuntimeLocks()
   #else
     _loadersLock   = _LIBLIBC_MTX_RECURSIVE_INIT;
     _notifiersLock = _LIBLIBC_MTX_RECURSIVE_INIT;
-    _tlvInfosLock  = _LIBLIBC_MTX_RECURSIVE_INIT;
     _apiLock       = _LIBLIBC_MTX_RECURSIVE_INIT;
 
     allocatorLock  = _LIBLIBC_MTX_INIT;
@@ -233,10 +243,10 @@ RuntimeLocks::RuntimeLocks()
 void RuntimeLocks::withLoadersReadLock(void (^work)())
 {
 #if BUILDING_DYLD
-    if ( _libSystemHelpers != nullptr ) {
-        _libSystemHelpers->os_unfair_recursive_lock_lock_with_options(&_loadersLock, OS_UNFAIR_LOCK_NONE);
+    if ( this->_libSystemHelpers != nullptr ) {
+        _libSystemHelpers.os_unfair_recursive_lock_lock_with_options(&_loadersLock, OS_UNFAIR_LOCK_NONE);
         work();
-        _libSystemHelpers->os_unfair_recursive_lock_unlock(&_loadersLock);
+        _libSystemHelpers.os_unfair_recursive_lock_unlock(&_loadersLock);
     }
     else
 #endif // BUILDING_DYLD
@@ -248,25 +258,10 @@ void RuntimeLocks::withLoadersReadLock(void (^work)())
 void RuntimeLocks::withNotifiersReadLock(void (^work)())
 {
 #if BUILDING_DYLD
-    if ( _libSystemHelpers != nullptr ) {
-        _libSystemHelpers->os_unfair_recursive_lock_lock_with_options(&_notifiersLock, OS_UNFAIR_LOCK_NONE);
+    if ( this->_libSystemHelpers != nullptr ) {
+        _libSystemHelpers.os_unfair_recursive_lock_lock_with_options(&_notifiersLock, OS_UNFAIR_LOCK_NONE);
         work();
-        _libSystemHelpers->os_unfair_recursive_lock_unlock(&_notifiersLock);
-    }
-    else
-#endif // BUILDING_DYLD
-    {
-        work();
-    }
-}
-
-void RuntimeLocks::withTLVLock(void (^work)())
-{
-#if BUILDING_DYLD
-    if ( _libSystemHelpers != nullptr ) {
-        _libSystemHelpers->os_unfair_recursive_lock_lock_with_options(&_tlvInfosLock, OS_UNFAIR_LOCK_NONE);
-        work();
-        _libSystemHelpers->os_unfair_recursive_lock_unlock(&_tlvInfosLock);
+        _libSystemHelpers.os_unfair_recursive_lock_unlock(&_notifiersLock);
     }
     else
 #endif // BUILDING_DYLD
@@ -282,13 +277,12 @@ void RuntimeLocks::takeLockBeforeFork()
     // We need to lock before we fork() as os_unfair_recursive_lock_unlock_forked_child() asserts that the lock is taken,
     // before then doing the reset
     if ( this->_libSystemHelpers != nullptr ) {
-        this->_libSystemHelpers->os_unfair_recursive_lock_lock_with_options(&_loadersLock, OS_UNFAIR_LOCK_NONE);
-        this->_libSystemHelpers->os_unfair_recursive_lock_lock_with_options(&_notifiersLock, OS_UNFAIR_LOCK_NONE);
-        this->_libSystemHelpers->os_unfair_recursive_lock_lock_with_options(&_tlvInfosLock, OS_UNFAIR_LOCK_NONE);
-        if (this->_libSystemHelpers->version() >= 6) {
-            this->_libSystemHelpers->os_unfair_lock_lock_with_options(&allocatorLock, OS_UNFAIR_LOCK_NONE);
+        this->_libSystemHelpers.os_unfair_recursive_lock_lock_with_options(&_loadersLock, OS_UNFAIR_LOCK_NONE);
+        this->_libSystemHelpers.os_unfair_recursive_lock_lock_with_options(&_notifiersLock, OS_UNFAIR_LOCK_NONE);
+        if (this->_libSystemHelpers.version() >= 6) {
+            this->_libSystemHelpers.os_unfair_lock_lock_with_options(&allocatorLock, OS_UNFAIR_LOCK_NONE);
 #if !TARGET_OS_SIMULATOR
-            this->_libSystemHelpers->os_unfair_lock_lock_with_options(&logSerializer, OS_UNFAIR_LOCK_NONE);
+            this->_libSystemHelpers.os_unfair_lock_lock_with_options(&logSerializer, OS_UNFAIR_LOCK_NONE);
 #endif // !TARGET_OS_SIMULATOR
         }
     }
@@ -300,13 +294,12 @@ void RuntimeLocks::releaseLockInForkParent()
 #if BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
     // This is on the parent side after fork().  We just to an unlock to undo the lock we did before form
     if ( this->_libSystemHelpers != nullptr ) {
-        this->_libSystemHelpers->os_unfair_recursive_lock_unlock(&_loadersLock);
-        this->_libSystemHelpers->os_unfair_recursive_lock_unlock(&_notifiersLock);
-        this->_libSystemHelpers->os_unfair_recursive_lock_unlock(&_tlvInfosLock);
-        if (this->_libSystemHelpers->version() >= 6) {
-            this->_libSystemHelpers->os_unfair_lock_unlock(&allocatorLock);
+        this->_libSystemHelpers.os_unfair_recursive_lock_unlock(&_loadersLock);
+        this->_libSystemHelpers.os_unfair_recursive_lock_unlock(&_notifiersLock);
+        if (this->_libSystemHelpers.version() >= 6) {
+            this->_libSystemHelpers.os_unfair_lock_unlock(&allocatorLock);
 #if !TARGET_OS_SIMULATOR
-            this->_libSystemHelpers->os_unfair_lock_unlock(&logSerializer);
+            this->_libSystemHelpers.os_unfair_lock_unlock(&logSerializer);
 #endif // !TARGET_OS_SIMULATOR
         }
     }
@@ -317,10 +310,9 @@ void RuntimeLocks::resetLockInForkChild()
 {
 #if BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
     // This is the child side after fork().  The locks are all taken, and will be reset to their initial state
-    if ( (this->_libSystemHelpers != nullptr) && (this->_libSystemHelpers->version() >= 2) ) {
-        this->_libSystemHelpers->os_unfair_recursive_lock_unlock_forked_child(&_loadersLock);
-        this->_libSystemHelpers->os_unfair_recursive_lock_unlock_forked_child(&_notifiersLock);
-        this->_libSystemHelpers->os_unfair_recursive_lock_unlock_forked_child(&_tlvInfosLock);
+    if ( (this->_libSystemHelpers != nullptr) && (this->_libSystemHelpers.version() >= 2) ) {
+        this->_libSystemHelpers.os_unfair_recursive_lock_unlock_forked_child(&_loadersLock);
+        this->_libSystemHelpers.os_unfair_recursive_lock_unlock_forked_child(&_notifiersLock);
         allocatorLock    = OS_LOCK_UNFAIR_INIT;
 #if !TARGET_OS_SIMULATOR
         logSerializer    = OS_LOCK_UNFAIR_INIT;
@@ -335,7 +327,7 @@ void RuntimeLocks::takeDlopenLockBeforeFork()
     // We need to lock before we fork() as os_unfair_recursive_lock_unlock_forked_child() asserts that the lock is taken,
     // before then doing the reset
     if ( this->_libSystemHelpers != nullptr ) {
-        this->_libSystemHelpers->os_unfair_recursive_lock_lock_with_options(&_apiLock, OS_UNFAIR_LOCK_NONE);
+        this->_libSystemHelpers.os_unfair_recursive_lock_lock_with_options(&_apiLock, OS_UNFAIR_LOCK_NONE);
     }
 #endif // BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
 }
@@ -345,7 +337,7 @@ void RuntimeLocks::releaseDlopenLockInForkParent()
 #if BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
     // This is on the parent side after fork().  We just to an unlock to undo the lock we did before form
     if ( this->_libSystemHelpers != nullptr ) {
-        this->_libSystemHelpers->os_unfair_recursive_lock_unlock(&_apiLock);
+        this->_libSystemHelpers.os_unfair_recursive_lock_unlock(&_apiLock);
     }
 #endif // BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
 }
@@ -354,8 +346,8 @@ void RuntimeLocks::resetDlopenLockInForkChild()
 {
 #if BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
     // This is the child side after fork().  The locks are all taken, and will be reset to their initial state
-    if ( (this->_libSystemHelpers != nullptr) && (this->_libSystemHelpers->version() >= 2) ) {
-        this->_libSystemHelpers->os_unfair_recursive_lock_unlock_forked_child(&_apiLock);
+    if ( (this->_libSystemHelpers != nullptr) && (this->_libSystemHelpers.version() >= 2) ) {
+        this->_libSystemHelpers.os_unfair_recursive_lock_unlock_forked_child(&_apiLock);
     }
 #endif // BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
 }
@@ -377,7 +369,7 @@ uint8_t* RuntimeState::cachedDylibState(uint16_t index)
 
 #if BUILDING_CACHE_BUILDER || BUILDING_CACHE_BUILDER_UNIT_TESTS
 
-const MachOFile* RuntimeState::appMF(uint16_t index)
+const MachOFile* RuntimeState::appMF(uint16_t index) const
 {
     assert(_processPrebuiltLoaderSet != nullptr);
     assert(index < _processPrebuiltLoaderSet->loaderCount());
@@ -391,7 +383,7 @@ void RuntimeState::setAppMF(uint16_t index, const MachOFile* mf)
     _processLoadedMachOArray[index] = mf;
 }
 
-const MachOFile* RuntimeState::cachedDylibMF(uint16_t index)
+const MachOFile* RuntimeState::cachedDylibMF(uint16_t index) const
 {
     // In the cache builder, the dylibs might not be mapped in their runtime layout,
     // so use the layout the builder gives us
@@ -400,7 +392,7 @@ const MachOFile* RuntimeState::cachedDylibMF(uint16_t index)
     return this->config.dyldCache.cacheBuilderDylibs->at(index).mf;
 }
 
-const mach_o::Layout* RuntimeState::cachedDylibLayout(uint16_t index)
+const mach_o::Layout* RuntimeState::cachedDylibLayout(uint16_t index) const
 {
     // In the cache builder, the dylibs might not be mapped in their runtime layout,
     // so use the layout the builder gives us
@@ -411,7 +403,7 @@ const mach_o::Layout* RuntimeState::cachedDylibLayout(uint16_t index)
 
 #else
 
-const MachOLoaded* RuntimeState::appLoadAddress(uint16_t index)
+const MachOLoaded* RuntimeState::appLoadAddress(uint16_t index) const
 {
     assert(_processPrebuiltLoaderSet != nullptr);
     assert(index < _processPrebuiltLoaderSet->loaderCount());
@@ -425,7 +417,7 @@ void RuntimeState::setAppLoadAddress(uint16_t index, const MachOLoaded* ml)
     _processLoadedAddressArray[index] = ml;
 }
 
-const MachOLoaded* RuntimeState::cachedDylibLoadAddress(uint16_t index)
+const MachOLoaded* RuntimeState::cachedDylibLoadAddress(uint16_t index) const
 {
 #if !TARGET_OS_EXCLAVEKIT
     // In the cache builder, the dylibs might not be mapped in their runtime layout,
@@ -455,12 +447,12 @@ void RuntimeState::add(const Loader* ldr)
     if ( ldr->isPrebuilt && ldr->dylibInDyldCache ) {
         // in normal case where special loaders are Prebuilt and in dyld cache
         // improve performance by not accessing load commands of dylib (may not be paged-in)
-        installName = ldr->path();
+        installName = ldr->path(*this);
     }
     else {
-        const MachOFile* mf = ldr->mf(*this);
-        if ( mf->isDylib() )
-            installName = mf->installName();
+        const Header* hdr = (const Header*)ldr->mf(*this);
+        if ( hdr->isDylib() )
+            installName = hdr->installName();
     }
     if ( installName != nullptr ) {
 #if TARGET_OS_EXCLAVEKIT
@@ -469,11 +461,22 @@ void RuntimeState::add(const Loader* ldr)
         else if ( strcmp(installName, "/System/ExclaveKit/usr/lib/libSystem.dylib") == 0 )
             libSystemLoader = ldr;
 #else
-        if ( config.process.platform == dyld3::Platform::driverKit ) {
+        if ( config.process.platform == Platform::driverKit ) {
             if ( strcmp(installName, "/System/DriverKit/usr/lib/system/libdyld.dylib") == 0 )
                 setDyldLoader(ldr);
             else if ( strcmp(installName, "/System/DriverKit/usr/lib/libSystem.dylib") == 0 )
                 libSystemLoader = ldr;
+        }
+        else if ( config.security.internalInstall && config.process.platform.isExclaveKit() ) {
+            // ExclaveKit processes may use either Darwin or native loader
+            // The path of native loader starts with /System/ExclaveKit
+            const size_t prefixLength = 18;
+            if ( strlen(installName) > prefixLength ) {
+                if ( (strcmp(installName + prefixLength, "/usr/lib/system/libdyld.dylib") == 0) || (strcmp(installName, "/usr/lib/system/libdyld.dylib") == 0) )
+                    setDyldLoader(ldr);
+                else if ( (strcmp(installName + prefixLength, "/usr/lib/libSystem.dylib") == 0) || (strcmp(installName, "/usr/lib/libSystem.B.dylib") == 0) )
+                    libSystemLoader = ldr;
+            }
         }
         else {
             if ( strcmp(installName, "/usr/lib/system/libdyld.dylib") == 0 )
@@ -485,8 +488,34 @@ void RuntimeState::add(const Loader* ldr)
     }
 }
 
-#if BUILDING_DYLD
-void RuntimeState::recursiveMarkNonDelayed(const Loader* ldr)
+__attribute__((noinline))
+void RuntimeState::printLinkageChain(const Loader::LinksWithChain* start, const char* msgPrefix)
+{
+    char msgBuff[2048];
+    msgBuff[0] = '\0';
+    for ( const Loader::LinksWithChain* c=start; c != nullptr; c=c->next ) {
+        if ( c != start ) {
+            char extras[8];
+            extras[0] = '\0';
+            if ( c->attr.reExport )
+                strlcat(extras, "r", sizeof(extras));
+            if ( c->attr.weakLink )
+                strlcat(extras, "w", sizeof(extras));
+            if ( c->attr.upward )
+                strlcat(extras, "u", sizeof(extras));
+            if ( c->attr.delayInit )
+                strlcat(extras, "d", sizeof(extras));
+            strlcat(msgBuff, " -",   sizeof(msgBuff));
+            strlcat(msgBuff, extras, sizeof(msgBuff));
+            strlcat(msgBuff, "-> ",   sizeof(msgBuff));
+        }
+        strlcat(msgBuff, c->ldr->leafName(*this), sizeof(msgBuff));
+    }
+    log("%s: %s\n", msgPrefix, msgBuff);
+}
+
+#if BUILDING_DYLD || BUILDING_CACHE_BUILDER || BUILDING_CACHE_BUILDER_UNIT_TESTS
+void RuntimeState::recursiveMarkNonDelayed(const Loader* ldr, Loader::LinksWithChain* start, Loader::LinksWithChain* prev)
 {
     // if already marked as not-delayed, then we have already visited this loader
     if ( !ldr->isDelayInit(*this) )
@@ -495,10 +524,22 @@ void RuntimeState::recursiveMarkNonDelayed(const Loader* ldr)
     // mark this loader as not-delayed
     ldr->setDelayInit(*this, false);
 
+    // if we are using DYLD_PRINT_LINKS_WITH and this loader is the target, the print linkage chain
+    if ( !config.log.linksWith.empty() && (config.log.linksWith == ldr->leafName(*this)) ) {
+        char prefixBuff[64];
+        if ( this->_libSystemInitialized ) // test for launch vs dlopen
+            strlcpy(prefixBuff, "no longer delayed(", sizeof(prefixBuff));
+        else
+            strlcpy(prefixBuff, "not delayed at launch(", sizeof(prefixBuff));
+        strlcat(prefixBuff, ldr->leafName(*this), sizeof(prefixBuff));
+        strlcat(prefixBuff, ")", sizeof(prefixBuff));
+        printLinkageChain(start, prefixBuff);
+    }
+
     // recurse on all dylib this loader links with
     const uint32_t depCount = ldr->dependentCount();
     for ( uint32_t i = 0; i < depCount; ++i ) {
-        Loader::DependentDylibAttributes childAttrs;
+        Loader::LinkedDylibAttributes childAttrs;
         if ( Loader* child = ldr->dependent(*this, i, &childAttrs) ) {
             if ( childAttrs.delayInit ) {
                 // This is the magic of how delayed-init works:
@@ -512,17 +553,33 @@ void RuntimeState::recursiveMarkNonDelayed(const Loader* ldr)
                 // initialzers run (since only dependencies are potentially skipped).
             }
             else {
-                recursiveMarkNonDelayed(child);
+                Loader::LinksWithChain next{nullptr, child, childAttrs};
+                prev->next = &next;
+                recursiveMarkNonDelayed(child, start, &next);
+                prev->next = nullptr;
             }
         }
     }
+
+    // recurse down any dylib that 'ldr' found a weak-def symbol in
+    for (const DynamicReference& ref : _dynamicReferences) {
+        if ( ref.from == ldr ) {
+            if ( config.log.libraries )
+                log("%s has weak-def (or flat lookup) symbol used by %s, so cannot be delayed\n", ref.to->leafName(*this), ldr->leafName(*this));
+            Loader::LinksWithChain next{nullptr, ref.to};
+            prev->next = &next;
+            recursiveMarkNonDelayed(ref.to, start, &next);
+            prev->next = nullptr;
+        }
+    }
+
 }
 
 // Move loaders between "loaded" and "delayLoaded" lists.
 // In undelayedLoaders, returns Loaders there were delay-init but now can be inited
 // Note: when a delay-init dylib is first used, it is dlopen()ed which will call this
 //       with newLoaders.size()==0, because it and everything it depends on are already loaded.
-void RuntimeState::partitionDelayLoads(std::span<const Loader*> newLoaders, std::span<const Loader*> rootLoaders, Vector<const Loader*>& undelayedLoaders)
+void RuntimeState::partitionDelayLoads(std::span<const Loader*> newLoaders, std::span<const Loader*> rootLoaders, Vector<const Loader*>* newAndNotDelayed)
 {
     // start with all newly loaded images having "delay" bit cleared, unless they have weak-def exports
     for (const Loader* ldr : newLoaders) {
@@ -530,14 +587,27 @@ void RuntimeState::partitionDelayLoads(std::span<const Loader*> newLoaders, std:
     }
 
     // recursively mark reachable dylibs (where delay-init load commands are not followed)
-    for (const Loader* ldr : rootLoaders) {
-        recursiveMarkNonDelayed(ldr);
+    for (const Loader* rootLdr : rootLoaders) {
+        Loader::LinksWithChain start{nullptr, rootLdr};
+        recursiveMarkNonDelayed(rootLdr, &start, &start);
     }
 
-    // also mark any dylib with weak-defs as not-delay-init
-    for (const Loader* ldr : newLoaders) {
-        if ( ldr->loadAddress(*this)->hasWeakDefs() )
-            recursiveMarkNonDelayed(ldr);
+    // also mark as not-delay-init any dylib with interposing
+    if ( !this->interposingTuplesAll.empty()
+#if !TARGET_OS_EXCLAVEKIT
+        && config.security.allowInterposing
+#endif
+        ) {
+        for (const Loader* ldr : newLoaders) {
+             // only non-cache dylibs can have interposing tuples
+             const Header* hdr = (const Header*)ldr->mf(*this);
+             if ( !ldr->dylibInDyldCache && hdr->isDylib() && hdr->hasInterposingTuples() ) {
+                 if ( config.log.libraries )
+                     log("has interposing tuples so cannot be delayed: %s\n", ldr->leafName(*this));
+                 Loader::LinksWithChain start{nullptr, ldr};
+                 recursiveMarkNonDelayed(ldr, &start, &start);
+             }
+        }
     }
 
     // now that all images are marked with if they should be delayed or not, move them to the correct list
@@ -546,9 +616,11 @@ void RuntimeState::partitionDelayLoads(std::span<const Loader*> newLoaders, std:
         if ( !ldr->isDelayInit(*this) ) {
             // in delay list, but no longer delayed, move
             loaded.push_back(ldr);
-            //log("move delayed to loaded: %s\n", ldr->leafName());
+            if ( config.log.libraries )
+                log("move delayed to loaded: %s\n", ldr->leafName(*this));
             delayLoaded.erase(delayLoaded.begin() + i);
-            undelayedLoaders.push_back(ldr);
+            if ( newAndNotDelayed != nullptr )
+                newAndNotDelayed->push_back(ldr);
             --i;
         }
     }
@@ -557,28 +629,81 @@ void RuntimeState::partitionDelayLoads(std::span<const Loader*> newLoaders, std:
         if ( ldr->isDelayInit(*this) ) {
             // in loaded list, but now delayed, move
             delayLoaded.push_back(ldr);
-            //log("move loaded to delayed: %s\n", ldr->leafName());
+            if ( config.log.libraries )
+                log("move loaded to delayed: %s\n", ldr->leafName(*this));
             loaded.erase(loaded.begin() + i);
             --i;
         }
     }
+    // return all newLoaders that are not delayed
+    if ( newAndNotDelayed != nullptr ) {
+        for (const Loader* ldr : newLoaders) {
+            if ( !ldr->isDelayInit(*this) )
+                newAndNotDelayed->push_back(ldr);
+        }
+    }
+
 }
-#endif // BUILDING_DYLD
+#endif // BUILDING_DYLD || BUILDING_CACHE_BUILDER || BUILDING_CACHE_BUILDER_UNIT_TESTS
+
+Error RuntimeState::loadInsertedLibraries(dyld3::OverflowSafeArray<Loader *> &topLevelLoaders, const Loader *mainLoader)
+{
+#if !TARGET_OS_EXCLAVEKIT
+    __block Error insertError = Error::none();
+
+    Loader::LoadChain   loadChainMain { nullptr, mainLoader };
+
+    Loader::LoadOptions options;
+    options.staticLinkage   = true;
+    options.launching       = true;
+    options.insertedDylib   = true;
+    options.canBeDylib      = true;
+    options.rpathStack      = &loadChainMain;
+    this->config.pathOverrides.forEachInsertedDylib(^(const char* dylibPath, bool& stop) {
+        Diagnostics insertDiag;
+        if ( Loader* insertedDylib = (Loader*)Loader::getLoader(insertDiag, *this, dylibPath, options) ) {
+            // Make sure we haven't already loaded this dylib
+            // This can happen if we have 2 of the same dylib in the DYLD_INSERT_LIBRARIES, or
+            // if we have 2 different libraries with the same leaf name and DYLD_FALLBACK_LIBRARY_PATH
+            // ends up with them resolving to the same dylib
+            for ( const Loader* ldr : topLevelLoaders ) {
+                if ( ldr == insertedDylib ) {
+                    if ( this->config.log.libraries )
+                        this->log("skipping duplicate inserted dylib '%s'\n", dylibPath);
+                    return;
+                }
+            }
+            topLevelLoaders.push_back(insertedDylib);
+            this->notifyDebuggerLoad(insertedDylib);
+            if ( insertedDylib->isPrebuilt )
+                this->add(insertedDylib);
+        }
+        else if ( insertDiag.hasError() && !this->config.security.allowInsertFailures  ) {
+#if BUILDING_DYLD
+            this->log("terminating because inserted dylib '%s' could not be loaded: %s\n", dylibPath, insertDiag.errorMessageCStr());
+#endif
+            insertError = Error("%s", insertDiag.errorMessageCStr());
+            stop = true;
+        }
+    });
+
+    if ( insertError )
+        return std::move(insertError);
+
+    // move inserted libraries ahead of main executable in state.loaded, for correct flat namespace lookups
+    if ( topLevelLoaders.count() != 1 ) {
+        this->loaded.erase(this->loaded.begin());
+        this->loaded.push_back(mainLoader);
+    }
+#endif // !TARGET_OS_EXCLAVEKIT
+
+    return Error::none();
+}
 
 
 void RuntimeState::setDyldLoader(const Loader* ldr)
 {
     this->libdyldLoader = ldr;
-
-    Loader::ResolvedSymbol result = { nullptr, "", 0, Loader::ResolvedSymbol::Kind::bindAbsolute, false, false };
-    Diagnostics diag;
-    if ( ldr->hasExportedSymbol(diag, *this, "__dyld_missing_symbol_abort", Loader::shallow, Loader::skipResolver, &result) ) {
-#if BUILDING_DYLD
-        this->libdyldMissingSymbol = (const void*)Loader::resolvedAddress(*this, result);
-#endif
-        assert(result.kind == Loader::ResolvedSymbol::Kind::bindToImage);
-        this->libdyldMissingSymbolRuntimeOffset = result.targetRuntimeOffset;
-    }
 }
 
 void RuntimeState::setMainLoader(const Loader* ldr)
@@ -594,14 +719,16 @@ void RuntimeState::setMainLoader(const Loader* ldr)
         this->log("Kernel mapped %s\n", this->config.process.mainExecutablePath);
         uintptr_t        slide    = ma->getSlide();
         __block uint32_t segIndex = 0;
-        ma->forEachSegment(^(const MachOAnalyzer::SegmentInfo& segInfo, bool& stop) {
-            uint8_t  permissions = segInfo.protections;
-            uint64_t segAddr     = segInfo.vmAddr + slide;
+        const Header* mh = (const Header*)ma;
+        mh->forEachSegment(^(const Header::SegmentInfo& segInfo, bool& stop) {
+            uint8_t  permissions = segInfo.initProt;
+            uint64_t segAddr     = segInfo.vmaddr + slide;
             uint64_t segSize     = round_page(segInfo.fileSize);
             if ( (segSize == 0) && (segIndex == 0) )
-                segSize = (uint64_t)ma; // kernel stretches __PAGEZERO
+                segSize = (uint64_t)mh; // kernel stretches __PAGEZERO
             if ( this->config.log.segments ) {
-                this->log("%14s (%c%c%c) 0x%012llX->0x%012llX \n", ma->segmentName(segIndex),
+                this->log("%14.*s (%c%c%c) 0x%012llX->0x%012llX \n",
+                          (int)segInfo.segmentName.size(), segInfo.segmentName.data(),
                           (permissions & VM_PROT_READ) ? 'r' : '.', (permissions & VM_PROT_WRITE) ? 'w' : '.', (permissions & VM_PROT_EXECUTE) ? 'x' : '.',
                           segAddr,
                           segAddr + segSize);
@@ -631,25 +758,20 @@ void RuntimeState::setMainLoader(const Loader* ldr)
                     fsobj.fid_objno      = (uint32_t)inode;
                     fsobj.fid_generation = (uint32_t)(inode >> 32);
                     fsid.val[0]          = sb.st_dev;
-                    dyld3::kdebug_trace_dyld_image(DBG_DYLD_UUID_MAP_A, image_info.imageFilePath, &(uuid_info.imageUUID), fsobj, fsid, image_info.imageLoadAddress);
+                    dyld3::kdebug_trace_dyld_image(DBG_DYLD_UUID_MAP_A, image_info.imageFilePath, &(uuid_info.imageUUID), fsobj, fsid,
+                                                   image_info.imageLoadAddress, image_info.imageLoadAddress->cpusubtype);
                 }
             }
 
   #if HAS_EXTERNAL_STATE
-            this->externallyViewable.setRosettaSharedCacheInfo(aotInfo->aot_cache_info.cacheBaseAddress, aotInfo->aot_cache_info.cacheUUID);
+            this->externallyViewable->setRosettaSharedCacheInfo(aotInfo->aot_cache_info.cacheBaseAddress, aotInfo->aot_cache_info.cacheUUID);
             std::span<const dyld_aot_image_info> aots(aotInfo->aots,aotInfo->aot_image_count);
             std::span<const dyld_image_info> images(aotInfo->images,aotInfo->image_count);
-            this->externallyViewable.addRosettaImages(aots, images);
+            this->externallyViewable->addRosettaImages(aots, images);
   #endif
         }
     }
 #endif // BUILDING_DYLD && SUPPORT_ROSETTA
-}
-
-void RuntimeState::setHelpers(const LibSystemHelpers* helpers)
-{
-    this->locks.setHelpers(helpers);
-    this->libSystemHelpers = helpers;
 }
 
 void RuntimeState::log(const char* format, ...) const
@@ -663,7 +785,7 @@ void RuntimeState::log(const char* format, ...) const
 #if !TARGET_OS_EXCLAVEKIT
 void RuntimeState::setUpLogging()
 {
-    memoryManager.withWritableMemory([&]{
+    MemoryManager::withWritableMemory([&]{
         if ( config.log.useStderr || config.log.useFile ) {
             // logging forced to a file or stderr
             _logDescriptor = config.log.descriptor;
@@ -688,8 +810,8 @@ void RuntimeState::setUpLogging()
             else {
                 // Use syslog() for processes managed by launchd
                 // we can only check if launchd owned after libSystem initialized
-                if ( libSystemHelpers != nullptr ) {
-                    if ( libSystemHelpers->isLaunchdOwned() ) {
+                if ( libSystemInitialized() ) {
+                    if ( libSystemHelpers.isLaunchdOwned() ) {
                         _logToSyslog = true;
                         _logSetUp    = true;
                     }
@@ -770,21 +892,22 @@ void RuntimeState::addDynamicReference(const Loader* from, const Loader* to)
 {
 #if BUILDING_DYLD
     // don't add dynamic reference if target can't be unloaded
-    if ( to->neverUnload )
+    if ( to->neverUnload && !to->isDelayInit(*this) )
         return;
 
-    locks.withLoadersWriteLock(memoryManager, ^(){
+    locks.withLoadersWriteLock(^{
         // don't add if already in list
         for (const DynamicReference& ref : _dynamicReferences) {
             if ( (ref.from == from) && (ref.to == to) ) {
                 return;
             }
         }
-        //log("addDynamicReference(%s, %s\n", from->leafName(), to->leafName());
+        //log("addDynamicReference(%s, %s\n", from->leafName(*this), to->leafName(*this));
         _dynamicReferences.push_back({from, to});
     });
 #endif // BUILDING_DYLD
 }
+
 
 #if BUILDING_DYLD || BUILDING_UNIT_TESTS
 void RuntimeState::addMissingFlatLazySymbol(const Loader* ldr, const char* symbolName, uintptr_t* bindLoc)
@@ -799,7 +922,7 @@ void RuntimeState::rebindMissingFlatLazySymbols(const std::span<const Loader*>& 
     Diagnostics diag;
 
     _missingFlatLazySymbols.erase(std::remove_if(_missingFlatLazySymbols.begin(), _missingFlatLazySymbols.end(), [&](const MissingFlatSymbol& symbol) {
-        Loader::ResolvedSymbol result = { nullptr, symbol.symbolName, 0, Loader::ResolvedSymbol::Kind::bindAbsolute, false, false };
+        Loader::ResolvedSymbol result = { nullptr, symbol.symbolName, 0, 0, Loader::ResolvedSymbol::Kind::bindAbsolute, false, false };
         for ( const Loader* ldr : newLoaders ) {
             // flat lookup can look in self, even if hidden
             if ( ldr->hiddenFromFlat() )
@@ -808,7 +931,7 @@ void RuntimeState::rebindMissingFlatLazySymbols(const std::span<const Loader*>& 
                 // Note we don't try to interpose here.  Interposing is only registered at launch, when we know the symbol wasn't defined
                 uintptr_t targetAddr = Loader::resolvedAddress(*this, result);
                 if ( this->config.log.fixups )
-                    this->log("fixup: *0x%012lX = 0x%012lX <%s>\n", (uintptr_t)symbol.bindLoc, (uintptr_t)targetAddr, ldr->leafName());
+                    this->log("fixup: *0x%012lX = 0x%012lX <%s>\n", (uintptr_t)symbol.bindLoc, (uintptr_t)targetAddr, ldr->leafName(*this));
                 *symbol.bindLoc = targetAddr;
                 this->addDynamicReference(symbol.ldr, result.targetLoader);
                 return true;
@@ -834,23 +957,23 @@ RuntimeState::PermanentRanges* RuntimeState::PermanentRanges::make(RuntimeState&
         const uintptr_t      slide        = ma->getSlide();
         __block uintptr_t    lastSegEnd   = 0;
         __block uint8_t      lastPerms    = 0;
-        ldr->loadAddress(state)->forEachSegment(^(const MachOAnalyzer::SegmentInfo& segInfo, bool& stop) {
-            uintptr_t segStart = (uintptr_t)(segInfo.vmAddr + slide);
-            uintptr_t segEnd   = segStart + (uintptr_t)segInfo.vmSize;
-            if ( (segStart == lastSegEnd) && (segInfo.protections == lastPerms) && !tempRanges.empty() ) {
+        ((const Header*)ldr->loadAddress(state))->forEachSegment(^(const Header::SegmentInfo& segInfo, bool& stop) {
+            uintptr_t segStart = (uintptr_t)(segInfo.vmaddr + slide);
+            uintptr_t segEnd   = segStart + (uintptr_t)segInfo.vmsize;
+            if ( (segStart == lastSegEnd) && (segInfo.initProt == lastPerms) && !tempRanges.empty() ) {
                 // back to back segments with same perms, so just extend last range
                 tempRanges.back().end = segEnd;
             }
-            else if ( segInfo.protections != 0 ) {
+            else if ( segInfo.initProt != 0 ) {
                 Range r;
                 r.start       = segStart;
                 r.end         = segEnd;
-                r.permissions = segInfo.protections;
+                r.permissions = segInfo.initProt;
                 r.loader      = ldr;
                 tempRanges.push_back(r);
             }
             lastSegEnd = segEnd;
-            lastPerms  = segInfo.protections;
+            lastPerms  = segInfo.initProt;
         });
     }
     unsigned count = (unsigned)tempRanges.count();
@@ -906,6 +1029,26 @@ bool RuntimeState::inPermanentRange(uintptr_t start, uintptr_t end, uint8_t* per
             return true;
     }
     return false;
+}
+
+void RuntimeState::setLaunchMissingDylib(const char* missingDylibPath, const char* clientUsingDylib)
+{
+#if BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
+    this->structuredError.kind              = DYLD_EXIT_REASON_DYLIB_MISSING;
+    this->structuredError.clientOfDylibPath = clientUsingDylib;
+    this->structuredError.targetDylibPath   = missingDylibPath;
+    this->structuredError.symbolName        = nullptr;
+#endif // BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
+}
+
+void RuntimeState::setLaunchMissingSymbol(const char* missingSymbolName, const char* dylibThatShouldHaveSymbol, const char* clientUsingSymbol)
+{
+#if BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
+    this->structuredError.kind              = DYLD_EXIT_REASON_SYMBOL_MISSING;
+    this->structuredError.clientOfDylibPath = clientUsingSymbol;
+    this->structuredError.targetDylibPath   = dylibThatShouldHaveSymbol;
+    this->structuredError.symbolName        = missingSymbolName;
+#endif // BUILDING_DYLD && !TARGET_OS_EXCLAVEKIT
 }
 #endif // BUILDING_DYLD || BUILDING_UNIT_TESTS
 
@@ -968,7 +1111,7 @@ void RuntimeState::appendInterposingTuples(const Loader* ldr, const uint8_t* raw
             ma->forEachChainedFixupTarget(diag, ^(int libOrdinal, const char* symbolName, uint64_t addend, bool weakImport, bool& stop) {
                 Loader::ResolvedSymbol target = ldr->resolveSymbol(diag, *this, libOrdinal, symbolName, weakImport, false, nullptr);
                 if ( diag.hasError() ) {
-                    this->log("warning could not apply interposing tuples in %s\n", ldr->path());
+                    this->log("warning could not apply interposing tuples in %s\n", ldr->path(*this));
                     stop = true;
                     return;
                 }
@@ -978,7 +1121,7 @@ void RuntimeState::appendInterposingTuples(const Loader* ldr, const uint8_t* raw
             });
             if ( diag.hasError() )
                 return;
-            const uintptr_t prefLoadAddresss = (uintptr_t)(ma->preferredLoadAddress());
+            const uintptr_t prefLoadAddresss = (uintptr_t)((const Header*)ma)->preferredLoadAddress();
             ma->forEachFixupInAllChains(diag, starts, false, ^(MachOLoaded::ChainedFixupPointerOnDisk* fixupLoc, const dyld_chained_starts_in_segment* segInfo, bool& stop) {
                 if ( ((uintptr_t*)fixupLoc >= rawStart) && ((uintptr_t*)fixupLoc < rawEnd) ) {
                     uintptr_t index      = ((uintptr_t*)fixupLoc - rawStart) / 2;
@@ -987,7 +1130,7 @@ void RuntimeState::appendInterposingTuples(const Loader* ldr, const uint8_t* raw
                         if ( fixupLoc->isRebase(segInfo->pointer_format, prefLoadAddresss, targetRuntimeOffset) ) {
                             tempTuples[index].tuple.replacement = (uintptr_t)ma + (uintptr_t)targetRuntimeOffset;
                             tempTuples[index].tuple.onlyImage   = ldr;
-                            //this->log("replacement=0x%08lX at %lu in %s\n", interposingTuples[index].replacement, index, ldr->path());
+                            //this->log("replacement=0x%08lX at %lu in %s\n", interposingTuples[index].replacement, index, ldr->path(*this));
                         }
                     }
                     else {
@@ -996,7 +1139,7 @@ void RuntimeState::appendInterposingTuples(const Loader* ldr, const uint8_t* raw
                         if ( fixupLoc->isBind(segInfo->pointer_format, bindOrdinal, addend) ) {
                             tempTuples[index].tuple.replacee = (uintptr_t)targetAddrs[bindOrdinal];
                             tempTuples[index].symbolName     = targetNames[bindOrdinal];
-                            //this->log("replacee=0x%08lX at %lu for %s in %s\n", tempTuples[index].tuple.replacee, index, tempTuples[index].symbolName, ldr->path());
+                            //this->log("replacee=0x%08lX at %lu for %s in %s\n", tempTuples[index].tuple.replacee, index, tempTuples[index].symbolName, ldr->path(*this));
                         }
                     }
                 }
@@ -1005,7 +1148,7 @@ void RuntimeState::appendInterposingTuples(const Loader* ldr, const uint8_t* raw
     }
     else {
         // rebase
-        intptr_t slide = (uintptr_t)ma - (uintptr_t)ma->preferredLoadAddress();
+        intptr_t slide = (uintptr_t)ma - (uintptr_t)((const Header*)ma)->preferredLoadAddress();
         ma->forEachRebase(diag, false, ^(uint64_t runtimeOffset, bool& stop) {
             uintptr_t* fixupLoc = (uintptr_t*)((uint64_t)ma + runtimeOffset);
             if ( (fixupLoc >= rawStart) && (fixupLoc < rawEnd) ) {
@@ -1014,7 +1157,7 @@ void RuntimeState::appendInterposingTuples(const Loader* ldr, const uint8_t* raw
                 uintptr_t replacement                     = *fixupLoc + slide;
                 tempTuples[index].tuple.replacement = replacement;
                 tempTuples[index].tuple.onlyImage   = ldr;
-                //this->log("replacement=0x%08lX at %lu in %s\n", replacement, index, ldr->path());
+                //this->log("replacement=0x%08lX at %lu in %s\n", replacement, index, ldr->path(*this));
             }
         });
 
@@ -1029,7 +1172,7 @@ void RuntimeState::appendInterposingTuples(const Loader* ldr, const uint8_t* raw
                     tempTuples[index].tuple.replacee = replacee;
                     tempTuples[index].symbolName     = symbolName;
                     checkHiddenCacheAddr(target.targetLoader, (const void*)replacee, symbolName, hiddenCacheAddrs);
-                    //this->log("replacee=0x%08lX at %lu in %s\n", replacee, index, ldr->path());
+                    //this->log("replacee=0x%08lX at %lu in %s\n", replacee, index, ldr->path(*this));
                  }
             } 
         },
@@ -1053,7 +1196,7 @@ void RuntimeState::appendInterposingTuples(const Loader* ldr, const uint8_t* raw
         if ( previousReplacement == 0 )
             this->interposingTuplesAll.push_back({t.tuple.replacement, t.tuple.replacee});
         if ( this->config.log.interposing )
-            this->log("%s has interposed '%s' to replacing binds to 0x%08lX with 0x%08lX\n", ldr->leafName(), t.symbolName, t.tuple.replacee, t.tuple.replacement);
+            this->log("%s has interposed '%s' to replacing binds to 0x%08lX with 0x%08lX\n", ldr->leafName(*this), t.symbolName, t.tuple.replacee, t.tuple.replacement);
 
         // now add specific interpose so that the generic is not applied to the interposing dylib, so it can call through to old impl
         if ( previousReplacement != 0 ) {
@@ -1072,7 +1215,7 @@ void RuntimeState::appendInterposingTuples(const Loader* ldr, const uint8_t* raw
             if ( entry.replacementAddr == (void*)(t.tuple.replacee) ) {
                 this->interposingTuplesAll.push_back({t.tuple.replacement, (uintptr_t)entry.cacheAddr});
                 if ( this->config.log.interposing )
-                    this->log("%s has interposed '%s' so need to patch cache uses of 0x%08lX\n", ldr->leafName(), t.symbolName, (uintptr_t)entry.cacheAddr);
+                    this->log("%s has interposed '%s' so need to patch cache uses of 0x%08lX\n", ldr->leafName(*this), t.symbolName, (uintptr_t)entry.cacheAddr);
             }
         }
     }
@@ -1089,15 +1232,14 @@ void RuntimeState::buildInterposingTables()
     __block uint32_t tupleCount  = 0;
     STACK_ALLOC_OVERFLOW_SAFE_ARRAY(const Loader*, dylibsWithTuples, 8);
     for ( const Loader* ldr : loaded ) {
-        const MachOAnalyzer* ma = ldr->analyzer(*this);
+        const Header* hdr = (const Header*)ldr->analyzer(*this);
         // dylibs in dyld cache cannot have interposing tuples
         if ( ldr->dylibInDyldCache )
             continue;
-        if ( !ma->isDylib() )
+        if ( !hdr->isDylib() )
             continue;
-        Diagnostics diag;
-        ma->forEachInterposingSection(diag, ^(uint64_t vmOffset, uint64_t vmSize, bool& stop) {
-            tupleCount += (vmSize / (2 * pointerSize));
+        hdr->forEachInterposingSection(^(const Header::SectionInfo& info, bool& stop) {
+            tupleCount += (info.size / (2 * pointerSize));
             dylibsWithTuples.push_back(ldr);
         });
     }
@@ -1108,33 +1250,14 @@ void RuntimeState::buildInterposingTables()
     interposingTuplesAll.reserve(tupleCount);
     interposingTuplesSpecific.reserve(tupleCount);
     for ( const Loader* ldr : dylibsWithTuples ) {
-        Diagnostics          diag;
-        const MachOAnalyzer* ma = ldr->analyzer(*this);
-        ma->forEachInterposingSection(diag, ^(uint64_t vmOffset, uint64_t vmSize, bool& stop) {
-            this->appendInterposingTuples(ldr, (uint8_t*)ma + vmOffset, (uint32_t)(vmSize / (2 * pointerSize)));
+        const Header* hdr = (const Header*)ldr->analyzer(*this);
+        hdr->forEachInterposingSection(^(const Header::SectionInfo& info, bool& stop) {
+            const uint8_t* rawDylibTuples = (const uint8_t*)hdr + info.address - hdr->preferredLoadAddress();
+            this->appendInterposingTuples(ldr, rawDylibTuples, (uint32_t)(info.size / (2 * pointerSize)));
         });
     }
 }
 
-void RuntimeState::setLaunchMissingDylib(const char* missingDylibPath, const char* clientUsingDylib)
-{
-#if BUILDING_DYLD
-    this->structuredError.kind              = DYLD_EXIT_REASON_DYLIB_MISSING;
-    this->structuredError.clientOfDylibPath = clientUsingDylib;
-    this->structuredError.targetDylibPath   = missingDylibPath;
-    this->structuredError.symbolName        = nullptr;
-#endif
-}
-
-void RuntimeState::setLaunchMissingSymbol(const char* missingSymbolName, const char* dylibThatShouldHaveSymbol, const char* clientUsingSymbol)
-{
-#if BUILDING_DYLD
-    this->structuredError.kind              = DYLD_EXIT_REASON_SYMBOL_MISSING;
-    this->structuredError.clientOfDylibPath = clientUsingSymbol;
-    this->structuredError.targetDylibPath   = dylibThatShouldHaveSymbol;
-    this->structuredError.symbolName        = missingSymbolName;
-#endif
-}
 #endif // !BUILDING_DYLD || BUILDING_UNIT_TESTS
 
 bool RuntimeState::hasMissingFlatLazySymbols() const
@@ -1187,7 +1310,7 @@ void RuntimeState::decDlRefCount(const Loader* ldr)
     if ( ldr->neverUnload )
         return;
 
-    memoryManager.withWritableMemory([&]{
+    locks.withLoadersWriteLockAndProtectedStack([&] {
         bool doCollect = false;
         for (auto it=_dlopenRefCounts.begin(); it != _dlopenRefCounts.end(); ++it) {
             if ( it->loader == ldr ) {
@@ -1293,7 +1416,7 @@ void Reaper::markDependentsOf(const Loader* ldr)
         if ( ref.from == ldr ) {
             for ( LoaderAndUse& lu : _unloadables ) {
                 if ( lu.loader == ref.to ) {
-                    //_state.log("markDependentsOf(%s) dynamic ref to %s\n", ldr->leafName(), ref.to->leafName());
+                    //_state.log("markDependentsOf(%s) dynamic ref to %s\n", ldr->leafName(*this), ref.to->leafName(*this));
                     lu.inUse = true;
                     break;
                 }
@@ -1314,7 +1437,7 @@ void Reaper::dump(const char* msg)
 {
     _state.log("GC, %s:\n", msg);
     for (LoaderAndUse& lu : _unloadables) {
-        _state.log("  in-use=%d  %s\n", lu.inUse, lu.loader->path());
+        _state.log("  in-use=%d  %s\n", lu.inUse, lu.loader->path(_state));
     }
 }
 
@@ -1351,7 +1474,7 @@ void Reaper::finalizeDeadImages()
     if ( _deadCount == 0 )
         return;
 
-    if ( _state.libSystemHelpers != nullptr ) {
+    if ( _state.libSystemInitialized() ) {
         STACK_ALLOC_OVERFLOW_SAFE_ARRAY(__cxa_range_t, ranges, _deadCount);
         for ( LoaderAndUse& lu : _unloadables ) {
             if ( lu.inUse )
@@ -1359,11 +1482,12 @@ void Reaper::finalizeDeadImages()
             const MachOAnalyzer* ma = lu.loader->analyzer(_state);
             if ( lu.loader->dylibInDyldCache )
                 continue;
-            ma->forEachSegment(^(const MachOAnalyzer::SegmentInfo& segInfo, bool& stop) {
+            const Header* mh = (const Header*)ma;
+            mh->forEachSegment(^(const Header::SegmentInfo& segInfo, bool& stop) {
                 if ( segInfo.executable() ) {
                     __cxa_range_t range;
-                    range.addr   = (void*)(segInfo.vmAddr + ma->getSlide());
-                    range.length = (size_t)segInfo.vmSize;
+                    range.addr   = (void*)(segInfo.vmaddr + ma->getSlide());
+                    range.length = (size_t)segInfo.vmsize;
                     ranges.push_back(range);
                 }
             });
@@ -1373,7 +1497,7 @@ void Reaper::finalizeDeadImages()
         //       were pseudodylibs): __cxa_finalize_ranges will treat an empty range array as
         //       a request to run all atexit handlers, which isn't what we want.
         if ( ranges.count() )
-          _state.libSystemHelpers->__cxa_finalize_ranges(ranges.begin(), (uint32_t)ranges.count());
+          _state.libSystemHelpers.__cxa_finalize_ranges(ranges.begin(), (uint32_t)ranges.count());
     }
 }
 
@@ -1417,7 +1541,7 @@ void RuntimeState::garbageCollectInner()
                 bool inUse = ldr->neverUnload;
                 unloadables.push_back({ ldr, inUse });
                 if ( verbose )
-                    this->log("unloadable[%llu] neverUnload=%d %p %s\n", unloadables.count(), inUse, ldr->loadAddress(*this), ldr->path());
+                    this->log("unloadable[%llu] neverUnload=%d %p %s\n", unloadables.count(), inUse, ldr->loadAddress(*this), ldr->path(*this));
             }
         }
     });
@@ -1433,7 +1557,10 @@ void RuntimeState::garbageCollectInner()
     if ( verbose ) {
         this->log("loaded before GC removals:\n");
         for ( const Loader* ldr : loaded )
-            this->log("   loadAddr=%p, path=%s\n", ldr->loadAddress(*this), ldr->path());
+            this->log("   loadAddr=%p, path=%s\n", ldr->loadAddress(*this), ldr->path(*this));
+        this->log("delay-loaded before GC removals:\n");
+        for ( const Loader* ldr : delayLoaded )
+            this->log("   loadAddr=%p, path=%s\n", ldr->loadAddress(*this), ldr->path(*this));
     }
 
     // make copy of LoadedImages we want to remove
@@ -1452,7 +1579,10 @@ void RuntimeState::garbageCollectInner()
     if ( verbose ) {
         this->log("loaded after GC removals:\n");
         for ( const Loader* ldr : loaded )
-            this->log("   loadAddr=%p, path=%s\n", ldr->loadAddress(*this), ldr->path());
+            this->log("   loadAddr=%p, path=%s\n", ldr->loadAddress(*this), ldr->path(*this));
+        this->log("delay-loaded before GC removals:\n");
+        for ( const Loader* ldr : delayLoaded )
+            this->log("   loadAddr=%p, path=%s\n", ldr->loadAddress(*this), ldr->path(*this));
     }
 }
 #endif // SUPPORT_IMAGE_UNLOADING || BUILDING_UNIT_TESTS
@@ -1484,8 +1614,8 @@ void RuntimeState::notifyDtrace(const std::span<const Loader*>& newLoaders)
             dof_helper_t& entry = dofData->dofiod_helpers[dofData->dofiod_count];
             entry.dofhp_addr = (uintptr_t)ma + offset;
             entry.dofhp_dof  = (uintptr_t)ma + offset;
-            strlcpy(entry.dofhp_mod, ldr->leafName(), DTRACE_MODNAMELEN);
-            if (verbose) log("adding DOF section at offset 0x%08X from %s\n", offset, ldr->path());
+            strlcpy(entry.dofhp_mod, ldr->leafName(*this), DTRACE_MODNAMELEN);
+            if (verbose) log("adding DOF section at offset 0x%08X from %s\n", offset, ldr->path(*this));
             dofData->dofiod_count++;
             if ( !ldr->neverUnload )
                 someUnloadable = true;
@@ -1511,7 +1641,7 @@ void RuntimeState::notifyDtrace(const std::span<const Loader*>& newLoaders)
                 if ( entry.dofhp_addr == (uintptr_t)ma ) {
                     // the ioctl() returns the dofhp_dof field as a registrationID
                     int registrationID = (int)entry.dofhp_dof;
-                    if (verbose) log("adding registrationID=%d for %s\n", registrationID, ldr->path());
+                    if (verbose) log("adding registrationID=%d for %s\n", registrationID, ldr->path(*this));
                     _loadersNeedingDOFUnregistration.push_back({ldr, registrationID});
                 }
             }
@@ -1531,7 +1661,7 @@ void RuntimeState::notifyDebuggerLoad(const Loader* oneLoader)
 void RuntimeState::notifyDebuggerLoad(const std::span<const Loader*>& newLoaders)
 {
 #if HAS_EXTERNAL_STATE
-    EphemeralAllocator ephemeralAllocator;
+    STACK_ALLOCATOR(ephemeralAllocator, 0);
     STACK_ALLOC_VECTOR(ExternallyViewableState::ImageInfo, infos, newLoaders.size());
     for (const Loader* ldr : newLoaders) {
         if ( ldr == this->mainExecutableLoader )
@@ -1546,37 +1676,29 @@ void RuntimeState::notifyDebuggerLoad(const std::span<const Loader*>& newLoaders
             }
         }
 #endif // !TARGET_OS_EXCLAVEKIT
-        info.path          = ldr->path();
+        info.path          = ldr->path(*this);
         info.loadAddress   = ldr->loadAddress(*this);
         info.inSharedCache = ldr->dylibInDyldCache;
         infos.push_back(info);
     }
     if ( infos.empty() )
         return;
-#if TARGET_OS_EXCLAVEKIT
-    this->externallyViewable.addImagesOld(ephemeralAllocator, infos);
-#else
-    this->externallyViewable.addImages(persistentAllocator, ephemeralAllocator, infos);
-#endif // !TARGET_OS_EXCLAVEKIT
+    this->externallyViewable->addImages(persistentAllocator, ephemeralAllocator, infos);
 #endif // HAS_EXTERNAL_STATE
 }
 
 void RuntimeState::notifyDebuggerUnload(const std::span<const Loader*>& removingLoaders)
 {
 #if HAS_EXTERNAL_STATE
-    EphemeralAllocator ephemeralAllocator;
+    STACK_ALLOCATOR(ephemeralAllocator, 0);
     STACK_ALLOC_ARRAY(const mach_header*, mhs, removingLoaders.size());
     for ( const Loader* ldr : removingLoaders )
         mhs.push_back(ldr->loadAddress(*this));
     std::span<const mach_header*> mhsSpan(&mhs[0], (size_t)mhs.count());
-#if TARGET_OS_EXCLAVEKIT
-    this->externallyViewable.removeImagesOld(mhsSpan);
-#else
-    this->externallyViewable.removeImages(this->persistentAllocator, ephemeralAllocator, mhsSpan);
-#endif // !TARGET_OS_EXCLAVEKIT
-  #if BUILDING_DYLD && SUPPORT_ROSETTA
+    this->externallyViewable->removeImages(this->persistentAllocator, ephemeralAllocator, mhsSpan);
+ #if BUILDING_DYLD && SUPPORT_ROSETTA
     if ( config.process.isTranslated )
-        this->externallyViewable.removeRosettaImages(mhsSpan);
+        this->externallyViewable->removeRosettaImages(mhsSpan);
  #endif //  BUILDING_DYLD && SUPPORT_ROSETTA
 
 #endif // BUILDING_DYLD
@@ -1594,13 +1716,11 @@ void RuntimeState::notifyLoad(const std::span<const Loader*>& newLoaders)
             struct stat        stat_buf;
             fsid_t             fsid    = { { 0, 0 } };
             fsobj_id_t         fsobjid = { 0, 0 };
-            if ( !ldr->dylibInDyldCache && (dyld3::stat(ldr->path(), &stat_buf) == 0) ) { //FIXME Loader knows inode
+            if ( !ldr->dylibInDyldCache && (dyld3::stat(ldr->path(*this), &stat_buf) == 0) ) { //FIXME Loader knows inode
                 fsobjid = *(fsobj_id_t*)&stat_buf.st_ino;
                 fsid    = { { stat_buf.st_dev, 0 } };
             }
-            uuid_t uuid;
-            ml->getUuid(uuid);
-            kdebug_trace_dyld_image(DBG_DYLD_UUID_MAP_A, ldr->path(), &uuid, fsobjid, fsid, ml);
+            kdebug_trace_dyld_image(DBG_DYLD_UUID_MAP_A, ldr->path(*this), &ldr->uuid, fsobjid, fsid, ml, ml->cpusubtype);
         }
     }
 #endif // !TARGET_OS_EXCLAVEKIT
@@ -1612,7 +1732,7 @@ void RuntimeState::notifyLoad(const std::span<const Loader*>& newLoaders)
                 const MachOLoaded* ml = ldr->loadAddress(*this);
                 dyld3::ScopedTimer timer(DBG_DYLD_TIMING_FUNC_FOR_ADD_IMAGE, (uint64_t)ml, (uint64_t)func, 0);
                 if ( this->config.log.notifications )
-                    this->log("notifier %p called with mh=%p\n", func, ml);
+                    this->log("notifier %p called with mh=%p\n", func.raw(), ml);
                 if ( ldr->dylibInDyldCache )
                     func(ml, this->config.dyldCache.slide);
                 else
@@ -1624,8 +1744,8 @@ void RuntimeState::notifyLoad(const std::span<const Loader*>& newLoaders)
                 const MachOLoaded* ml = ldr->loadAddress(*this);
                 dyld3::ScopedTimer timer(DBG_DYLD_TIMING_FUNC_FOR_ADD_IMAGE, (uint64_t)ml, (uint64_t)func, 0);
                 if ( this->config.log.notifications )
-                    this->log("notifier %p called with mh=%p\n", func, ml);
-                func(ml, ldr->path(), !ldr->neverUnload);
+                    this->log("notifier %p called with mh=%p\n", func.raw(), ml);
+                func(ml, ldr->path(*this), !ldr->neverUnload);
             }
         }
         for ( BulkLoadNotifier func : _notifyBulkLoadImage ) {
@@ -1633,12 +1753,12 @@ void RuntimeState::notifyLoad(const std::span<const Loader*>& newLoaders)
             const char*        paths[count];
             for ( unsigned i = 0; i < count; ++i ) {
                 mhs[i]   = newLoaders[i]->loadAddress(*this);
-                paths[i] = newLoaders[i]->path();
+                paths[i] = newLoaders[i]->path(*this);
             }
             dyld3::ScopedTimer timer(DBG_DYLD_TIMING_FUNC_FOR_ADD_IMAGE, (uint64_t)mhs[0], (uint64_t)func, 0);
             if ( this->config.log.notifications )
-                this->log("bulk notifier %p called with %d images\n", func, count);
-            func(count, mhs, paths);
+                this->log("bulk notifier %p called with %d images\n", func.raw(), count);
+            func(count, (const mach_header**)mhs, (const char**)paths);
         }
     });
 
@@ -1648,12 +1768,24 @@ void RuntimeState::notifyLoad(const std::span<const Loader*>& newLoaders)
     const char*                     pathsBuffer[count];
     const mach_header*              mhBuffer[count];
     _dyld_objc_notify_mapped_info   infos[count];
-    if ( (_notifyObjCMapped2 != nullptr) || (_notifyObjCMapped3 != nullptr) ) {
+    if ( _notifyObjCMapped3 != nullptr ) {
+        // Set the low bit of the flags if TPRO is enabled on the image. objc needs to know when its enabled for the process
+        // TODO: Remove this once TPRO headers have been updated to not need it
+        uint32_t imageFlags = 0;
+#if DYLD_FEATURE_USE_HW_TPRO
+        imageFlags = MemoryManager::memoryManager().tproEnabled() ? 1 : 0;
+#endif
+
         for ( const Loader* ldr : newLoaders ) {
             if ( ldr->hasObjC ) {
-                pathsBuffer[loadersWithObjC] = ldr->path();
+                // If dyld also optimized the protocol refs, then tell objc
+                uint32_t perImageFlags = imageFlags;
+                if ( ldr->dyldDoesObjCFixups() )
+                    perImageFlags |= 2;
+
+                pathsBuffer[loadersWithObjC] = ldr->path(*this);
                 mhBuffer[loadersWithObjC]    = ldr->loadAddress(*this);
-                infos[loadersWithObjC] = { mhBuffer[loadersWithObjC], ldr->path(), (_dyld_section_location_info_t)ldr, ldr->dyldDoesObjCFixups(), 0 };
+                infos[loadersWithObjC] = { mhBuffer[loadersWithObjC], ldr->path(*this), (_dyld_section_location_info_t)ldr, ldr->dyldDoesObjCFixups(), perImageFlags };
                 ++loadersWithObjC;
                 // Make the memory read-write while map_images runs
                 if ( ldr->hasConstantSegmentsToProtect() && ldr->hasReadOnlyObjC )
@@ -1666,14 +1798,9 @@ void RuntimeState::notifyLoad(const std::span<const Loader*>& newLoaders)
         if ( loadersWithObjC != 0 ) {
             DyldCacheDataConstLazyScopedWriter dataConstWriter(*this);
             DyldCacheDataConstLazyScopedWriter* dataConstWriterPtr = &dataConstWriter;
-            memoryManager.withWritableMemory([&]{
+            MemoryManager::withWritableMemory([&]{
                 dyld3::ScopedTimer timer(DBG_DYLD_TIMING_OBJC_MAP, 0, 0, 0);
-                if ( _notifyObjCMapped2 != nullptr ) {
-                    if ( sharedCacheLoaders )
-                        dataConstWriterPtr->makeWriteable();
-                    (*_notifyObjCMapped2)(loadersWithObjC, &infos[0]);
-                }
-                else if ( _notifyObjCMapped3 != nullptr ) {
+                {
                     const _dyld_objc_notify_mapped_info* infosPtr = &infos[0];
                     _dyld_objc_mark_image_mutable makeImageMutable = ^(uint32_t objcImageIndex) {
                         // For now don't try be smart about patching parts of the shared cache.  Just do the whole thing
@@ -1685,7 +1812,9 @@ void RuntimeState::notifyLoad(const std::span<const Loader*>& newLoaders)
                                 dataConstWriterPtr->makeWriteable();
                         }
                     };
-                    (*_notifyObjCMapped3)(loadersWithObjC, &infos[0], makeImageMutable);
+
+                    // FIXME: This should be wrapped in withReadOnlyMemory
+                    _notifyObjCMapped3(loadersWithObjC, &infos[0], makeImageMutable);
                 }
                 if ( this->config.log.notifications ) {
                     this->log("objc-mapped-notifier called with %d images:\n", loadersWithObjC);
@@ -1715,7 +1844,7 @@ void RuntimeState::notifyUnload(const std::span<const Loader*>& loadersToRemove)
                 const MachOLoaded* ml = ldr->loadAddress(*this);
                 dyld3::ScopedTimer timer(DBG_DYLD_TIMING_FUNC_FOR_REMOVE_IMAGE, (uint64_t)ml, (uint64_t)func, 0);
                 if ( this->config.log.notifications )
-                    this->log("remove notifier %p called with mh=%p\n", func, ml);
+                    this->log("remove notifier %p called with mh=%p\n", func.raw(), ml);
                 if ( ldr->dylibInDyldCache )
                     func(ml, this->config.dyldCache.slide);
                 else
@@ -1728,9 +1857,9 @@ void RuntimeState::notifyUnload(const std::span<const Loader*>& loadersToRemove)
     if ( _notifyObjCUnmapped != nullptr ) {
         for ( const Loader* ldr : loadersToRemove ) {
             if ( ldr->hasObjC ) {
-                (*_notifyObjCUnmapped)(ldr->path(), ldr->loadAddress(*this));
+                _notifyObjCUnmapped(ldr->path(*this), ldr->loadAddress(*this));
                 if ( this->config.log.notifications )
-                    this->log("objc-unmapped-notifier called with image %p %s\n", ldr->loadAddress(*this), ldr->path());
+                    this->log("objc-unmapped-notifier called with image %p %s\n", ldr->loadAddress(*this), ldr->path(*this));
             }
         }
     }
@@ -1739,16 +1868,14 @@ void RuntimeState::notifyUnload(const std::span<const Loader*>& loadersToRemove)
     // call kdebug trace for each image
     if ( kdebug_is_enabled(KDBG_CODE(DBG_DYLD, DBG_DYLD_UUID, DBG_DYLD_UUID_MAP_A)) ) {
         for ( const Loader* ldr : loadersToRemove ) {
-            uuid_t      uuid;
             fsid_t      fsid    = { { 0, 0 } };
             fsobj_id_t  fsobjid = { 0, 0 };
             struct stat stat_buf;
-            ldr->loadAddress(*this)->getUuid(uuid);
-            if ( dyld3::stat(ldr->path(), &stat_buf) == 0 ) { // FIXME, get inode from Loader
+            if ( dyld3::stat(ldr->path(*this), &stat_buf) == 0 ) { // FIXME, get inode from Loader
                 fsobjid = *(fsobj_id_t*)&stat_buf.st_ino;
                 fsid    = { { stat_buf.st_dev, 0 } };
             }
-            kdebug_trace_dyld_image(DBG_DYLD_UUID_UNMAP_A, ldr->path(), &uuid, fsobjid, fsid, ldr->loadAddress(*this));
+            kdebug_trace_dyld_image(DBG_DYLD_UUID_UNMAP_A, ldr->path(*this), &ldr->uuid, fsobjid, fsid, ldr->loadAddress(*this), ldr->cpusubtype);
         }
     }
 
@@ -1769,7 +1896,7 @@ void RuntimeState::notifyUnload(const std::span<const Loader*>& loadersToRemove)
 
     removeMissingFlatLazySymbols(loadersToRemove);
 
-    locks.withLoadersWriteLock(memoryManager, ^() {
+    locks.withLoadersWriteLock(^{
         // remove each from loaded
         for ( const Loader* removeeLoader : loadersToRemove ) {
             for ( auto it=loaded.begin(); it != loaded.end(); ++it ) {
@@ -1784,7 +1911,7 @@ void RuntimeState::notifyUnload(const std::span<const Loader*>& loadersToRemove)
     });
 
     // Call deinitialize on any pseudo-dylibs.
-    locks.withLoadersWriteLock(memoryManager, [&]() {
+    locks.withLoadersWriteLock([&] {
         for ( const Loader* removeeLoader : loadersToRemove ) {
             if ( const JustInTimeLoader *jitLoader = removeeLoader->isJustInTimeLoader() ) {
                 if ( const PseudoDylib *pd = jitLoader->pseudoDylib() ) {
@@ -1853,8 +1980,8 @@ void RuntimeState::notifyObjCPatching()
         this->setDyldPatchedObjCClasses();
 
         for ( const ObjCClassReplacement& classReplacement : this->objcReplacementClasses )
-            (*_notifyObjCPatchClass)(classReplacement.cacheMH, (void*)classReplacement.cacheImpl,
-                                     classReplacement.rootMH, (const void*)classReplacement.rootImpl);
+            _notifyObjCPatchClass(classReplacement.cacheMH, (void*)classReplacement.cacheImpl,
+                                  classReplacement.rootMH, (const void*)classReplacement.rootImpl);
         if ( this->config.log.notifications ) {
             this->log("objc-patch-class-notifier called with %lld patches:\n", this->objcReplacementClasses.size());
         }
@@ -1930,14 +2057,12 @@ void RuntimeState::removeLoaders(const std::span<const Loader*>& loadersToRemove
 }
 
 #if BUILDING_DYLD || BUILDING_UNIT_TESTS
-void RuntimeState::setObjCNotifiers(_dyld_objc_notify_unmapped unmapped, _dyld_objc_notify_patch_class patchClass,
-                                    _dyld_objc_notify_mapped2 mapped2, _dyld_objc_notify_init2 init2,
-                                    _dyld_objc_notify_mapped3 mapped3)
+void RuntimeState::setObjCNotifiers(ObjCUnmapped unmapped, ObjCPatchClass patchClass,
+                                    ObjCInit2 init2, ObjCMapped3 mapped3)
 {
-    memoryManager.withWritableMemory([&]{
+    MemoryManager::withWritableMemory([&]{
         _notifyObjCUnmapped     = unmapped;
         _notifyObjCPatchClass   = patchClass;
-        _notifyObjCMapped2      = mapped2;
         _notifyObjCInit2        = init2;
         _notifyObjCMapped3      = mapped3;
         locks.withLoadersReadLock(^{
@@ -1946,8 +2071,8 @@ void RuntimeState::setObjCNotifiers(_dyld_objc_notify_unmapped unmapped, _dyld_o
                 this->setDyldPatchedObjCClasses();
 
                 for ( const ObjCClassReplacement& classReplacement : this->objcReplacementClasses )
-                    (*_notifyObjCPatchClass)(classReplacement.cacheMH, (void*)classReplacement.cacheImpl,
-                                             classReplacement.rootMH, (const void*)classReplacement.rootImpl);
+                    _notifyObjCPatchClass(classReplacement.cacheMH, (void*)classReplacement.cacheImpl,
+                                          classReplacement.rootMH, (const void*)classReplacement.rootImpl);
                 if ( this->config.log.notifications ) {
                     this->log("objc-patch-class-notifier called with %lld patches:\n", this->objcReplacementClasses.size());
                 }
@@ -1955,6 +2080,13 @@ void RuntimeState::setObjCNotifiers(_dyld_objc_notify_unmapped unmapped, _dyld_o
                 // Clear the replacement classes.  We don't want to notify about them again if a dlopen happens
                 this->objcReplacementClasses.clear();
             }
+
+            // Set the low bit of the flags if TPRO is enabled on the image. objc needs to know when its enabled for the process
+            // TODO: Remove this once TPRO headers have been updated to not need it
+            uint32_t imageFlags = 0;
+#if DYLD_FEATURE_USE_HW_TPRO
+            imageFlags = MemoryManager::memoryManager().tproEnabled() ? 1 : 0;
+#endif
 
             // callback about already loaded images
             uint64_t maxCount = this->loaded.size();
@@ -1966,9 +2098,14 @@ void RuntimeState::setObjCNotifiers(_dyld_objc_notify_unmapped unmapped, _dyld_o
                 // don't need _mutex here because this is called when process is still single threaded
                 const MachOLoaded* ml = ldr->loadAddress(*this);
                 if ( ldr->hasObjC ) {
-                    paths.push_back(ldr->path());
+                    // If dyld also optimized the protocol refs, then tell objc
+                    uint32_t perImageFlags = imageFlags;
+                    if ( ldr->dyldDoesObjCFixups() )
+                        perImageFlags |= 2;
+
+                    paths.push_back(ldr->path(*this));
                     mhs.push_back(ml);
-                    infos.push_back({ml, ldr->path(), (_dyld_section_location_info_t)ldr, ldr->dyldDoesObjCFixups(), 0});
+                    infos.push_back({ml, ldr->path(*this), (_dyld_section_location_info_t)ldr, ldr->dyldDoesObjCFixups(), perImageFlags});
 
                     // Make the memory read-write while map_images runs
                     if ( ldr->hasConstantSegmentsToProtect() && ldr->hasReadOnlyObjC )
@@ -1981,12 +2118,7 @@ void RuntimeState::setObjCNotifiers(_dyld_objc_notify_unmapped unmapped, _dyld_o
             if ( !mhs.empty() ) {
                 DyldCacheDataConstLazyScopedWriter dataConstWriter(*this);
                 DyldCacheDataConstLazyScopedWriter* dataConstWriterPtr = &dataConstWriter;
-                if ( _notifyObjCMapped2 != nullptr ) {
-                    if ( sharedCacheLoaders )
-                        dataConstWriterPtr->makeWriteable();
-                    (*_notifyObjCMapped2)((uint32_t)mhs.count(), &infos[0]);
-                }
-                else if ( _notifyObjCMapped3 != nullptr ) {
+                {
                     _dyld_objc_mark_image_mutable makeImageMutable = ^(uint32_t objcImageIndex) {
                         // For now don't try be smart about patching parts of the shared cache.  Just do the whole thing
                         // FIXME: On-disk dylibs are eagerly mprotect()ed earlier. We could do them lazily too
@@ -1997,7 +2129,12 @@ void RuntimeState::setObjCNotifiers(_dyld_objc_notify_unmapped unmapped, _dyld_o
                                 dataConstWriterPtr->makeWriteable();
                         }
                     };
-                    (*_notifyObjCMapped3)((uint32_t)mhs.count(), &infos[0], makeImageMutable);
+
+                    const _dyld_objc_notify_mapped_info* infosBase = &infos[0];
+                    uint32_t infosCount = (uint32_t)infos.count();
+
+                    // FIXME: This should be wrapped in withReadOnlyMemory
+                    _notifyObjCMapped3(infosCount, infosBase, makeImageMutable);
                 }
                 if ( this->config.log.notifications ) {
                     this->log("objc-mapped-notifier called with %lld images:\n", mhs.count());
@@ -2018,20 +2155,22 @@ void RuntimeState::setObjCNotifiers(_dyld_objc_notify_unmapped unmapped, _dyld_o
 
 void RuntimeState::notifyObjCInit(const Loader* ldr)
 {
-    //this->log("objc-init-notifier checking mh=%p, path=%s, +load=%d, objcInit=%p\n", ldr->loadAddress(), ldr->path(), ldr->mayHavePlusLoad, _notifyObjCInit);
+    //this->log("objc-init-notifier checking mh=%p, path=%s, +load=%d, objcInit=%p\n", ldr->loadAddress(), ldr->path(*this), ldr->mayHavePlusLoad, _notifyObjCInit);
     if ( !ldr->mayHavePlusLoad )
         return;
 
     if ( _notifyObjCInit2 != nullptr ) {
         const MachOLoaded* ml  = ldr->loadAddress(*this);
-        const char*        pth = ldr->path();
+        const char*        pth = ldr->path(*this);
         dyld3::ScopedTimer timer(DBG_DYLD_TIMING_OBJC_INIT, (uint64_t)ml, 0, 0);
         if ( this->config.log.notifications )
             this->log("objc-init-notifier called with mh=%p, path=%s\n", ml, pth);
         _dyld_objc_notify_mapped_info info = {
             ml, pth, (_dyld_section_location_info_t)ldr, ldr->dyldDoesObjCFixups(), 0
         };
-        _notifyObjCInit2(&info);
+        MemoryManager::withReadOnlyMemory([&]{
+            _notifyObjCInit2(&info);
+        });
     }
 }
 
@@ -2076,246 +2215,37 @@ void RuntimeState::addNotifyBulkLoadImage(const Loader* callbackLoader, BulkLoad
 void RuntimeState::initialize()
 {
 #if BUILDING_DYLD
+    _libSystemInitialized = true;
+
     // assign pthread_key for per-thread dlerror messages
     // NOTE: dlerror uses malloc() - not dyld's Allocator to store per-thread error messages
-    this->libSystemHelpers->pthread_key_create_free(&_dlerrorPthreadKey);
-
-    // assign pthread_key for per-thread terminators
-    // Note: if a thread is terminated the value for this key is cleaned up by calling _finalizeListTLV()
-    this->libSystemHelpers->pthread_key_create_thread_exit(&_tlvTerminatorsKey);
+    // Use a temporary on the stack to ensure we don't try to write directly to variables in protected memory while in the callback
+    dyld_thread_key_t dlerrorPthreadKey = -1;
+    libSystemHelpers.pthread_key_create_free(&dlerrorPthreadKey);
+    _dlerrorPthreadKey = dlerrorPthreadKey;
 
     // if images have thread locals, set them up
-    for ( const Loader* ldr : this->loaded ) {
-        const MachOAnalyzer* ma = ldr->analyzer(*this);
-        if ( ma->hasThreadLocalVariables() )
-            this->setUpTLVs(ma);
+    for (const Loader* ldr : this->loaded) {
+        if ( ldr->hasTLVs ) {
+            const Header* hdr = ldr->header(*this);
+            if ( Error err = this->libSystemHelpers.setUpThreadLocals(config.dyldCache.addr, hdr) ) {
+                Error fullMsg("failed to set up thread local variables for '%s': %s", ldr->path(*this), err.message());
+#if TARGET_OS_WATCH
+                // ModelIO on watchOS has > 64KB of thread-locals, but ModelIO does not work on watchOS...
+                if ( !fullMsg.messageContains("/ModelIO.framework/") )
+                    halt(fullMsg.message());
+#else
+                halt(fullMsg.message());
+#endif
+            }
+        }
     }
 
 #if !TARGET_OS_EXCLAVEKIT
     // __pthread_init has run, TSDs work now, so enable allocator locking before we go multi-threaded
     Lock lock(this, &locks.allocatorLock);
-    this->memoryManager.adoptLock(std::move(lock));
+    MemoryManager::memoryManager().adoptLock(std::move(lock));
 #endif // !TARGET_OS_EXCLAVEKIT
-#endif // BUILDING_DYLD
-}
-
-void RuntimeState::setUpTLVs(const MachOAnalyzer* ma)
-{
-#if BUILDING_DYLD
-#if SUPPPORT_PRE_LC_MAIN
-    // Support for macOS 10.4 binaries with custom crt1.o glue and call dlopen before initializers are run
-    if ( this->libSystemHelpers == nullptr )
-        return;
-#endif
-
-    __block TLV_Info info;
-    info.ma = ma;
-    // Note: the space for thread local variables is allocated with
-    // system malloc and freed on thread death with system free()
-    info.key = 0;
-
-    Diagnostics                       diag;
-    MachOAnalyzer::TLV_InitialContent initialContent;
-    LibSystemHelpers::TLVGetAddrFunc getAddrFunc = this->libSystemHelpers->getTLVGetAddrFunc();
-    void *strippedGetAddr = (void*)getAddrFunc;
-
-#if __has_feature(ptrauth_calls)
-    strippedGetAddr = __builtin_ptrauth_strip(strippedGetAddr, ptrauth_key_asia);
-#endif
-
-    bool inSharedCache = false;
-#if !TARGET_OS_EXCLAVEKIT
-    const DyldSharedCache* dyldCache = config.dyldCache.addr;
-    if ( (dyldCache != nullptr) && (ma > (void*)dyldCache) ) {
-        if ( ma < (void*)((uint8_t*)dyldCache + dyldCache->mappedSize()) ) {
-            inSharedCache = true;
-        }
-    }
-#endif // !TARGET_OS_EXCLAVEKIT
-    initialContent = ma->forEachThreadLocalVariable(diag, ^(MachOAnalyzer::TLV_ResolverPtr tlvThunkAddr, uintptr_t *keyAddr) {
-        // initialize each descriptor
-        int key = (int)*keyAddr;
-        if (inSharedCache && (key != 0) && (this->libSystemHelpers->version() >= 4)) {
-            // slot.key is normally preallocated at shared cache build time in order
-            // not to dirty memory here.
-            // If so, we just need to set its destructor to free()
-
-            this->libSystemHelpers->pthread_key_init_free(key);
-            if (info.key == 0) {
-                info.key = key;
-            } else {
-                // All the TLVs in a given image should share the same key
-#if DEBUG
-                assert(info.key == key);
-#endif
-                // Try to restore sanity by resetting the slot's key to be the
-                // dylib's one. This may fail due to offsets colliding (?) but
-                // this is a bug in the shared cache builder that we cannot fix here.
-
-                if (info.key != key) {
-                    *(intptr_t*)keyAddr = info.key;
-                }
-
-            }
-        } else {
-            // The key was not preallocated by the shared cache builder,
-            // we need to create one.
-
-            if (info.key == 0) {
-                dyld_thread_key_t tlKey;
-                if ( this->libSystemHelpers->pthread_key_create_free(&tlKey) != 0 )
-                    halt("could not create thread local variables pthread key");
-                info.key = (uint32_t)tlKey;
-            }
-
-            *(intptr_t*)keyAddr = info.key;
-        }
-
-        void * tlvResolverAddress = *(void**)tlvThunkAddr;
-#if __has_feature(ptrauth_calls)
-        tlvResolverAddress = __builtin_ptrauth_strip(tlvResolverAddress, ptrauth_key_asia);
-#endif
-
-        if (tlvResolverAddress != strippedGetAddr) {
-            // If we are outside of the shared cache, or if we have an old
-            // shared cache which did not rewrite the thunk to be tlv_get_addr,
-            // update the thunk. Note that we only write if the existing value is
-            // different, in order not to dirty the page needlessly
-
-            *tlvThunkAddr = getAddrFunc;
-        }
-
-        // No need to modify the third pointer of the TLV Thunk (the offset)
-    });
-    info.initialContentOffset = (uint32_t)initialContent.runtimeOffset;
-    info.initialContentSize   = (uint32_t)initialContent.size;
-    locks.withTLVLock(^() {
-        _tlvInfos.push_back(info);
-    });
-#endif // BUILDING_DYLD
-}
-
-// called lazily when TLV is first accessed
-void* RuntimeState::_instantiateTLVs(dyld_thread_key_t key)
-{
-#if TARGET_OS_EXCLAVEKIT
-    // On ExclaveKit, we get called even when the key is already allocated, so just return the value if it exists.
-    void *mallocedBuffer = this->libSystemHelpers->pthread_getspecific(key);
-    if ( mallocedBuffer )
-        return mallocedBuffer;
-#endif // TARGET_OS_EXCLAVEKIT
-
-#if BUILDING_DYLD
-    // find amount to allocate and initial content
-    __block const uint8_t* initialContent     = nullptr;
-    __block size_t         initialContentSize = 0;
-    locks.withTLVLock(^() {
-        for ( const auto& info : _tlvInfos ) {
-            if ( info.key == key ) {
-                initialContent     = (uint8_t*)info.ma + info.initialContentOffset;
-                initialContentSize = info.initialContentSize;
-            }
-        }
-    });
-
-    // no thread local storage in image: should never happen
-    if ( initialContent == nullptr )
-        return nullptr;
-
-    // allocate buffer and fill with template
-    // Note: the space for thread local variables is allocated with system malloc
-    void* buffer = this->libSystemHelpers->malloc(initialContentSize);
-    memcpy(buffer, initialContent, initialContentSize);
-
-    // set this thread's value for key to be the new buffer.
-    this->libSystemHelpers->pthread_setspecific(key, buffer);
-
-    return buffer;
-#else
-    return nullptr;
-#endif // BUILDING_DYLD
-}
-
-void RuntimeState::addTLVTerminationFunc(TLV_TermFunc func, void* objAddr)
-{
-#if BUILDING_DYLD
-    // NOTE: this does not need locks because it only operates on current thread data
-    TLV_TerminatorList* list = (TLV_TerminatorList*)this->libSystemHelpers->pthread_getspecific(_tlvTerminatorsKey);
-    if ( list == nullptr ) {
-        // Note: use system malloc because it is thread safe
-        list = (TLV_TerminatorList*)this->libSystemHelpers->malloc(sizeof(TLV_TerminatorList));
-        bzero(list, sizeof(TLV_TerminatorList));
-        this->libSystemHelpers->pthread_setspecific(_tlvTerminatorsKey, list);
-    }
-    // go to end of chain
-    while (list->next != nullptr)
-        list = list->next;
-    // make sure there is space to add another element
-    if ( list->count == 7 ) {
-        // if list is full, add a chain
-        TLV_TerminatorList* nextList = (TLV_TerminatorList*)this->libSystemHelpers->malloc(sizeof(TLV_TerminatorList));
-        bzero(nextList, sizeof(TLV_TerminatorList));
-        list->next = nextList;
-        list = nextList;
-    }
-    list->elements[list->count++] = { func, objAddr };
-#endif // BUILDING_DYLD
-}
-
-void RuntimeState::TLV_TerminatorList::reverseWalkChain(void (^visit)(TLV_TerminatorList*))
-{
-    if ( this->next != nullptr )
-        this->next->reverseWalkChain(visit);
-    visit(this);
-}
-
-void RuntimeState::_finalizeListTLV(void* l)
-{
-#if BUILDING_DYLD
-    // on entry, libc has set the TSD slot to nullptr and passed us the previous value
-    TLV_TerminatorList* list = (TLV_TerminatorList*)l;
-    // call term functions in reverse order of construction
-    list->reverseWalkChain(^(TLV_TerminatorList* chain) {
-        for ( uintptr_t i = chain->count; i > 0; --i ) {
-            const TLV_Terminator& entry = chain->elements[i - 1];
-            if ( entry.termFunc != nullptr )
-                (*entry.termFunc)(entry.objAddr);
-
-            // If a new tlv was added via tlv_atexit during the termination function just called, then we need to immediately destroy it
-            TLV_TerminatorList* newlist = (TLV_TerminatorList*)(this->libSystemHelpers->pthread_getspecific(_tlvTerminatorsKey));
-            if ( newlist != nullptr ) {
-                // Set the list to NULL so that if yet another tlv is registered, we put it in a new list
-                this->libSystemHelpers->pthread_setspecific(_tlvTerminatorsKey, nullptr);
-                this->_finalizeListTLV(newlist);
-            }
-        }
-    });
-
-    // free entire chain
-    list->reverseWalkChain(^(TLV_TerminatorList* chain) {
-        this->libSystemHelpers->free(chain);
-    });
-#endif // BUILDING_DYLD
-}
-
-// <rdar://problem/13741816>
-// called by exit() before it calls cxa_finalize() so that thread_local
-// objects are destroyed before global objects.
-// Note this is only called on macOS, and by libc.
-// iOS only destroys tlv's when each thread is destroyed and libpthread calls
-// tlv_finalize as that is the pointer we provided when we created the key
-void RuntimeState::exitTLV()
-{
-#if BUILDING_DYLD
-    Vector<TLV_Terminator>* list = (Vector<TLV_Terminator>*)this->libSystemHelpers->pthread_getspecific(_tlvTerminatorsKey);
-    if ( list != nullptr ) {
-        // detach storage from thread while freeing it
-        this->libSystemHelpers->pthread_setspecific(_tlvTerminatorsKey, nullptr);
-        // Note, if new thread locals are added to our during this termination,
-        // they will be on a new list, but the list we have here
-        // is one we own and need to destroy it
-        this->_finalizeListTLV(list);
-    }
 #endif // BUILDING_DYLD
 }
 
@@ -2435,7 +2365,7 @@ bool RuntimeState::buildBootToken(dyld3::Array<uint8_t>& bootToken) const
                 bootToken.push_back(programHash[i]);
             // dyld'd uuid
             uuid_t dyldUuid;
-            if ( ((const dyld3::MachOLoaded*)&__dso_handle)->getUuid(dyldUuid) ) {
+            if ( ((const Header*)&__dso_handle)->getUuid(dyldUuid) ) {
                 for ( size_t i = 0; i < sizeof(dyldUuid); ++i )
                     bootToken.push_back(dyldUuid[i]);
             }
@@ -2462,7 +2392,7 @@ bool RuntimeState::fileAlreadyHasBootToken(const char* path, const Array<uint8_t
         return false;
     if ( fileToken.count() != bootToken.count() )
         return false;
-    if ( ::memcmp(bootToken.begin(), fileToken.begin(), (size_t)bootToken.count()) != 0 )
+    if ( ::memcmp(bootToken.data(), fileToken.data(), (size_t)bootToken.count()) != 0 )
         return false;
     return true;
 }
@@ -2495,7 +2425,7 @@ void RuntimeState::loadAppPrebuiltLoaderSet()
     // make sure there is enough space for the state array (needed during recursive isValid())
     if ( _processPrebuiltLoaderSet != nullptr ) {
         allocateProcessArrays(_processPrebuiltLoaderSet->loaderCount());
-        _processLoadedAddressArray[0] = config.process.mainExecutable;
+        _processLoadedAddressArray[0] = config.process.mainExecutableMF;
     }
 
     // verify it is still valid (no roots installed or OS update)
@@ -2601,7 +2531,7 @@ const PrebuiltLoader* RuntimeState::findPrebuiltLoader(const char* path) const
 #if BUILDING_CACHE_BUILDER || BUILDING_CACHE_BUILDER_UNIT_TESTS
     // The builder has no dyldCache, so use the loader set to find the path
     if ( _cachedDylibsPrebuiltLoaderSet != nullptr ) {
-        if ( const PrebuiltLoader* ldr = _cachedDylibsPrebuiltLoaderSet->findLoader(path) ) {
+        if ( const PrebuiltLoader* ldr = _cachedDylibsPrebuiltLoaderSet->findLoader(*this, path) ) {
             // Assume loaders in the cache builder are always valid
             // FIXME: Validate them
             return ldr;
@@ -2620,7 +2550,7 @@ const PrebuiltLoader* RuntimeState::findPrebuiltLoader(const char* path) const
 #if SUPPORT_ON_DISK_PREBUILTLOADERS
     // see if path is in app PrebuiltLoaderSet
     if ( this->_processPrebuiltLoaderSet != nullptr ) {
-        if ( const PrebuiltLoader* ldr = _processPrebuiltLoaderSet->findLoader(path) ) {
+        if ( const PrebuiltLoader* ldr = _processPrebuiltLoaderSet->findLoader(*this, path) ) {
             if ( ldr->isValid(*this) )
                 return ldr;
         }
@@ -2643,18 +2573,17 @@ bool RuntimeState::allowNonOsProgramsToSaveUpdatedClosures() const
 {
 #if !TARGET_OS_EXCLAVEKIT
     // on embedded, all 3rd party apps can build closures
-    switch ( config.process.platform ) {
-        case Platform::iOS:
+    if ( config.process.platform == Platform::iOS ) {
 #if BUILDING_DYLD && TARGET_OS_OSX && __arm64__
-            return false; // don't save closures for iPad apps running on Apple Silicon
+        return false; // don't save closures for iPad apps running on Apple Silicon
 #else
-            return true;
+        return true;
 #endif
-        case Platform::tvOS:
-        case Platform::watchOS:
-            return true;
-        default:
-            break;
+    }
+    else if (   config.process.platform == Platform::tvOS
+             || config.process.platform == Platform::watchOS
+             || config.process.platform == Platform::visionOS ) {
+        return true;
     }
 
     // need cdhash of executable to build closure
@@ -2663,7 +2592,11 @@ bool RuntimeState::allowNonOsProgramsToSaveUpdatedClosures() const
 #endif // !TARGET_OS_EXCLAVEKIT
 
     // <rdar://74910825> disable macOS closure saving
+#if SUPPORT_ON_DISK_PREBUILTLOADERS
+    return true;
+#else
     return false;
+#endif
 }
 
 #if BUILDING_DYLD && SUPPORT_PREBUILTLOADERS
@@ -2708,10 +2641,45 @@ void RuntimeState::initializeClosureMode()
             // perhaps OS program was Mastered elsewhere, try looking up the cd-hash
             if ( const dyld4::PrebuiltLoaderSet* aPBLS = config.dyldCache.addr->findLaunchLoaderSetWithCDHash(config.process.appleParam("executable_cdhash")) ) {
                 const char* progLeafName = Loader::leafName(config.process.mainExecutablePath);
-                const char* aLeafName    = Loader::leafName(aPBLS->atIndex(0)->path());
+                const char* aLeafName    = Loader::leafName(aPBLS->atIndex(0)->path(*this));
                 // if leaf name matches then this is some OS progam that got moved after being built
                 if ( strcmp(progLeafName, aLeafName) == 0 )
                     cachePBLS = aPBLS;
+            }
+        }
+        else if ( (cachePBLS == nullptr) && (strncmp(config.process.mainExecutablePath, INSTALL_APPS_DIR, strlen(INSTALL_APPS_DIR)) == 0) ) {
+            // perhaps this is removable app with closure built for /var/staged_system_apps/
+            if ( const dyld4::PrebuiltLoaderSet* aPBLS = config.dyldCache.addr->findLaunchLoaderSetWithCDHash(config.process.appleParam("executable_cdhash")) ) {
+                const char* closureAppPath = aPBLS->atIndex(0)->path(*this);
+                const size_t stagedAppsDirLen = strlen(STAGED_APPS_DIR);
+                if ( strncmp(closureAppPath, STAGED_APPS_DIR, stagedAppsDirLen) == 0 ) {
+                    // example closure path:  /private/var/staged_system_apps/Foo.app/Foo
+                    // example actual path:   /var/containers/Bundle/Application/34A646B9-3E3F-415F-B1A8-80858F5FC869/Foo.app/Foo
+                    const char* endClosureAppPath = &closureAppPath[stagedAppsDirLen];
+                    const char* endActualAppPath  = strchr(&config.process.mainExecutablePath[strlen(INSTALL_APPS_DIR)+1], '/')+1;
+                    if ( strcmp(endClosureAppPath, endActualAppPath) == 0 ) {
+                        // looks like a match for a relocated staged app. We now need to build a table of path translations
+                        // from paths in the closure like "/private/var/staged_system_apps/Foo.app/Foo") to actual runtime
+                        // paths like "/var/containers/Bundle/Application/34A646B9-3E3F-415F-B1A8-80858F5FC869/Foo.app/Foo"
+                        size_t realPrefix = endActualAppPath - config.process.mainExecutablePath;
+                        for (uint32_t i=0; i < aPBLS->loaderCount(); ++i) {
+                            const char* aPath = aPBLS->atIndex(i)->path(*this);
+                            const char* realerPath = aPath;
+                            if ( strncmp(aPath, STAGED_APPS_DIR, stagedAppsDirLen) == 0 ) {
+                                // transform: /private/var/staged_system_apps/Foo.app/Frameworks/Bar.framework/Bar
+                                //        to: /var/containers/Bundle/Application/34A646B9-3E3F-415F-B1A8-80858F5FC869/Foo.app/Frameworks/Bar.framework/Bar
+                                char betterPath[PATH_MAX];
+                                strlcpy(betterPath, config.process.mainExecutablePath, PATH_MAX);
+                                betterPath[realPrefix] = '\0';
+                                strlcat(betterPath, &aPath[stagedAppsDirLen], PATH_MAX);
+                                realerPath = this->persistentAllocator.strdup(betterPath);
+                                //log("%s -> %s\n", aPath, realerPath);
+                            }
+                            this->prebuiltLoaderSetRealPaths.push_back(realerPath);
+                        }
+                        cachePBLS = aPBLS;
+                    }
+                }
             }
         }
         isOsProgram              = (cachePBLS != nullptr) || config.dyldCache.addr->hasLaunchLoaderSetWithCDHash(config.process.appleParam("executable_cdhash"));
@@ -2778,7 +2746,7 @@ void RuntimeState::initializeClosureMode()
     if ( (_processPrebuiltLoaderSet == nullptr) && ( cachePBLS != nullptr) && cachePBLS->validHeader(*this) ) {
         // alloc state array (needed during recursive isValid())
         allocateProcessArrays(cachePBLS->loaderCount());
-        _processLoadedAddressArray[0] = (const MachOAnalyzer*)config.process.mainExecutable;
+        _processLoadedAddressArray[0] = (const MachOAnalyzer*)config.process.mainExecutableMF;
 
         const PrebuiltLoader* mainPbl = cachePBLS->atIndex(0);
         if ( config.log.loaders )
@@ -2801,16 +2769,24 @@ void RuntimeState::initializeClosureMode()
             _processPrebuiltLoaderSet = cachePBLS;
             if ( !_processPrebuiltLoaderSet->isValid(*this) ) {
                 if ( config.log.loaders )
-                    this->log("PrebuiltLoader %p not used because Loader for %s is invalid\n", cachePBLS, mainPbl->path());
+                    this->log("PrebuiltLoader %p not used because Loader for %s is invalid\n", cachePBLS, mainPbl->path(*this));
                 // something has changed in the file system, don't use PrebuiltLoader, make a JustInTimeLoader for main executable
                 _processPrebuiltLoaderSet = nullptr;
             }
         }
     }
 
-    // If we have an app PrebuiltLoaderSet, then deserialize the Swift hash tables
+    // If we have an app PrebuiltLoaderSet, then deserialize the objc and Swift maps
     if ( _processPrebuiltLoaderSet != nullptr ) {
-        // Deserialize protocol maps
+        // Deserialize objc maps
+        if ( const void* selMap = _processPrebuiltLoaderSet->objcSelectorMap() )
+            this->objcSelectorMap = { selMap };
+        if ( const void* classMap = _processPrebuiltLoaderSet->objcClassMap() )
+            this->objcClassMap = { classMap };
+        if ( const void* protocolMap = _processPrebuiltLoaderSet->objcProtocolMap() )
+            this->objcProtocolMap = { protocolMap };
+
+        // Deserialize swift protocol maps
         const uint64_t* typeProtocolTable = _processPrebuiltLoaderSet->swiftTypeProtocolTable();
         if ( typeProtocolTable != nullptr )
             this->typeProtocolMap = new (this->persistentAllocator.malloc(sizeof(TypeProtocolMap))) TypeProtocolMap(this, typeProtocolTable);
@@ -2866,9 +2842,9 @@ bool RuntimeState::inPrebuiltLoader(const void* p, size_t len) const
 void RuntimeState::setDyldPatchedObjCClasses() const
 {
 #if !TARGET_OS_EXCLAVEKIT
-    if ( this->libSystemHelpers != nullptr ) {
-        if ( this->libSystemHelpers->version() >= 3 )
-            this->libSystemHelpers->setDyldPatchedObjCClasses();
+    if ( this->libSystemInitialized() ) {
+        if ( this->libSystemHelpers.version() >= 3 )
+            this->libSystemHelpers.setDyldPatchedObjCClasses();
     }
 #endif // !TARGET_OS_EXCLAVEKIT
 }
@@ -2887,20 +2863,13 @@ DyldCacheDataConstLazyScopedWriter::DyldCacheDataConstLazyScopedWriter(RuntimeSt
 
 DyldCacheDataConstLazyScopedWriter::~DyldCacheDataConstLazyScopedWriter()
 {
-
     if ( _wasMadeWritable ) {
-#if !TARGET_OS_EXCLAVEKIT
         _state.config.dyldCache.makeDataConstWritable(_state.config.log, _state.config.syscall, false);
-#else
-        //TODO: EXCLAVES
-        (void)_state;
-#endif
     }
 }
 
 void DyldCacheDataConstLazyScopedWriter::makeWriteable() const
 {
-#if !TARGET_OS_EXCLAVEKIT
     if ( _wasMadeWritable )
         return;
     if ( !_state.config.process.enableDataConst )
@@ -2909,10 +2878,6 @@ void DyldCacheDataConstLazyScopedWriter::makeWriteable() const
         return;
     _wasMadeWritable = true;
     _state.config.dyldCache.makeDataConstWritable(_state.config.log, _state.config.syscall, true);
-#else
-    //TODO: EXCLAVES
-    (void)_state;
-#endif
 }
 #endif // (BUILDING_DYLD || BUILDING_UNIT_TESTS)
 

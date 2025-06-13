@@ -26,7 +26,8 @@
 namespace mach_o
 {
 
-WarningHandler sHandler = nullptr;
+static WarningHandler sHandler = nullptr;
+
 void setWarningHandler(WarningHandler handler)
 {
     sHandler = handler;
@@ -42,7 +43,7 @@ void warning(const void* context, const char* format, ...)
     if ( sHandler ) {
         va_list list;
         va_start(list, format);
-        sHandler(context, format, list);
+        sHandler(context, format, va_list_wrap(list));
         va_end(list);
     }
 }

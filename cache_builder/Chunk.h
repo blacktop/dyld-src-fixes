@@ -50,6 +50,7 @@ struct LinkeditDataChunk;
 struct CodeSignatureChunk;
 struct DynamicConfigChunk;
 struct SlidChunk;
+struct AlignChunk;
 struct StubsChunk;
 struct UniquedGOTsChunk;
 
@@ -81,13 +82,19 @@ struct Chunk
         // A buffer to hold a swift hash table (type, metadata, foreign)
         swiftConformanceHashTable,
 
+        // A buffer to hold a pointer hash table
+        pointerHashTable,
+
         // A buffer to hold the trie for the cache dylib names
         cacheDylibsTrie,
 
         // A buffer to hold the patch table for the cache dylibs
         cachePatchTable,
 
-        // A buffer to hold the PrebuiltLoaderSet for the cache dylibs
+        // A buffer to hold the list of function variants to patch at launch
+        cacheFunctionVariantsPatchTable,
+
+         // A buffer to hold the PrebuiltLoaderSet for the cache dylibs
         dylibPrebuiltLoaders,
 
         // A buffer to hold the PrebuiltLoaderSet for the executables
@@ -95,6 +102,9 @@ struct Chunk
 
         // A buffer to hold the trie for the cache dylib names
         cacheExecutablesTrie,
+
+        // A buffer to hold the prewarming pages
+        prewarmingData,
 
         // In the .symbols file, this is the payload
         unmappedSymbols,
@@ -108,14 +118,12 @@ struct Chunk
         // __TEXT copied from the source dylib
         dylibText,
 
-        // __DATA copied from the source dylib
-        dylibData,
-
-        // __DATA_CONST copied from the source dylib, but the dylib is ineligible for RO __DATA_CONST
-        dylibDataConstWorkaround,
-
         // __DATA_CONST copied from the source dylib, and the dylib is eligible for RO __DATA_CONST
         dylibDataConst,
+
+        // __TPRO_CONST segments.  These are placed next to the very start of DATA/AUTH as that puts them
+        // next to the dirty data inside the data/auth regions
+        tproDataConst,
 
         // The objc HeaderInfoRW array.  It is before __DATA_DIRTY so that we sort it near
         // the __DATA_DIRTY from libobjc
@@ -128,14 +136,14 @@ struct Chunk
         // __DATA_DIRTY copied from the source dylib
         dylibDataDirty,
 
+        // __DATA copied from the source dylib
+        dylibData,
+
         // __AUTH copied from the source dylib
         dylibAuth,
 
         // __AUTH_CONST copied from the source dylib, and the dylib is eligible for RO __DATA_CONST
         dylibAuthConst,
-
-        // __AUTH_CONST copied from the source dylib, but the dylib is ineligible for RO __AUTH_CONST
-        dylibAuthConstWorkaround,
 
         // Read-only segment copied from the source dylib
         dylibReadOnly,
@@ -150,6 +158,7 @@ struct Chunk
         linkeditFunctionStarts,
         linkeditDataInCode,
         linkeditExportTrie,
+        linkeditFunctionVariants,
 
         // Optimized symbols nlist/strings.
         // Note this must be sorted after the above LINKEDIT entries so that
@@ -190,6 +199,10 @@ struct Chunk
 
         // This is a placeholder for empty address space that can be used at runtime
         dynamicConfig,
+
+        // just align the current address to some value. This is only used to align before/after x86_64 TPRO right now,
+        // to ensure that we have whole pages to mprotect at runtime
+        align,
     };
 
 protected:
@@ -225,10 +238,12 @@ public:
 
     virtual bool isZeroFill() const;
     virtual SlidChunk* isSlidChunk();
+    virtual const AlignChunk* isAlignChunk() const;
     virtual const DylibSegmentChunk* isDylibSegmentChunk() const;
     virtual const LinkeditDataChunk* isLinkeditDataChunk() const;
     virtual StubsChunk* isStubsChunk();
     virtual UniquedGOTsChunk* isUniquedGOTsChunk();
+    virtual const DylibSegmentChunk* isTPROChunk() const;
 
 private:
     __attribute__((used))
@@ -553,6 +568,24 @@ private:
     virtual void dump() const override final;
 };
 
+struct PointerHashTableChunk : Chunk
+{
+public:
+    PointerHashTableChunk();
+    virtual ~PointerHashTableChunk();
+    PointerHashTableChunk(const PointerHashTableChunk&) = delete;
+    PointerHashTableChunk(PointerHashTableChunk&&) = delete;
+    PointerHashTableChunk& operator=(const PointerHashTableChunk&) = delete;
+    PointerHashTableChunk& operator=(PointerHashTableChunk&&) = delete;
+
+    // Virtual methods
+    const char* name() const override final;
+
+private:
+    __attribute__((used))
+    virtual void dump() const override final;
+};
+
 struct CacheTrieChunk : Chunk
 {
 public:
@@ -588,6 +621,26 @@ private:
     __attribute__((used))
     virtual void dump() const override final;
 };
+
+
+struct FunctionVariantsPatchTableChunk : Chunk
+{
+public:
+    FunctionVariantsPatchTableChunk();
+    virtual ~FunctionVariantsPatchTableChunk();
+    FunctionVariantsPatchTableChunk(const FunctionVariantsPatchTableChunk&) = delete;
+    FunctionVariantsPatchTableChunk(FunctionVariantsPatchTableChunk&&) = delete;
+    FunctionVariantsPatchTableChunk& operator=(const FunctionVariantsPatchTableChunk&) = delete;
+    FunctionVariantsPatchTableChunk& operator=(FunctionVariantsPatchTableChunk&&) = delete;
+
+    // Virtual methods
+    const char* name() const override final;
+
+private:
+    __attribute__((used))
+    virtual void dump() const override final;
+};
+
 
 struct PrebuiltLoaderChunk : Chunk
 {
@@ -652,6 +705,7 @@ public:
     // Virtual methods
     const char* name() const override final;
     const DylibSegmentChunk* isDylibSegmentChunk() const override final;
+    const DylibSegmentChunk* isTPROChunk() const override final;
 
     // FIXME: We really don't want to make kind public
     using Chunk::kind;
@@ -685,6 +739,7 @@ public:
     bool isIndirectSymbols() const;
     bool isNList() const;
     bool isNSymbolStrings() const;
+    bool isFunctionVariantsTable() const;
 
     // FIXME: We really don't want to make kind public
     using Chunk::kind;
@@ -808,6 +863,44 @@ public:
     // Virtual methods
     const char* name() const override final;
     bool isZeroFill() const override final;
+private:
+    __attribute__((used))
+    virtual void dump() const override final;
+};
+
+struct AlignChunk : Chunk
+{
+public:
+    AlignChunk();
+    virtual ~AlignChunk();
+    AlignChunk(const AlignChunk&) = delete;
+    AlignChunk(AlignChunk&&) = delete;
+    AlignChunk& operator=(const AlignChunk&) = delete;
+    AlignChunk& operator=(AlignChunk&&) = delete;
+
+    // Virtual methods
+    const char* name() const override final;
+
+    const AlignChunk* isAlignChunk() const override final;
+
+private:
+    __attribute__((used))
+    virtual void dump() const override final;
+};
+
+struct PrewarmingChunk : Chunk
+{
+public:
+    PrewarmingChunk(Kind kind);
+    virtual ~PrewarmingChunk();
+    PrewarmingChunk(const PrewarmingChunk&) = delete;
+    PrewarmingChunk(PrewarmingChunk&&) = delete;
+    PrewarmingChunk& operator=(const PrewarmingChunk&) = delete;
+    PrewarmingChunk& operator=(PrewarmingChunk&&) = delete;
+
+    // Virtual methods
+    const char* name() const override final;
+
 private:
     __attribute__((used))
     virtual void dump() const override final;

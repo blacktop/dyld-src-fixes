@@ -84,13 +84,13 @@ struct TRIVIAL_ABI Vector {
         contract(_allocator != nullptr);
         reserve(other._size);
         _size = other._size;
-        std::copy(other.begin(), other.end(), &_buffer[0]);
+        std::copy(other.begin(), other.end(), _buffer);
     }
     Vector(Vector&& other, Allocator& allocator) : _allocator(&allocator) {
         std::swap(_size,        other._size);
         if (_allocator == other._allocator) {
-            std::swap(_allocationSize,  other._allocationSize);
-            std::swap(_buffer,          other._buffer);
+            std::swap(_capacity,    other._capacity);
+            std::swap(_buffer,      other._buffer);
         } else {
             reserve(_size);
             for(auto&& i : other) {
@@ -131,88 +131,75 @@ struct TRIVIAL_ABI Vector {
     }
 #pragma mark -
 #pragma mark Iterator support
-    iterator begin()                                { return &_buffer[0]; }
-    iterator end()                                  { return &_buffer[_size]; }
-    const_iterator begin() const                    { return &_buffer[0]; }
-    const_iterator end() const                      { return &_buffer[_size]; }
-    const_iterator cbegin() const noexcept          { return &_buffer[0]; }
-    const_iterator cend() const noexcept            { return &_buffer[_size]; }
+    iterator begin()                                { return _buffer; }
+    iterator end()                                  { return _buffer + _size; }
+    const_iterator begin() const                    { return _buffer; }
+    const_iterator end() const                      { return _buffer + _size; }
+    const_iterator cbegin() const noexcept          { return _buffer; }
+    const_iterator cend() const noexcept            { return _buffer + _size; }
 
-    reference at(size_type pos)                     { return _buffer[pos]; }
-    const_reference at(size_type pos) const         { return _buffer[pos]; }
-    reference       operator[](size_type pos)       { return _buffer[pos]; }
-    const_reference operator[](size_type pos) const { return _buffer[pos]; }
+    reference at(size_type pos)                     { return *(_buffer + pos); }
+    const_reference at(size_type pos) const         { return *(_buffer + pos); }
+    reference       operator[](size_type pos)       { return *(_buffer + pos); }
+    const_reference operator[](size_type pos) const { return *(_buffer + pos); }
     
-    reference       front()                         { return _buffer[0]; }
-    const_reference front() const                   { return _buffer[0]; }
-    reference       back()                          { return _buffer[_size-1]; }
-    const_reference back() const                    { return _buffer[_size-1]; }
+    reference       front()                         { return *_buffer; }
+    const_reference front() const                   { return *_buffer; }
+    reference       back()                          { return *(_buffer + _size - 1); }
+    const_reference back() const                    { return *(_buffer + _size - 1); }
 #pragma mark -
-    constexpr pointer data()                        { return &_buffer[0]; }
-    constexpr const_pointer data() const            { return &_buffer[0]; }
+    constexpr pointer data()                        { return _buffer; }
+    constexpr const_pointer data() const            { return _buffer; }
     
     [[nodiscard]] constexpr bool empty() const      { return (_size == 0); }
     size_type size() const                          { return _size; }
-    size_type capacity() const                      { return _allocationSize/sizeof(T); }
+    size_type capacity() const                      { return _capacity; }
     void clear() {
-        if constexpr(!std::is_trivially_destructible<value_type>::value) {
-            for (auto i = begin(); i != end(); ++i) {
-                i->~value_type();
-            }
-        }
+        deleteElements(0, _size);
         _size = 0;
     }
     void resize(size_type newCapacity) {
         if (newCapacity > capacity()) {
             reserve(newCapacity);
+            _size = newCapacity;
+            _capacity = newCapacity;
         } else if (newCapacity == 0) {
-            if constexpr(!std::is_trivially_destructible<value_type>::value) {
-                for (auto i = &_buffer[0]; i != &_buffer[_size]; ++i) {
-                    i->~value_type();
-                }
-            }
+            deleteElements(0, _size);
             if (_buffer) {
-                _allocator->deallocate_buffer((void*)_buffer, _allocationSize, std::max(16UL, alignof(T)));
+                _allocator->free((void*)_buffer);
             }
             _buffer = nullptr;
             _size = 0;
-            _allocationSize = 0;
+            _capacity = 0;
         } else {
-            auto [newBuffer, newBufferSize] = _allocator->allocate_buffer(sizeof(T)*newCapacity, std::max(16UL, alignof(T)));
-            std::move(&_buffer[0], &_buffer[newCapacity], (value_type *)newBuffer);
-            for (auto i = &_buffer[newCapacity]; i != &_buffer[_size]; ++i) {
-                i->~value_type();
-            }
-            if (_buffer) {
-                _allocator->deallocate_buffer((void*)_buffer, _allocationSize, std::max(16UL, alignof(T)));
-            }
-            _buffer = (value_type *)newBuffer;
+            deleteElements(newCapacity, _size);
             _size = newCapacity;
-            _allocationSize = newBufferSize;
+            _capacity = newCapacity;
+            (void)_allocator->realloc((void*)_buffer, sizeof(T)*newCapacity);
         }
     }
     // This function exists purely to support stack allocated arrays
     void reserveExact(size_type newCapacity) {
         if (newCapacity <= capacity()) { return; }
-        auto buffer = _allocator->allocate_buffer(sizeof(T)*newCapacity, std::max(16UL, alignof(T)));
+        if (_allocator->realloc((void*)_buffer, sizeof(T)*newCapacity)) {
+            _capacity = newCapacity;
+            return;
+        }
+        auto buffer = _allocator->aligned_alloc(std::max(16UL, alignof(T)), sizeof(T)*newCapacity);
         for (auto i = 0; i < _size; ++i) {
-            (void)new ((void*)((uintptr_t)buffer.address+(i*sizeof(T)))) T(std::move(_buffer[i]));
+            (void)new ((void*)((uintptr_t)buffer+(i*sizeof(T)))) T(std::move(_buffer[i]));
         }
-        if constexpr(!std::is_trivially_destructible<value_type>::value) {
-            for (auto i = &_buffer[0]; i != &_buffer[_size]; ++i) {
-                i->~value_type();
-            }
-        }
+        deleteElements(0, _size);
         if (_buffer) {
-            _allocator->deallocate_buffer((void*)_buffer, _allocationSize, std::max(16UL, alignof(T)));
+            _allocator->free((void*)_buffer);
         }
-        _buffer = (value_type *)buffer.address;
+        _buffer = (value_type *)buffer;
         _size = std::min(newCapacity, _size);
-        _allocationSize = buffer.size;
-        assert(capacity() >= newCapacity);
+        _capacity = newCapacity;
+        assert(_capacity >= newCapacity);
     }
     void reserve(size_type newCapacity) {
-        if (newCapacity <= capacity()) { return; }
+        if (newCapacity <= _capacity) { return; }
         if (newCapacity < 16) {
             newCapacity = 16;
         } else {
@@ -223,7 +210,7 @@ struct TRIVIAL_ABI Vector {
     iterator insert( const_iterator pos, const T& value ) {
         auto offset = pos-begin();
         reserve(_size+1);
-        std::move_backward(&_buffer[offset], &_buffer[_size], &_buffer[_size+1]);
+        std::copy_backward(_buffer + offset, _buffer + _size, _buffer + _size + 1);
         ++_size;
         _buffer[offset] = value;
         return &_buffer[offset];
@@ -231,7 +218,7 @@ struct TRIVIAL_ABI Vector {
     iterator insert( const_iterator pos, T&& value ) {
         auto offset = pos-begin();
         reserve(_size+1);
-        std::move_backward(&_buffer[offset], &_buffer[_size], &_buffer[_size+1]);
+        std::move_backward(_buffer + offset , _buffer + _size, _buffer + _size + 1);
         ++_size;
         std::swap(_buffer[offset], value);
         return &_buffer[offset];
@@ -239,10 +226,11 @@ struct TRIVIAL_ABI Vector {
     iterator insert( const_iterator pos, size_type count, const T& value ) {
         auto offset = pos-begin();
         reserve(_size+count);
-        std::move_backward(&_buffer[offset], &_buffer[_size], &_buffer[_size+count]);
+        std::move_backward(_buffer + offset, _buffer + _size, _buffer + _size + count);
         for(auto i = 0; i < count; ++i) {
             _buffer[offset+i] = value;
         }
+        _size += count;
         return &_buffer[offset];
     }
     template< class InputIt >
@@ -250,35 +238,44 @@ struct TRIVIAL_ABI Vector {
         auto offset = pos-begin();
         auto count = last-first;
         reserve(_size+count);
-        std::move_backward(&_buffer[offset], &_buffer[_size], &_buffer[_size+count]);
-        std::move(first, last, &_buffer[offset]);
+        std::copy_backward(_buffer + offset, _buffer + _size, _buffer + _size + count);
+        std::copy(first, last, _buffer + offset );
         _size += count;
-        return &_buffer[offset];
+        return _buffer + offset;
     }
     iterator erase(iterator pos) {
-        contract(_size > 0);
-        std::move(pos+1, end(), pos);
-        --_size;
-        return &_buffer[pos-begin()];
+        if (pos == end()) {
+            return end();
+        }
+        return erase(pos, pos + 1);
     }
     iterator erase(const_iterator pos) {
-        contract(_size > 0);
-        std::move(pos+1, cend(), (iterator)pos);
-        --_size;
-        return &_buffer[pos-cbegin()];
+        if (pos == end()) {
+            return end();
+        }
+        return erase(pos, pos + 1);
     }
     iterator erase(iterator first, iterator last) {
-        uint64_t count = (last-first);
+        if (first == last) {
+            return end();
+        }
+        uint64_t firstIdx   = first - _buffer;
+        uint64_t count      = last - first;
         std::move(last, end(), first);
+        deleteElements(_size-count, _size);
         _size -= count;
-        return &_buffer[first-begin()];
-
+        return _buffer + std::min(firstIdx, _size);
     }
     iterator erase(const_iterator first, const_iterator last) {
-        uint64_t count = (last-first);
+        if (first == last) {
+            return end();
+        }
+        uint64_t firstIdx   = first - _buffer;
+        uint64_t count      = last - first;
         std::move(last, cend(), (iterator)first);
+        deleteElements(_size-count, _size);
         _size -= count;
-        return &_buffer[first-cbegin()];
+        return _buffer + std::min(firstIdx, _size);
         
     }
     void push_back(const T& value) {
@@ -292,53 +289,50 @@ struct TRIVIAL_ABI Vector {
     template< class... Args >
     reference emplace_back( Args&&... args ) {
         reserve(_size+1);
-        (void)new((void*)&_buffer[_size]) value_type(std::forward<Args>(args)...);
+        (void)new((void*)(_buffer + _size)) value_type(std::forward<Args>(args)...);
         return _buffer[_size++];
     }
-    
     void pop_back() {
-        contract(_size > 0);
-        if constexpr(!std::is_trivially_destructible<value_type>::value) {
-            _buffer[_size].~value_type();
-        }
+        assert(_size > 0);
+        deleteElements(_size-1, _size);
         _size--;
     }
-    
     Allocator* allocator() const {
         return _allocator;
     }
 private:
     Vector(const Vector& other): _allocator(other._allocator) {
-        contract(_allocator != nullptr);
+        assert(_allocator != nullptr);
         resize(0);
         reserve(other._size);
         _size = other._size;
-        std::copy(other.begin(), other.end(), &_buffer[0]);
+        std::copy(other.begin(), other.end(), _buffer);
     };
     void swap(Vector& other) {
         using std::swap;
-
         if (this == &other) { return; }
-        swap(_allocator,        other._allocator);
-        swap(_size,             other._size);
-        swap(_allocationSize,   other._allocationSize);
-        swap(_buffer,           other._buffer);
+        swap(_allocator,    other._allocator);
+        swap(_size,         other._size);
+        swap(_capacity,     other._capacity);
+        swap(_buffer,       other._buffer);
+    }
+    void deleteElements(uint64_t startIdx, uint64_t endIdx) {
+        if constexpr(!std::is_trivially_destructible<value_type>::value) {
+            for (auto i = _buffer + startIdx; i != _buffer + endIdx; ++i) {
+                i->~value_type();
+            }
+        }
     }
     Allocator*  _allocator      = nullptr;
     value_type* _buffer         = nullptr;
     uint64_t    _size           = 0;
-    uint64_t    _allocationSize = 0;
+    uint64_t    _capacity       = 0;
 };
 
 } // namespace lsl
 
 #define STACK_ALLOC_VECTOR_BYTE_SIZE(_type, _count) (16UL   + alignof(_type)              + sizeof(_type)*_count        \
-                                                            + alignof(EphemeralAllocator) + sizeof(EphemeralAllocator)  \
-                                                            + alignof(MemoryManager)      + sizeof(MemoryManager))
-
-#define STACK_ALLOCATOR(_name, _count)                      \
-    void*  __##_name##_storage = alloca(_count);            \
-    EphemeralAllocator _name(__##_name##_storage, _count);
+                                                            + alignof(lsl::Vector<_type>) + sizeof(lsl::Vector<_type>))
 
 #define STACK_ALLOC_VECTOR(_type, _name, _count)                                        \
     STACK_ALLOCATOR(__##_name##_allocator, STACK_ALLOC_VECTOR_BYTE_SIZE(_type,_count))  \

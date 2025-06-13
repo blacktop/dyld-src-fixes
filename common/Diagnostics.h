@@ -35,8 +35,12 @@
   #include <vector>
 #endif
 
-#include "Defines.h"
+#if BUILDING_LD || BUILDING_UNIT_TESTS || BUILDING_SHARED_CACHE_LINKER || BUILDING_CACHE_BUILDER || BUILDING_CACHE_BUILDER_UNIT_TESTS
+  #include "Error.h"
+#endif
 
+#include "Defines.h"
+#include "va_list_wrap.h"
 
 class VIS_HIDDEN Diagnostics
 {
@@ -45,7 +49,7 @@ public:
                     ~Diagnostics();
 
     void            error(const char* format, ...)  __attribute__((format(printf, 2, 3)));
-    void            error(const char* format, va_list list) __attribute__((format(printf, 2, 0)));
+    void            error(const char* format, va_list_wrap vaWrap) __attribute__((format(printf, 2, 0)));
     void            appendError(const char* format, ...)  __attribute__((format(printf, 2, 3)));
 #if BUILDING_CACHE_BUILDER || BUILDING_UNIT_TESTS || BUILDING_CACHE_BUILDER_UNIT_TESTS
                     Diagnostics(const std::string& prefix, bool verbose=false);
@@ -70,6 +74,11 @@ public:
 #else
     const char*                     errorMessage() const;
     const char*                     errorMessageCStr() const { return errorMessage(); }
+#endif
+
+#if BUILDING_LD || BUILDING_UNIT_TESTS || BUILDING_SHARED_CACHE_LINKER || BUILDING_CACHE_BUILDER || BUILDING_CACHE_BUILDER_UNIT_TESTS
+    mach_o::Error                   toError() const;
+    void                            error(const mach_o::Error& err);
 #endif
 
 private:

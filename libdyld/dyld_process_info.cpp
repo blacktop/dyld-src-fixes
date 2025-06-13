@@ -45,6 +45,12 @@
 #include "dyld_process_info_internal.h"
 #include "Tracing.h"
 #include "DyldProcessConfig.h"
+#include "StringUtils.h"
+#include "DyldLegacyInterfaceGlue.h"
+
+extern "C" const dyld_all_image_infos* getProcessDyldInfo(); 
+
+#define BLEND_KERN_RETURN_LOCATION(kr, loc) (kr) = ((kr & 0x00ffffff) | loc<<24);
 
 #define IMAGE_COUNT_MAX 8192
 RemoteBuffer& RemoteBuffer::operator=(RemoteBuffer&& other) {
@@ -71,6 +77,10 @@ RemoteBuffer::map(task_t task, mach_vm_address_t remote_address, vm_size_t size)
         return std::make_pair(MACH_VM_MIN_ADDRESS, KERN_INVALID_ARGUMENT);
     }
     mach_vm_address_t localAddress = 0;
+#if __arm64e__
+    // Mask out TBI bits
+    remote_address &= 0x00ff'ffff'ffff'ffffUL;
+#endif
 #if TARGET_OS_SIMULATOR
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -98,6 +108,7 @@ RemoteBuffer::map(task_t task, mach_vm_address_t remote_address, vm_size_t size)
                         VM_INHERIT_NONE);
     // The call is not succesfull return
     if (kr != KERN_SUCCESS) {
+        BLEND_KERN_RETURN_LOCATION(kr, 0xfd)
         return std::make_pair(MACH_VM_MIN_ADDRESS, kr);
     }
     // If it is not a shared buffer then copy it into a local buffer so our results are coherent in the event
@@ -233,14 +244,15 @@ private:
                                 dyld_process_info_base(dyld_platform_t platform, unsigned imageCount, unsigned aotImageCount, size_t totalSize);
     void*                       operator new (size_t, void* buf) { return buf; }
 
-    kern_return_t               addImage(task_t task, bool sameCacheAsThisProcess, uint64_t sharedCacheStart, uint64_t sharedCacheEnd, uint64_t imageAddress, uint64_t imagePath, const char* imagePathLocal);
+    kern_return_t               addImage(task_t task, bool sameCacheAsThisProcess, uint64_t sharedCacheStart, uint64_t sharedCacheEnd, uint64_t imageAddress, uint64_t imagePath, const char* imagePathLocal,
+                                         uint32_t imageIndex);
 
     kern_return_t               addAotImage(dyld_aot_image_info_64 aotImageInfo);
 
     kern_return_t               addDyldImage(task_t task, uint64_t dyldAddress, uint64_t dyldPathAddress, const char* localPath);
 
     bool                        invalid() { return ((char*)_stringRevBumpPtr < (char*)_curSegment); }
-    const char*                 copyPath(task_t task, uint64_t pathAddr);
+    const char*                 copyPath(task_t task, kern_return_t* kr, uint64_t pathAddr);
     const char*                 addString(const char*, size_t);
     const char*                 copySegmentName(const char*);
 
@@ -370,8 +382,9 @@ dyld_process_info_ptr dyld_process_info_base::make(task_t task, const T1& allIma
     withRemoteBuffer(task, infoArray, imageArraySize, false, kr, ^(void *buffer, size_t size) {
         // figure out how many path strings will need to be copied and their size
         T2* imageArray = (T2 *)buffer;
-        const dyld_all_image_infos* myInfo = (const dyld_all_image_infos*)dyld4::gDyld.allImageInfos;   // FIXME: should not need dyld_all_image_info
+        const dyld_all_image_infos* myInfo = getProcessDyldInfo(); // FIXME: should not need dyld_all_image_info
         const bool sameCacheAsThisProcess = true
+            && (myInfo != nullptr)
             && (allImageInfo.sharedCacheBaseAddress != 0)
             && (myInfo->sharedCacheBaseAddress != 0)
             && !allImageInfo.processDetachedFromSharedRegion
@@ -389,7 +402,7 @@ dyld_process_info_ptr dyld_process_info_base::make(task_t task, const T1& allIma
             if ( sameCacheAsThisProcess && dyldCacheHeader != nullptr) {
                 bool readOnly = false;
                 for (uint32_t i=0; i < imageCount; ++i) {
-                    if ( !dyldCacheHeader->inCache((void*)imageArray[i].imageFilePath, 1, readOnly) )
+                    if ( !dyldCacheHeader->inCache((void*)imageArray[i].imageFilePath, 1, readOnly) || !readOnly )
                         ++countOfPathsNeedingCopying;
                 }
             }
@@ -464,7 +477,7 @@ dyld_process_info_ptr dyld_process_info_base::make(task_t task, const T1& allIma
         }
         // fill in info for each image
         for (uint32_t i=0; i < imageCount; ++i) {
-            *kr =  info->addImage(task, sameCacheAsThisProcess, sharedCacheStart, sharedCacheEnd, imageArray[i].imageLoadAddress, imageArray[i].imageFilePath, NULL);
+            *kr =  info->addImage(task, sameCacheAsThisProcess, sharedCacheStart, sharedCacheEnd, imageArray[i].imageLoadAddress, imageArray[i].imageFilePath, NULL, i);
             if (*kr != KERN_SUCCESS) {
                 result = nullptr;
                 return;
@@ -513,6 +526,7 @@ dyld_process_info_ptr dyld_process_info_base::makeSuspended(task_t task, const T
     mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
     if ((*kr = task_info(task, MACH_TASK_BASIC_INFO, (task_info_t)&ti, &count))) {
         *kr = KERN_NO_SPACE;
+        BLEND_KERN_RETURN_LOCATION(*kr, 0xfc)
         return  nullptr;
     }
 
@@ -525,6 +539,7 @@ dyld_process_info_ptr dyld_process_info_base::makeSuspended(task_t task, const T
         mach_vm_size_t kcd_size = 0;
         *kr = task_map_corpse_info_64(mach_task_self(), task, &kcd_addr_begin, &kcd_size);
         if (*kr != KERN_SUCCESS) {
+            BLEND_KERN_RETURN_LOCATION(*kr, 0xfb)
             // Not a corpse, so forward progress is possible. Return so that make() can pause and retry
             return nullptr;
         }
@@ -539,8 +554,10 @@ dyld_process_info_ptr dyld_process_info_base::makeSuspended(task_t task, const T
     char                    mainExecutablePathBuffer[PATH_MAX+1];
     __block char *          dyldPath = &dyldPathBuffer[0];
     __block char *          mainExecutablePath = &mainExecutablePathBuffer[0];
-    __block dyld3::Platform platformID = dyld3::Platform::unknown;
-    mach_vm_size_t      size;
+    mach_vm_size_t          size;
+    dyldPathBuffer[0]           = '\0';
+    mainExecutablePathBuffer[0] = '\0';
+
     for (mach_vm_address_t address = 0; ; address += size) {
         vm_region_basic_info_data_64_t  info;
         mach_port_t                     objectName;
@@ -559,16 +576,18 @@ dyld_process_info_ptr dyld_process_info_base::makeSuspended(task_t task, const T
                 if ( mhBuffer.filetype == MH_EXECUTE ) {
                     mainExecutableAddress = address;
                     int len = proc_regionfilename(pid, mainExecutableAddress, mainExecutablePath, PATH_MAX);
-                    if ( len != 0 ) {
-                        mainExecutablePath[len] = '\0';
+                    // explicitly clear the path if call failed
+                    if ( len <= 0 ) {
+                        strlcpy(mainExecutablePath, "/main_executable_path_missing", PATH_MAX);
                     }
                     ++imageCount;
                 }
                 else if ( mhBuffer.filetype == MH_DYLINKER ) {
                     dyldAddress = address;
                     int len = proc_regionfilename(pid, dyldAddress, dyldPath, PATH_MAX);
-                    if ( len != 0 ) {
-                        dyldPath[len] = '\0';
+                    // explicitly clear the path if call failed
+                    if ( len <= 0 ) {
+                        strlcpy(dyldPath, "/dyld_path_missing", PATH_MAX);
                     }
                     ++imageCount;
                 }
@@ -602,9 +621,10 @@ dyld_process_info_ptr dyld_process_info_base::makeSuspended(task_t task, const T
     void* storage = malloc(allocationSize);
     if (storage == nullptr) {
         *kr = KERN_NO_SPACE;
+        BLEND_KERN_RETURN_LOCATION(*kr, 0xfa)
         return  nullptr;
     }
-    auto obj = dyld_process_info_ptr(new (storage) dyld_process_info_base((dyld_platform_t)platformID, imageCount, aotImageCount, allocationSize), deleter);
+    auto obj = dyld_process_info_ptr(new (storage) dyld_process_info_base(PLATFORM_UNKNOWN, imageCount, aotImageCount, allocationSize), deleter);
     (void)obj->reserveSpace(sizeof(dyld_process_info_base)+sizeof(dyld_process_cache_info)+sizeof(dyld_process_aot_cache_info)+sizeof(dyld_process_state_info));
     // fill in base info
     dyld_process_cache_info* cacheInfo = obj->cacheInfo();
@@ -632,7 +652,7 @@ dyld_process_info_ptr dyld_process_info_base::makeSuspended(task_t task, const T
 
     // fill in info for each image
     if ( mainExecutableAddress != 0 ) {
-        if ((*kr = obj->addImage(task, false, 0, 0, mainExecutableAddress, 0, mainExecutablePath))) {
+        if ((*kr = obj->addImage(task, false, 0, 0, mainExecutableAddress, 0, mainExecutablePath, 0))) {
             return nullptr;
         }
     }
@@ -657,16 +677,38 @@ const char* dyld_process_info_base::addString(const char* str, size_t maxlen)
     return _stringRevBumpPtr;
 }
 
-const char* dyld_process_info_base::copyPath(task_t task, uint64_t stringAddressInTask)
+const char* dyld_process_info_base::copyPath(task_t task, kern_return_t *kr, uint64_t stringAddressInTask)
 {
     __block const char* retval = "";
-    withRemoteBuffer(task, stringAddressInTask, PATH_MAX, true, nullptr, ^(void *buffer, size_t size) {
+    withRemoteBuffer(task, stringAddressInTask, PATH_MAX, true, kr, ^(void *buffer, size_t size) {
         retval = addString(static_cast<const char *>(buffer), size);
     });
     return retval;
 }
 
-kern_return_t dyld_process_info_base::addImage(task_t task, bool sameCacheAsThisProcess, uint64_t sharedCacheStart, uint64_t sharedCacheEnd, uint64_t imageAddress, uint64_t imagePath, const char* imagePathLocal)
+static char sCrashReporterInfo[4096];
+
+static void checkPath(const char* path, uint64_t pathAddress, uint32_t imageIndex)
+{
+    if ( path[0] != '/' ) {
+        // Set the crash reporter info to help work out why we pass non-UTF8 strings to CS
+        snprintf(sCrashReporterInfo, sizeof(sCrashReporterInfo), "dyld: found non-UTF8 string on image[%d]: 0x%llx [ ", imageIndex, pathAddress);
+        for ( char c : std::string_view(path, strnlen(path, 8)) ) {
+            char buffer[8];
+            bytesToHex((uint8_t*)&c, 1, buffer);
+            strlcat(sCrashReporterInfo, buffer, sizeof(sCrashReporterInfo));
+            strlcat(sCrashReporterInfo, " ", sizeof(sCrashReporterInfo));
+        }
+
+        strlcat(sCrashReporterInfo, " ]\n", sizeof(sCrashReporterInfo));
+
+        CRSetCrashLogMessage2(sCrashReporterInfo);
+    }
+}
+
+kern_return_t dyld_process_info_base::addImage(task_t task, bool sameCacheAsThisProcess, uint64_t sharedCacheStart, uint64_t sharedCacheEnd,
+                                               uint64_t imageAddress, uint64_t imagePath, const char* imagePathLocal,
+                                               uint32_t imageIndex)
 {
     const DyldSharedCache* dyldCacheHeader = (DyldSharedCache*)sharedCacheStart;
     bool readOnly = false;
@@ -674,13 +716,19 @@ kern_return_t dyld_process_info_base::addImage(task_t task, bool sameCacheAsThis
     _curImage->segmentStartIndex = _curSegmentIndex;
     if ( imagePathLocal != NULL ) {
         _curImage->path = addString(imagePathLocal, PATH_MAX);
-    } else if ( sameCacheAsThisProcess && dyldCacheHeader != nullptr && dyldCacheHeader->inCache((void*)imagePath, 1, readOnly) ) {
+    } else if ( sameCacheAsThisProcess && dyldCacheHeader != nullptr && dyldCacheHeader->inCache((void*)imagePath, 1, readOnly) && readOnly ) {
         _curImage->path = (const char*)imagePath;
     } else if (imagePath) {
-        _curImage->path = copyPath(task, imagePath);
+        kern_return_t kr = KERN_SUCCESS;
+        _curImage->path = copyPath(task, &kr, imagePath);
+        if ( kr != KERN_SUCCESS ) {
+            return kr;
+        }
     } else {
-        _curImage->path = "";
+        _curImage->path = addString("/<unknown>", PATH_MAX);
     }
+
+    checkPath(_curImage->path, imagePath, imageIndex);
 
     if ( sameCacheAsThisProcess && dyldCacheHeader != nullptr && dyldCacheHeader->inCache((void*)imageAddress, 32*1024, readOnly) ) {
         addInfoFromLoadCommands((mach_header*)imageAddress, imageAddress, 32*1024);
@@ -748,10 +796,12 @@ kern_return_t dyld_process_info_base::addDyldImage(task_t task, uint64_t dyldAdd
         _curImage->path = addString(localPath, PATH_MAX);
     }
     else {
-        _curImage->path = copyPath(task, dyldPathAddress);
+        _curImage->path = copyPath(task, &kr, dyldPathAddress);
         if ( kr != KERN_SUCCESS)
             return kr;
     }
+
+    checkPath(_curImage->path, dyldPathAddress, ~0U);
 
     kr = addInfoFromRemoteLoadCommands(task, dyldAddress);
     if ( kr != KERN_SUCCESS)
@@ -827,7 +877,18 @@ const char* dyld_process_info_base::copySegmentName(const char* name)
 void dyld_process_info_base::forEachImage(void (^callback)(uint64_t machHeaderAddress, const uuid_t uuid, const char* path)) const
 {
     for (const ImageInfo* p = _firstImage; p < _curImage; ++p) {
+        // Set a temporary to hold a log message. We will always switch back to the original value before the scope ends, so it can live on the stack
+        char asiBuffer[1024];
+        const char* oldLogMessage = CRGetCrashLogMessage();
+        if (p->loadAddress == 0 || p->path == nullptr) {
+            // Set an ASI for debugging. Unfortunately we don't have much state here, so let's grab what we have that is meaingful which will hopefully
+            // let us figure out why this is sometimes set incorrectly.
+            snprintf(&asiBuffer[0], 1024, "Bad dyld_proces_info image info for\n\tplatform: %u\n\taddress = 0x%llx\n\tpath = %s\n",
+                     _platform, p->loadAddress, p->path ? p->path : "(null)");
+            CRSetCrashLogMessage(asiBuffer);
+        }
         callback(p->loadAddress, p->uuid, p->path);
+        CRSetCrashLogMessage(oldLogMessage);
     }
 }
 
@@ -866,6 +927,9 @@ void dyld_process_info_base::forEachSegment(uint64_t machHeaderAddress, void (^c
 
 dyld_process_info _dyld_process_info_create(task_t task, uint64_t timestamp, kern_return_t* kr)
 {
+    if ( const IntrospectionVtable* vtable = dyldFrameworkIntrospectionVtable() ) {
+        return vtable->_dyld_process_info_create(task, timestamp, kr);
+    }
     __block dyld_process_info result = nullptr;
     kern_return_t krSink = KERN_SUCCESS;
     if (kr == nullptr) {
@@ -877,12 +941,14 @@ dyld_process_info _dyld_process_info_create(task_t task, uint64_t timestamp, ker
     mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
     if ( kern_return_t r = task_info(task, TASK_DYLD_INFO, (task_info_t)&task_dyld_info, &count) ) {
         *kr = r;
+        BLEND_KERN_RETURN_LOCATION(*kr, 0xff);
         return  nullptr;
     }
 
     //The kernel will return MACH_VM_MIN_ADDRESS for an executable that has not had dyld loaded
     if (task_dyld_info.all_image_info_addr == MACH_VM_MIN_ADDRESS) {
         *kr = KERN_FAILURE;
+        BLEND_KERN_RETURN_LOCATION(*kr, 0xfe);
         return nullptr;
     }
 
@@ -916,47 +982,74 @@ dyld_process_info _dyld_process_info_create(task_t task, uint64_t timestamp, ker
 
 void _dyld_process_info_get_state(dyld_process_info info, dyld_process_state_info* stateInfo)
 {
+    if ( const IntrospectionVtable* vtable = dyldFrameworkIntrospectionVtable() ) {
+        return vtable->_dyld_process_info_get_state(info, stateInfo);
+    }
     *stateInfo = *info->stateInfo();
 }
 
 void _dyld_process_info_get_cache(dyld_process_info info, dyld_process_cache_info* cacheInfo)
 {
+    if ( const IntrospectionVtable* vtable = dyldFrameworkIntrospectionVtable() ) {
+        return vtable->_dyld_process_info_get_cache(info, cacheInfo);
+    }
     *cacheInfo = *info->cacheInfo();
 }
 
 void _dyld_process_info_get_aot_cache(dyld_process_info info, dyld_process_aot_cache_info* aotCacheInfo)
 {
+    if ( const IntrospectionVtable* vtable = dyldFrameworkIntrospectionVtable() ) {
+        return vtable->_dyld_process_info_get_aot_cache(info, aotCacheInfo);
+    }
     *aotCacheInfo = *info->aotCacheInfo();
 }
 
 void _dyld_process_info_retain(dyld_process_info object)
 {
+    if ( const IntrospectionVtable* vtable = dyldFrameworkIntrospectionVtable() ) {
+        return vtable->_dyld_process_info_retain(object);
+    }
     const_cast<dyld_process_info_base*>(object)->retain();
 }
 
 dyld_platform_t _dyld_process_info_get_platform(dyld_process_info object) {
+    if ( const IntrospectionVtable* vtable = dyldFrameworkIntrospectionVtable() ) {
+        return vtable->_dyld_process_info_get_platform(object);
+    }
     return  const_cast<dyld_process_info_base*>(object)->platform();
 }
 
 void _dyld_process_info_release(dyld_process_info object)
 {
+    if ( const IntrospectionVtable* vtable = dyldFrameworkIntrospectionVtable() ) {
+        return vtable->_dyld_process_info_release(object);
+    }
     const_cast<dyld_process_info_base*>(object)->release();
 }
 
 void _dyld_process_info_for_each_image(dyld_process_info info, void (^callback)(uint64_t machHeaderAddress, const uuid_t uuid, const char* path))
 {
+    if ( const IntrospectionVtable* vtable = dyldFrameworkIntrospectionVtable() ) {
+        return vtable->_dyld_process_info_for_each_image(info, callback);
+    }
     info->forEachImage(callback);
 }
 
 #if TARGET_OS_OSX
 void _dyld_process_info_for_each_aot_image(dyld_process_info info, bool (^callback)(uint64_t x86Address, uint64_t aotAddress, uint64_t aotSize, uint8_t* aotImageKey, size_t aotImageKeySize))
 {
+    if ( const IntrospectionVtable* vtable = dyldFrameworkIntrospectionVtable() ) {
+        return vtable->_dyld_process_info_for_each_aot_image(info, callback);
+    }
     info->forEachAotImage(callback);
 }
 #endif
 
 void _dyld_process_info_for_each_segment(dyld_process_info info, uint64_t machHeaderAddress, void (^callback)(uint64_t segmentAddress, uint64_t segmentSize, const char* segmentName))
 {
+    if ( const IntrospectionVtable* vtable = dyldFrameworkIntrospectionVtable() ) {
+        return vtable->_dyld_process_info_for_each_segment(info, machHeaderAddress, callback);
+    }
     info->forEachSegment(machHeaderAddress, callback);
 }
 

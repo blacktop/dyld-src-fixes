@@ -24,13 +24,16 @@
 #ifndef Loader_h
 #define Loader_h
 
-#include <ptrauth.h>
 #include <TargetConditionals.h>
 
 #include "Defines.h"
 #include "Array.h"
 #include "DyldDelegates.h"
 #include "DyldProcessConfig.h"
+
+// lsl
+#include "AuthenticatedValue.h"
+#include "Vector.h"
 
 // mach_o
 #include "Header.h"
@@ -112,8 +115,16 @@ public:
                         hasReadOnlyObjC    :  1,  // Has __DATA_CONST,__objc_selrefs section
                         pre2022Binary      :  1,
                         isPremapped        :  1,  // mapped by exclave core
-                        padding            :  6;
+                        hasUUIDLoadCommand :  1,
+                        hasWeakDefs        :  1,
+                        hasTLVs            :  1,
+                        belowLibSystem     :  1,
+                        hasFuncVarFixups   :  1,
+                        padding            :  1;
     LoaderRef           ref;
+    uuid_t              uuid;
+    uint32_t            cpusubtype;
+    uint32_t            unused;
 
     enum ExportedSymbolMode { staticLink, shallow, dlsymNext, dlsymSelf };
     enum ResolverMode { runResolver, skipResolver };
@@ -126,7 +137,7 @@ public:
 
     struct LoadOptions
     {
-        typedef const Loader* (^Finder)(Diagnostics& diag, dyld3::Platform, const char* loadPath, const LoadOptions& options);
+        typedef const Loader* (^Finder)(Diagnostics& diag, mach_o::Platform, const char* loadPath, const LoadOptions& options);
         typedef void          (^Missing)(const char* pathNotFound);
 
         bool        launching           = false;
@@ -151,13 +162,17 @@ public:
         const Loader*   targetLoader;
         const char*     targetSymbolName;
         uint64_t        targetRuntimeOffset;
+        uintptr_t       targetAddressForDlsym;
         Kind            kind;
-        bool            isCode;
-        bool            isWeakDef;
-        bool            isMissingFlatLazy;
+        bool            isCode              = false;
+        bool            isWeakDef           = false;
+        bool            isMissingFlatLazy   = false;
+        bool            isMaterializing     = false;
+        bool            isFunctionVariant   = false;
+        uint16_t        variantIndex        = 0;
     };
     struct BindTarget { const Loader* loader; uint64_t runtimeOffset; };
-    typedef mach_o::DependentDylibAttributes   DependentDylibAttributes;
+    typedef mach_o::LinkedDylibAttributes   LinkedDylibAttributes;
 
     // stored in PrebuiltLoader when it references a file on disk
     struct FileValidationInfo
@@ -202,18 +217,19 @@ public:
     };
 
     // these are the "virtual" methods that JustInTimeLoader, PrebuiltLoader and PremappedLoader implement
-    const dyld3::MachOFile* mf(RuntimeState& state) const;
+    const dyld3::MachOFile* mf(const RuntimeState& state) const;
 #if SUPPORT_VM_LAYOUT
-    const MachOLoaded*      loadAddress(RuntimeState& state) const;
+    const MachOLoaded*      loadAddress(const RuntimeState& state) const;
 #endif
-    const char*             path() const;
+    const char*             path(const RuntimeState& state) const;
+    const char*             installName(const RuntimeState& state) const;
     bool                    contains(RuntimeState& state, const void* addr, const void** segAddr, uint64_t* segSize, uint8_t* segPerms) const;
-    bool                    matchesPath(const char* path) const;
+    bool                    matchesPath(const RuntimeState& state, const char* path) const;
 #if !TARGET_OS_EXCLAVEKIT
     FileID                  fileID(const RuntimeState& state) const;
 #endif
     uint32_t                dependentCount() const;
-    Loader*                 dependent(const RuntimeState& state, uint32_t depIndex, DependentDylibAttributes* depAttrs=nullptr) const;
+    Loader*                 dependent(const RuntimeState& state, uint32_t depIndex, LinkedDylibAttributes* depAttrs=nullptr) const;
     bool                    hiddenFromFlat(bool forceGlobal=false) const;
     bool                    representsCachedDylibIndex(uint16_t dylibIndex) const;
     bool                    getExportsTrie(uint64_t& runtimeOffset, uint32_t& size) const;
@@ -221,11 +237,13 @@ public:
 #if SUPPORT_IMAGE_UNLOADING
     void                    unmap(RuntimeState& state, bool force=false) const;
 #endif
-    void                    applyFixups(Diagnostics&, RuntimeState&, DyldCacheDataConstLazyScopedWriter&, bool allowLazyBinds) const;
+    typedef std::pair<const Loader*, const char*> PseudoDylibSymbolToMaterialize;
+    void                    applyFixups(Diagnostics&, RuntimeState&, DyldCacheDataConstLazyScopedWriter&, bool allowLazyBinds,
+                                        lsl::Vector<PseudoDylibSymbolToMaterialize>* materializingSymbols) const;
     bool                    overridesDylibInCache(const DylibPatch*& patchTable, uint16_t& cacheDylibOverriddenIndex) const;
     bool                    dyldDoesObjCFixups() const;
     const SectionLocations* getSectionLocations() const;
-    void                    withLayout(Diagnostics &diag, RuntimeState& state, void (^callback)(const mach_o::Layout &layout)) const;
+    void                    withLayout(Diagnostics &diag, const RuntimeState& state, void (^callback)(const mach_o::Layout &layout)) const;
 
     // these are private
     bool                    hasBeenFixedUp(RuntimeState&) const;
@@ -238,23 +256,27 @@ public:
     typedef void (^CacheWeakDefOverride)(uint32_t cachedDylibIndex, uint32_t cachedDylibVMOffset, const ResolvedSymbol& target);
 
     // helper functions
-    const char*             leafName() const;
+    bool                    validMagic() const { return (this->magic == kMagic); }
+    const char*             leafName(const RuntimeState&) const;
 #if SUPPORT_VM_LAYOUT
-    const MachOAnalyzer*    analyzer(RuntimeState& state) const;
+    const MachOAnalyzer*    analyzer(const RuntimeState& state) const;
+    const mach_o::Header*   header(const RuntimeState& state) const;
 #endif
     bool                    hasExportedSymbol(Diagnostics& diag, RuntimeState&, const char* symbolName, ExportedSymbolMode mode,
                                               ResolverMode resolverMode, ResolvedSymbol* result,
                                               dyld3::Array<const Loader*>* searched=nullptr) const;
+    uint64_t                selectFromFunctionVariants(Diagnostics& diag, const RuntimeState& state, const char* symbolName, uint32_t fvTableIndex) const;
     void                    logSegmentsFromSharedCache(RuntimeState& state) const;
     bool                    hasConstantSegmentsToProtect() const;
     void                    makeSegmentsReadOnly(RuntimeState& state) const;
     void                    makeSegmentsReadWrite(RuntimeState& state) const;
     ResolvedSymbol          resolveSymbol(Diagnostics& diag, RuntimeState&, int libOrdinal, const char* symbolName, bool weakImport,
                                           bool lazyBind, CacheWeakDefOverride patcher, bool buildingCache=false) const;
-    void                    runInitializersBottomUp(RuntimeState&, Array<const Loader*>& danglingUpwards) const;
+    void                    runInitializersBottomUp(RuntimeState&, Array<const Loader*>& danglingUpwards, Array<const Loader*>& visitedDelayed) const;
     void                    runInitializersBottomUpPlusUpwardLinks(RuntimeState&) const;
     void                    findAndRunAllInitializers(RuntimeState&) const;
     bool                    hasMagic() const;
+    void                    applyFixupsCheckCachePatching(RuntimeState& state, DyldCacheDataConstLazyScopedWriter& cacheDataConst) const;
     void                    applyCachePatchesToOverride(RuntimeState& state, const Loader* dylibToPatch,
                                                         uint16_t overriddenDylibIndex, const DylibPatch* patches,
                                                         DyldCacheDataConstLazyScopedWriter& cacheDataConst) const;
@@ -263,6 +285,7 @@ public:
     void                    applyFixupsGeneric(Diagnostics&, RuntimeState& state, uint64_t sliceOffset, const Array<const void*>& bindTargets,
                                                const Array<const void*>& overrideBindTargets, bool laziesMustBind,
                                                const Array<MissingFlatLazySymbol>& missingFlatLazySymbols) const;
+    void                    applyFunctionVariantFixups(Diagnostics& diag, const RuntimeState& state) const;
     void                    forEachBindTarget(Diagnostics& diag, RuntimeState& state,
                                               CacheWeakDefOverride patcher, bool allowLazyBinds,
                                           void (^callback)(const ResolvedSymbol& target, bool& stop),
@@ -270,16 +293,20 @@ public:
     const JustInTimeLoader* isJustInTimeLoader() const { return (this->isPrebuilt ? nullptr               : (JustInTimeLoader*)this); };
     const PrebuiltLoader*   isPrebuiltLoader() const   { return (this->isPrebuilt ? (PrebuiltLoader*)this : nullptr); };
     const PremappedLoader*  isPremappedLoader() const   { return (this->isPremapped ? (PremappedLoader*)this : nullptr); };
-    void                    getUuidStr(RuntimeState&, char uuidStr[64]) const;
+    void                    getUuidStr(char uuidStr[64]) const;
     void                    logLoad(RuntimeState&, const char* path) const;
     void                    tooNewErrorAddendum(Diagnostics& diag, RuntimeState&) const;
+    void                    logChainToLinksWith(RuntimeState& state, const char* msgPrefix) const;
+    uint64_t                functionVariantTableVMOffset(const RuntimeState &state) const;
 
     static uintptr_t        resolvedAddress(RuntimeState& state, const ResolvedSymbol& symbol);
 
     static void             appendHexNibble(uint8_t value, char*& p);
     static void             appendHexByte(uint8_t value, char*& p);
-    static void             uuidToStr(uuid_t uuid, char  uuidStr[64]);
+    static void             uuidToStr(const uuid_t uuid, char  uuidStr[64]);
     static void             applyInterposingToDyldCache(RuntimeState& state);
+    static void             adjustFunctionVariantsInDyldCache(RuntimeState& state);
+
     static uintptr_t        interpose(RuntimeState& state, uintptr_t value, const Loader* forLoader=nullptr);
     static const Loader*    getLoader(Diagnostics& diag, RuntimeState& state, const char* loadPath, const LoadOptions& options);
     static const char*      leafName(const char* path);
@@ -292,6 +319,14 @@ public:
     static void             addWeakDefsToMap(RuntimeState& state, const std::span<const Loader*>& newLoaders);
 #endif
     static bool             expandAndNormalizeAtExecutablePath(const char* mainPath, const char* loadPath, char fixedPath[PATH_MAX]);
+
+    struct LinksWithChain { LinksWithChain* next=nullptr; const Loader* ldr=nullptr; LinkedDylibAttributes attr=LinkedDylibAttributes::regular; };
+
+#if TARGET_OS_EXCLAVEKIT
+    static void             setUpExclaveKitSharedCachePageInLinking(RuntimeState& state);
+    static void             exclaveKitPageInFixups(void* cbarg_for_segment, uintptr_t address_where_fixed_up_page_will_be_mapped,
+                                                   void* __sized_by(size) buf_to_perform_fixups_in, size_t size);
+#endif
 
 protected:
 
@@ -311,6 +346,11 @@ protected:
         bool leaveMapped        = false;
         bool roObjC             = false;
         bool pre2022Binary      = false;
+        bool hasUUID            = false;
+        bool hasWeakDefs        = false;
+        bool hasTLVs            = false;
+        bool belowLibSystem     = false;
+        bool hasFuncVarFixups   = false;
    };
 
     struct CodeSignatureInFile
@@ -324,14 +364,23 @@ protected:
                                        : magic(kMagic), isPrebuilt(prebuilt), dylibInDyldCache(options.inDyldCache),
                                          hasObjC(options.hasObjc), mayHavePlusLoad(options.mayHavePlusLoad), hasReadOnlyData(options.roData),
                                          neverUnload(options.neverUnloaded), leaveMapped(options.leaveMapped), hasReadOnlyObjC(options.roObjC),
-                                         pre2022Binary(options.pre2022Binary), isPremapped(premapped), padding(0),
-                                         ref(prebuiltApp, prebuiltIndex) { }
+                                         pre2022Binary(options.pre2022Binary), isPremapped(premapped), hasUUIDLoadCommand(options.hasUUID),
+                                         hasWeakDefs(options.hasWeakDefs), hasTLVs(options.hasTLVs), belowLibSystem(options.belowLibSystem),
+                                         hasFuncVarFixups(options.hasFuncVarFixups), padding(0),
+                                         ref(prebuiltApp, prebuiltIndex),
+                                         cpusubtype(0), unused(0) { }
 
+#if TARGET_OS_EXCLAVEKIT
+    void                        setUpExclaveKitPageInLinking(Diagnostics& diag, RuntimeState& state, uintptr_t slide, uint64_t sliceOffset, const Array<const void*>& bindTargets) const;
+#else
     void                        setUpPageInLinking(Diagnostics& diag, RuntimeState& state, uintptr_t slide, uint64_t sliceOffset, const Array<const void*>& bindTargets) const;
+#endif
+
+    void                        recursivelyLogChainToLinksWith(RuntimeState& state, const char* msgPrefx, const Loader* targetLoader, LinksWithChain* start, LinksWithChain* prev, Array<const Loader*>& visited) const;
 
     static bool                 expandAtLoaderPath(RuntimeState& state, const char* loadPath, const LoadOptions& options, const Loader* ldr, bool fromLCRPATH, char fixedPath[]);
     static bool                 expandAtExecutablePath(RuntimeState& state, const char* loadPath, const LoadOptions& options, bool fromLCRPATH, char fixedPath[]);
-    static const Loader*        makePremappedLoader(Diagnostics& diag, RuntimeState& state, const char* path, const LoadOptions& options, const mach_o::Layout* layout);
+    static const Loader*        makePremappedLoader(Diagnostics& diag, RuntimeState& state, const char* path, bool isInDyldCache, uint32_t dylibIndex, const LoadOptions& options, const mach_o::Layout* layout);
     static const Loader*        makeDiskLoader(Diagnostics& diag, RuntimeState& state, const char* path, const LoadOptions& options, bool overridesDyldCache, uint32_t dylibIndex,
                                                const mach_o::Layout* layout);
     static const Loader*        makeDyldCacheLoader(Diagnostics& diag, RuntimeState& state, const char* path, const LoadOptions& options, uint32_t dylibIndex,
@@ -340,7 +389,7 @@ protected:
     static const Loader*        makePseudoDylibLoader(Diagnostics& diag, RuntimeState &state, const char* path, const LoadOptions& options, const PseudoDylib* pd);
 
 #if SUPPORT_VM_LAYOUT
-    static const MachOAnalyzer* mapSegments(Diagnostics&, RuntimeState&, const char* path, uint64_t vmSpace,
+    static const MachOAnalyzer* mapSegments(Diagnostics&, RuntimeState&, const char* path, int fd, uint64_t vmSpace,
                                             const CodeSignatureInFile& codeSignature, bool hasCodeSignature,
                                             const Array<Region>& segments, bool neverUnloads, bool prebuilt, const FileValidationInfo&);
 #endif
@@ -354,89 +403,7 @@ protected:
 
 };
 
-#if __has_feature(ptrauth_calls)
-#define __ptrauth_dyld_address_auth __ptrauth(ptrauth_key_process_dependent_data, 1, 0)
-#else
-#define __ptrauth_dyld_address_auth
-#endif
-
-// On arm64e, signs the given pointer with the address of where it is stored.
-// Other archs just have a regular pointer
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wptrauth-null-pointers"
-template<typename T>
-struct AuthenticatedValue
-{
-};
-
-// Partial specialization for pointer types
-template<typename T>
-struct AuthenticatedValue<T*>
-{
-    AuthenticatedValue() {
-        this->value = ptrauth_sign_unauthenticated(nullptr, ptrauth_key_process_dependent_data, this);
-    }
-    ~AuthenticatedValue() = default;
-    AuthenticatedValue(const AuthenticatedValue& other) {
-        this->value = ptrauth_auth_and_resign(other.value,
-                                              ptrauth_key_process_dependent_data, &other,
-                                              ptrauth_key_process_dependent_data, this);
-    }
-    AuthenticatedValue(AuthenticatedValue&& other) {
-        this->value = ptrauth_auth_and_resign(other.value,
-                                              ptrauth_key_process_dependent_data, &other,
-                                              ptrauth_key_process_dependent_data, this);
-        other.value = ptrauth_sign_unauthenticated(nullptr, ptrauth_key_process_dependent_data, &other);
-    }
-    AuthenticatedValue& operator=(const AuthenticatedValue& other) {
-        this->value = ptrauth_auth_and_resign(other.value,
-                                              ptrauth_key_process_dependent_data, &other,
-                                              ptrauth_key_process_dependent_data, this);
-        return *this;
-    }
-    AuthenticatedValue& operator=(AuthenticatedValue&& other) {
-        this->value = ptrauth_auth_and_resign(other.value,
-                                              ptrauth_key_process_dependent_data, &other,
-                                              ptrauth_key_process_dependent_data, this);
-        other.value = ptrauth_sign_unauthenticated(nullptr, ptrauth_key_process_dependent_data, &other);
-        return *this;
-    }
-
-    // Add a few convenience methods for interoperating with values of the given type
-    AuthenticatedValue(const T* other) {
-        this->value = (void*)ptrauth_sign_unauthenticated(other, ptrauth_key_process_dependent_data, this);
-    }
-    AuthenticatedValue& operator=(const T* other) {
-        this->value = (void*)ptrauth_sign_unauthenticated(other, ptrauth_key_process_dependent_data, this);
-        return *this;
-    }
-    bool operator==(const T* other) const {
-        return ptrauth_auth_data(this->value, ptrauth_key_process_dependent_data, this) == other;
-    }
-    bool operator!=(const T* other) const {
-        return ptrauth_auth_data(this->value, ptrauth_key_process_dependent_data, this) != other;
-    }
-
-    T* operator->() {
-        return (T*)ptrauth_auth_data(this->value, ptrauth_key_process_dependent_data, this);
-    }
-
-    const T* operator->() const {
-        return (const T*)ptrauth_auth_data(this->value, ptrauth_key_process_dependent_data, this);
-    }
-
-    operator T*() {
-        return (T*)ptrauth_auth_data(this->value, ptrauth_key_process_dependent_data, this);
-    }
-
-    operator T*() const {
-        return (T*)ptrauth_auth_data(this->value, ptrauth_key_process_dependent_data, this);
-    }
-
-private:
-    void* value;
-};
-#pragma clang diagnostic pop
+static_assert(sizeof(Loader) == 32, "Invalid size");
 
 #if __has_feature(ptrauth_calls)
     typedef AuthenticatedValue<Loader*> AuthLoader;
@@ -444,6 +411,14 @@ private:
 #else
     typedef Loader* AuthLoader;
     typedef const Loader* ConstAuthLoader;
+#endif
+
+#if __has_feature(ptrauth_calls)
+    typedef AuthenticatedValue<PseudoDylib*> AuthPseudoDylib;
+    typedef AuthenticatedValue<const PseudoDylib*> ConstAuthPseudoDylib;
+#else
+    typedef PseudoDylib* AuthPseudoDylib;
+    typedef const PseudoDylib* ConstAuthPseudoDylib;
 #endif
 
 }
